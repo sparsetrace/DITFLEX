@@ -1,5 +1,4 @@
 """tests/modal_ci.py -- Modal runner for the ditflex gates and tests.
-======
 
 The source is NOT cloned from GitHub inside the container. `modal run`
 uploads the local checkout (the Actions checkout, in CI), so there is no
@@ -9,6 +8,8 @@ the working tree -- including uncommitted changes when run locally.
 Gates, in order (each blocks the next from meaning anything):
   1. tests/verify_identity.py   Flex path vs fp64 math reference
   2. tests/verify_latents.py    first latent shard from the Hub
+                                (--latents-all: every shard, ~10.5 GB,
+                                checks N == 1,281,167 and class coverage)
   3. pytest tests/
   4. (--smoke) tests/overfit_smoke.py, small model, both objectives
 
@@ -17,6 +18,7 @@ Usage
     modal run tests/modal_ci.py
     modal run tests/modal_ci.py --compile-check
     modal run tests/modal_ci.py --smoke
+    modal run tests/modal_ci.py --latents-all
     modal run tests/modal_ci.py --test-file test_attention_identity.py
 
 Environment
@@ -72,7 +74,9 @@ app = modal.App("ditflex-ci", image=image)
 
 @app.function(
     gpu=GPU_TYPE,
-    timeout=3600,
+    # Generous: the everything-enabled dispatch (full latents download +
+    # smoke x2 objectives + compile checks) can pass an hour.
+    timeout=7200,
     # Captured from the launching environment (the Actions runner, which
     # gets it from the GitHub repo secret) -- no Modal-side secret needed.
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
@@ -81,6 +85,7 @@ def run_gates(
     test_files: list | None = None,
     compile_check: bool = False,
     smoke: bool = False,
+    latents_all: bool = False,
 ) -> int:
     import subprocess
     import sys
@@ -108,7 +113,10 @@ def run_gates(
         gate_cmd.append("--compile")
     run(gate_cmd)
 
-    run([sys.executable, "tests/verify_latents.py"])
+    latents_cmd = [sys.executable, "tests/verify_latents.py"]
+    if latents_all:
+        latents_cmd.append("--all")  # replaces the fast check; shard 0 is cached
+    run(latents_cmd)
 
     pytest_cmd = [sys.executable, "-m", "pytest", "-v", "--tb=short"]
     pytest_cmd += test_files or ["tests"]
@@ -122,12 +130,18 @@ def run_gates(
 
 
 @app.local_entrypoint()
-def main(test_file: str = "", compile_check: bool = False, smoke: bool = False):
+def main(
+    test_file: str = "",
+    compile_check: bool = False,
+    smoke: bool = False,
+    latents_all: bool = False,
+):
     """
     Args:
         test_file:     specific pytest file (e.g. test_attention_identity.py), empty = all
         compile_check: also verify the torch.compile'd Flex path
         smoke:         also run the small-model overfit smoke, both objectives
+        latents_all:   check every latent shard (10.5 GB download) instead of the first
     """
     files = None
     if test_file:
@@ -135,6 +149,8 @@ def main(test_file: str = "", compile_check: bool = False, smoke: bool = False):
             test_file = f"tests/{test_file}"
         files = [test_file]
 
-    rc = run_gates.remote(test_files=files, compile_check=compile_check, smoke=smoke)
+    rc = run_gates.remote(
+        test_files=files, compile_check=compile_check, smoke=smoke, latents_all=latents_all
+    )
     if rc != 0:
         raise SystemExit(rc)

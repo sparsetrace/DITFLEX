@@ -62,6 +62,11 @@ class TrainConfig:
 class HubConfig:
     checkpoint_repo: str = "sparsetrace/ditflex-L2"
     archive_every_steps: int = 200_000
+    # Periodic save+push cadence. On ephemeral containers a local-only save
+    # protects nothing, so every periodic save uploads. At ~9.5 steps/s this
+    # is ~18 min of compute at risk between saves. 0 disables (end-of-run
+    # save only).
+    save_every_steps: int = 10_000
 
 
 @dataclass

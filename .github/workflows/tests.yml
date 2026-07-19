@@ -11,7 +11,9 @@ on:
 
   pull_request:
     paths:
+      - src/ditflex/**
       - tests/**
+      - pyproject.toml
 
   workflow_dispatch:
     inputs:
@@ -50,13 +52,13 @@ jobs:
         run: pip install modal
 
       # No GH_TOKEN: `modal run` uploads the checkout into the container,
-      # so Modal never clones from GitHub. Only the Modal tokens are needed.
-      # The `huggingface` MODAL secret (not a GitHub secret) must exist for
-      # the latents gate: modal secret create huggingface HF_TOKEN=hf_...
+      # so Modal never clones from GitHub. HF_TOKEN is a GitHub repo secret,
+      # exported here and forwarded into the container by modal_ci.py.
       - name: Run gates on Modal
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MODAL_GPU: ${{ github.event.inputs.gpu || 'B300' }}
         run: |
           modal run tests/modal_ci.py \

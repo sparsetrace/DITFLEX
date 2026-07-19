@@ -71,6 +71,20 @@ def _unflatten_optim(tensors: dict[str, torch.Tensor], param_groups: list) -> di
     return {"state": state, "param_groups": param_groups}
 
 
+def _restore_group_types(loaded_groups: list, reference_groups: list) -> list:
+    """JSON has no tuples: AdamW's betas=(0.9, 0.999) comes back as a list.
+    Coerce loaded values back to tuple wherever the live optimizer's
+    param_groups hold a tuple, so state_dict round-trips exactly -- same
+    move as DataConfig.__post_init__ for latent_shape."""
+    if len(loaded_groups) != len(reference_groups):
+        return loaded_groups  # let load_state_dict raise its own error
+    for lg, rg in zip(loaded_groups, reference_groups, strict=True):
+        for k, v in lg.items():
+            if isinstance(v, list) and isinstance(rg.get(k), tuple):
+                lg[k] = tuple(v)
+    return loaded_groups
+
+
 # -- save / load ----------------------------------------------------------
 
 
@@ -136,9 +150,10 @@ def load_checkpoint(
     ema.load_state_dict(load_file(str(directory / "ema.safetensors")))
     if optimizer is not None:
         optim_tensors = load_file(str(directory / "optim.safetensors"))
-        optimizer.load_state_dict(
-            _unflatten_optim(optim_tensors, state["optim_param_groups"])
+        param_groups = _restore_group_types(
+            state["optim_param_groups"], optimizer.state_dict()["param_groups"]
         )
+        optimizer.load_state_dict(_unflatten_optim(optim_tensors, param_groups))
     return state
 
 

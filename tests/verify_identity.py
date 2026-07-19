@@ -69,14 +69,24 @@ def build_attention(device: torch.device, dtype: torch.dtype) -> Attention:
     return attn
 
 
-def compare(name: str, got: torch.Tensor, ref: torch.Tensor, tol: float) -> bool:
+def compare(
+    name: str, got: torch.Tensor, ref: torch.Tensor, rtol: float, atol: float = 1e-8
+) -> bool:
+    """Combined |a-b| <= atol + rtol*|ref| criterion (numpy/torch allclose
+    style). The atol term matters for quantities that are mathematically
+    zero -- e.g. d/d(to_k.bias), which vanishes exactly because softmax is
+    shift-invariant -- where a pure relative test divides rounding noise by
+    rounding noise and fails spuriously."""
     got64, ref64 = got.double(), ref.double()
     max_abs = (got64 - ref64).abs().max().item()
-    denom = ref64.abs().max().item() + 1e-12
-    max_rel = max_abs / denom
-    ok = max_rel < tol
+    denom = ref64.abs().max().item()
+    ok = max_abs <= atol + rtol * denom
+    max_rel = max_abs / (denom + 1e-12)
     status = "PASS" if ok else "FAIL"
-    print(f"  [{status}] {name:<30} max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  tol={tol:.1e}")
+    print(
+        f"  [{status}] {name:<30} max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  "
+        f"rtol={rtol:.1e} atol={atol:.1e}"
+    )
     return ok
 
 

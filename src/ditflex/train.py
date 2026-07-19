@@ -144,7 +144,37 @@ def main() -> int:
     t_start = time.time()
     deadline = t_start + args.train_seconds
     losses: list[float] = []
+    last_archive_bucket = start_step // cfg.hub.archive_every_steps
     wrapped.train()
+
+    def run_record(end_step: int, completed: bool) -> dict:
+        return {
+            "start_step": start_step,
+            "end_step": end_step,
+            "seconds": round(time.time() - t_start, 1),
+            "world": ctx.world,
+            "objective": cfg.train.objective,
+            "completed": completed,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def save_and_push(at_step: int, completed: bool) -> None:
+        """Rank-0 only. Periodic saves record the run-in-progress
+        (completed=False) so a crash-resume still sees honest history."""
+        nonlocal last_archive_bucket
+        state = {
+            "step": at_step,
+            "run_history": run_history + [run_record(at_step, completed)],
+        }
+        save_checkpoint(CKPT_DIR, model, ema, optimizer, cfg, state)
+        tag = "final" if completed else "periodic"
+        print(f"[train] saved step {at_step:,} ({tag})")
+        if not args.no_push:
+            bucket = at_step // cfg.hub.archive_every_steps
+            archive = at_step if bucket != last_archive_bucket else None
+            last_archive_bucket = bucket
+            push_to_hub(CKPT_DIR, cfg.hub.checkpoint_repo, archive_step=archive)
+            print(f"[train] pushed to {cfg.hub.checkpoint_repo}")
 
     while True:
         if step % cfg.train.deadline_check_every == 0 and step > start_step:
@@ -172,6 +202,15 @@ def main() -> int:
 
         losses.append(val)
         step += 1
+
+        # Periodic checkpoint: every rank reaches the barrier, rank 0
+        # saves+pushes behind it, so the DDP collectives never see a
+        # half-absent rank during the upload.
+        if cfg.hub.save_every_steps > 0 and step % cfg.hub.save_every_steps == 0:
+            if ctx.is_rank0:
+                save_and_push(step, completed=False)
+            barrier(ctx)
+
         if ctx.is_rank0 and step % LOG_EVERY == 0:
             rate = LOG_EVERY / max(time.time() - getattr(main, "_t", t_start), 1e-9)
             main._t = time.time()
@@ -179,26 +218,12 @@ def main() -> int:
             print(f"  step {step:>8,}  loss {avg:.5f}  {rate:5.2f} steps/s  "
                   f"{rate * cfg.train.global_batch:7.0f} img/s")
 
-    # -- save + push (rank 0), everyone waits ----------------------------
+    # -- final save + push (rank 0), everyone waits ----------------------
     elapsed = time.time() - t_start
     if ctx.is_rank0:
-        run_history.append({
-            "start_step": start_step,
-            "end_step": step,
-            "seconds": round(elapsed, 1),
-            "world": ctx.world,
-            "objective": cfg.train.objective,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-        })
-        state = {"step": step, "run_history": run_history}
-        save_checkpoint(CKPT_DIR, model, ema, optimizer, cfg, state)
-        print(f"[train] saved step {step:,} after {elapsed/60:.1f} min "
+        print(f"[train] run done after {elapsed/60:.1f} min "
               f"({step - start_step:,} steps this run)")
-        if not args.no_push:
-            archive = step if step % cfg.hub.archive_every_steps < (
-                step - start_step) else None
-            push_to_hub(CKPT_DIR, cfg.hub.checkpoint_repo, archive_step=archive)
-            print(f"[train] pushed to {cfg.hub.checkpoint_repo}")
+        save_and_push(step, completed=True)
     barrier(ctx)
     cleanup(ctx)
     return 0

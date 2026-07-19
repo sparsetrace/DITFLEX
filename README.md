@@ -1,4 +1,4 @@
-# dit-map
+# dit-flex
 
 DiT-L/2 on ImageNet-256 latents, with self-attention routed through PyTorch
 FlexAttention so the attention score function is a swappable component.

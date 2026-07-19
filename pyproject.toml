@@ -43,7 +43,7 @@ prepare = [                # only for scripts/prepare_latents.py
 ]
 
 [project.urls]
-Repository = "https://github.com/jcandane/dit-flex"
+Repository = "https://github.com/jcandane/ditflex"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ditflex"]

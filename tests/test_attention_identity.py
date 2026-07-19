@@ -39,9 +39,13 @@ def build_attention(dtype: torch.dtype, requires_grad: bool = False):
     return attn
 
 
-def max_rel(got: torch.Tensor, ref: torch.Tensor) -> float:
+def agree(got: torch.Tensor, ref: torch.Tensor, rtol: float, atol: float = 1e-8) -> bool:
+    """|a-b| <= atol + rtol*|ref|. The atol term matters for mathematically
+    zero quantities (e.g. d/d(to_k.bias): softmax is shift-invariant, so the
+    key bias has exactly zero gradient) where a pure relative comparison is
+    rounding noise divided by rounding noise."""
     got, ref = got.double(), ref.double()
-    return ((got - ref).abs().max() / (ref.abs().max() + 1e-12)).item()
+    return ((got - ref).abs().max() <= atol + rtol * ref.abs().max()).item()
 
 
 @requires_cuda
@@ -67,7 +71,7 @@ def test_flex_matches_math_reference(dtype):
 
     assert out.shape == ref.shape
     assert torch.isfinite(out).all()
-    assert max_rel(out, ref) < REL_TOL[dtype]
+    assert agree(out, ref, REL_TOL[dtype])
 
 
 @requires_cuda
@@ -115,7 +119,7 @@ def test_flex_backward_matches_reference():
 
     for name, param in attn.named_parameters():
         if name in ref_grads:
-            assert max_rel(param.grad, ref_grads[name]) < 1e-4, f"grad mismatch: {name}"
+            assert agree(param.grad, ref_grads[name], 1e-4), f"grad mismatch: {name}"
 
 
 @requires_cuda

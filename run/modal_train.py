@@ -18,8 +18,10 @@ env vars (set by the workflow), not CLI flags:
     MODAL_GPU    B300 (default) | B200 | ...
     MODAL_GPUS   8 (default) | 2 for smoke
 
-Requires the `huggingface` Modal secret (HF_TOKEN with write scope) for
-pulling latents and pushing checkpoints. `wandb` secret is optional.
+HF_TOKEN (write scope: pulls latents AND pushes checkpoints) comes from
+the launching environment -- a GitHub repo secret exported by train.yml,
+or `export HF_TOKEN=...` locally -- and is forwarded into the container
+via Secret.from_dict. No Modal-side secret needed.
 
 NOTE: this launcher is ready; the entrypoint it launches (ditflex.train)
 is Phase 1 and does not exist yet. Until it does, this file is
@@ -41,12 +43,13 @@ GPU_COUNT = int(os.environ.get("MODAL_GPUS", "8"))
 TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
 
 # The Modal function timeout must cover train_seconds PLUS checkpoint
-# download (~12 min), upload (~12 min), and cold compile (2-5 min), or the
-# run is killed mid-upload and the checkpoint is lost. Set a generous
-# ceiling here; the real stepping budget is enforced inside train.py by
-# --train-seconds (rank 0 checks the deadline every 500 steps and
-# broadcasts the stop).
-TIMEOUT_CEILING = 24 * 3600
+# download (~12 min), upload (~12 min), and cold compile (~3 min) -- but
+# NOT much more: a hung run bills until the timeout kills it. So the
+# ceiling derives from the requested budget: the workflow exports
+# MODAL_TRAIN_SECONDS and we add a 1-hour overhead allowance. A 2-hour
+# dispatch can never bill more than ~3 hours, even if everything hangs.
+_BUDGET = int(os.environ.get("MODAL_TRAIN_SECONDS", "7200"))
+TIMEOUT_CEILING = _BUDGET + 3600
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -74,11 +77,11 @@ app = modal.App("ditflex-train", image=image)
     gpu=f"{GPU_KIND}:{GPU_COUNT}",
     timeout=TIMEOUT_CEILING,
     secrets=[
-        modal.Secret.from_name("huggingface"),
-        # modal.Secret.from_name("wandb"),  # enable when logging lands
+        modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")}),
+        # add WANDB_API_KEY here the same way when logging lands
     ],
 )
-def train(train_seconds: int = 7200, objective: str = "ddpm") -> int:
+def train(train_seconds: int = 7200, objective: str = "flow", hub_repo: str = "") -> int:
     import subprocess
     import sys
 
@@ -106,24 +109,29 @@ def train(train_seconds: int = 7200, objective: str = "ddpm") -> int:
         f"--nproc-per-node={n_gpu}",
         "--standalone",
         "-m",
-        "ditflex.train",  # Phase 1: src/ditflex/train.py
+        "ditflex.train",
         f"--train-seconds={train_seconds}",
         f"--objective={objective}",
     ]
+    if hub_repo:
+        cmd.append(f"--hub-repo={hub_repo}")
     print(f"\n[modal] running: {' '.join(cmd)}\n")
     return subprocess.run(cmd, cwd="/repo").returncode
 
 
 @app.local_entrypoint()
-def main(train_seconds: int = 7200, objective: str = "ddpm"):
+def main(train_seconds: int = 7200, objective: str = "flow", hub_repo: str = ""):
     """
     Args:
         train_seconds: stepping budget (checkpoint I/O and compile are on top)
         objective:     ddpm | flow
+        hub_repo:      checkpoint repo override. SMOKES MUST SET THIS to a
+                       scratch repo -- a smoke that pushes to the real repo
+                       would be silently resumed by the real run.
     """
     if objective not in ("ddpm", "flow"):
         raise SystemExit(f"unknown objective: {objective!r}")
 
-    rc = train.remote(train_seconds=train_seconds, objective=objective)
+    rc = train.remote(train_seconds=train_seconds, objective=objective, hub_repo=hub_repo)
     if rc != 0:
         raise SystemExit(rc)

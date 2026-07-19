@@ -1,0 +1,69 @@
+name: quick-train
+
+# Dress rehearsal of the training chain on 2 GPUs: real ditflex.train,
+# real latents, real checkpointing against the SCRATCH repo
+# (sparsetrace/quicktraindit -- fixed name, reset+overwritten every
+# dispatch). Two legs in one job; the runner asserts the resumed step
+# count, so green means the whole fresh->push->pull->resume chain works.
+#
+# Manual dispatch only. NOT detached: this is a test, so the Actions job
+# waits and shows red/green like tests.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpus:
+        description: "GPU count"
+        required: false
+        default: "2"
+      gpu_kind:
+        description: "GPU kind (B300 | B200)"
+        required: false
+        default: "B300"
+      steps:
+        description: "Leg-1 steps (fresh start)"
+        required: false
+        default: "1000"
+      resume_steps:
+        description: "Leg-2 steps (after resume)"
+        required: false
+        default: "200"
+      objective:
+        description: "Objective (ddpm | flow)"
+        required: false
+        default: "flow"
+      max_latent_files:
+        description: "Latent shards to load (0 = all 32, realistic)"
+        required: false
+        default: "0"
+
+jobs:
+  quick:
+    name: "quick · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }} · ${{ inputs.steps }}+${{ inputs.resume_steps }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Run quick train chain on Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODAL_GPU: ${{ inputs.gpu_kind }}
+          MODAL_GPUS: ${{ inputs.gpus }}
+        run: |
+          modal run quick_train/modal_quick.py \
+            --steps "${{ inputs.steps }}" \
+            --resume-steps "${{ inputs.resume_steps }}" \
+            --objective "${{ inputs.objective }}" \
+            --max-latent-files "${{ inputs.max_latent_files }}"

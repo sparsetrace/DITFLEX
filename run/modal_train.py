@@ -62,6 +62,7 @@ image = (
         "huggingface_hub>=0.26",
         "numpy>=1.26",
         "tqdm",
+        "pillow",          # sample-grid PNG at end of each link
     )
     .add_local_dir(
         REPO_ROOT,

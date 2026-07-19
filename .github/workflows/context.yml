@@ -1,0 +1,54 @@
+name: context
+
+# Regenerate context/context.md (a one-file snapshot of the repo for
+# sharing) and commit it back.
+#
+# Triggers: manual dispatch, or a push to main that modifies the
+# generator itself -- and ONLY the generator. Editing source files does
+# not refresh the snapshot automatically; dispatch when you want a fresh
+# one. (The workflow's own commit cannot retrigger it: it touches only
+# context/context.md, carries [skip ci], and GITHUB_TOKEN pushes do not
+# start workflows.)
+#
+# Runs entirely on the Actions runner -- no Modal, no GPU, no secrets
+# beyond the automatic GITHUB_TOKEN. Reading files and writing markdown
+# is not a job for an ephemeral server.
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches: [main]
+    paths:
+      - context/context.py
+
+permissions:
+  contents: write   # allows the push with the automatic GITHUB_TOKEN
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate context.md
+        run: python context/context.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name "ditflex context bot"
+          git config user.email "actions@github.com"
+          git add context/context.md
+          if git diff --cached --quiet; then
+            echo "context.md unchanged -- nothing to commit"
+          else
+            git commit -m "context: refresh repo snapshot [skip ci]"
+            git push
+          fi

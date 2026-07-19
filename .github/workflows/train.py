@@ -1,0 +1,61 @@
+name: train
+
+# Manual dispatch ONLY. This spends real 8-GPU hours -- it must never
+# trigger from a push.
+on:
+  workflow_dispatch:
+    inputs:
+      gpus:
+        description: "GPU count (2 = smoke, 8 = real run)"
+        required: false
+        default: "8"
+      gpu_kind:
+        description: "GPU kind (B300 | B200)"
+        required: false
+        default: "B300"
+      train_seconds:
+        description: "Stepping budget in seconds (7200 = 2 h)"
+        required: false
+        default: "7200"
+      objective:
+        description: "Objective (ddpm | flow)"
+        required: false
+        default: "flow"
+      hub_repo:
+        description: "Checkpoint repo. ONE PER OBJECTIVE: config-drift refusal (correctly) blocks resuming flow from a ddpm checkpoint"
+        required: false
+        default: "sparsetrace/ditflex-L2-flow"
+
+jobs:
+  launch:
+    name: "launch · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      # --detach: the Modal app outlives this job. The Actions job ends in
+      # minutes; training continues on Modal for the full budget. Monitor
+      # via the Modal dashboard, not the Actions log.
+      - name: Launch detached training run
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODAL_GPU: ${{ inputs.gpu_kind }}
+          MODAL_GPUS: ${{ inputs.gpus }}
+          MODAL_TRAIN_SECONDS: ${{ inputs.train_seconds }}
+        run: |
+          modal run --detach run/modal_train.py \
+            --train-seconds "${{ inputs.train_seconds }}" \
+            --objective "${{ inputs.objective }}" \
+            --hub-repo "${{ inputs.hub_repo }}"

@@ -39,7 +39,13 @@ class EMA:
         if missing:
             raise KeyError(f"EMA state mismatch on keys: {sorted(missing)[:5]} ...")
         for name, t in sd.items():
-            self.shadow[name] = t.float().clone()
+            # safetensors load_file materializes on CPU; the shadow must
+            # stay wherever it already lives (the training device), or the
+            # first update() after a resume mixes cuda params with cpu
+            # shadows. Caught by quick_train leg 2.
+            self.shadow[name] = t.detach().to(
+                device=self.shadow[name].device, dtype=torch.float32, copy=True
+            )
 
     def to(self, device) -> EMA:
         self.shadow = {k: v.to(device) for k, v in self.shadow.items()}

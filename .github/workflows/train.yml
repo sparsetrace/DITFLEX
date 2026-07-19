@@ -6,17 +6,17 @@ on:
   workflow_dispatch:
     inputs:
       gpus:
-        description: "GPU count (2 = smoke, 8 = real run)"
+        description: "GPU count (2 is the certified sweet spot: fixed batch 256 makes 8 GPUs slower AND ~6x costlier)"
         required: false
-        default: "8"
+        default: "2"
       gpu_kind:
         description: "GPU kind (B300 | B200)"
         required: false
         default: "B300"
       train_seconds:
-        description: "Stepping budget in seconds (7200 = 2 h)"
+        description: "Stepping budget in seconds (14400 = 4 h ~= 136K steps ~= $60 on 2xB300)"
         required: false
-        default: "7200"
+        default: "14400"
       objective:
         description: "Objective (ddpm | flow)"
         required: false

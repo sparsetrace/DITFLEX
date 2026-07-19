@@ -37,3 +37,22 @@ def test_load_rejects_key_mismatch():
     import pytest
     with pytest.raises(KeyError):
         ema.load_state_dict({"wrong": torch.zeros(1)})
+
+
+def test_load_preserves_shadow_device():
+    """Regression for the quick_train leg-2 failure: safetensors loads on
+    CPU, and load_state_dict must move tensors to where the shadow already
+    lives, then update() must run. Exercises the real cross-device path on
+    GPU; on CPU it still pins the load->update sequence."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = torch.nn.Linear(4, 4).to(device)
+    ema = EMA(model, decay=0.9).to(device)
+
+    cpu_state = {k: v.cpu() for k, v in ema.state_dict().items()}   # what load_file yields
+    ema.load_state_dict(cpu_state)
+
+    for name, t in ema.state_dict().items():
+        assert t.device.type == device, f"{name} landed on {t.device}"
+        assert t.dtype == torch.float32
+
+    ema.update(model)   # the call that crashed on resume

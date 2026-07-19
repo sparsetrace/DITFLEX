@@ -1,5 +1,5 @@
 """tests/modal_ci.py -- Modal runner for the ditflex gates and tests.
-===
+======
 
 The source is NOT cloned from GitHub inside the container. `modal run`
 uploads the local checkout (the Actions checkout, in CI), so there is no

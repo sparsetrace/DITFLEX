@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 """context/context.py -- snapshot the repo into one shareable markdown.
+===
 
 Walks the repo, writes context/context.md containing every source file in
 a fenced code block with its path as a header, preceded by a file tree.

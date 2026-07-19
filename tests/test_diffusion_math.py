@@ -87,14 +87,26 @@ def test_theorem_4_1_dense():
 
 
 def test_symmetric_kernel_is_equilibrium():
-    """Sec. 5: DMAP of a symmetric kernel has vanishing probability
-    current at stationarity (detailed balance)."""
+    """Sec. 5: DMAP of a symmetric kernel satisfies detailed balance.
+    The stationary distribution has a CLOSED FORM -- the normalized
+    degree measure pi = P1 / (1^T P 1) -- under which the current
+    vanishes identically: J_ij = (P_ij - P_ji)/Z = 0. Asserting through
+    power iteration instead would test the spectral gap of a random
+    kernel, not the physics (and fails when the gap is small)."""
     M = random_scores(asymmetric=False)
     _, _, H = bidivergence(M)
-    p_plus = dmap(torch.exp(-0.5 * H))
-    pi = stationary_distribution(p_plus)
-    J = probability_current(p_plus, pi)
-    assert J.abs().max() < 1e-9
+    P = torch.exp(-0.5 * H)
+    p_plus = dmap(P)
+
+    pi_exact = P.sum(dim=-1) / P.sum()
+    assert torch.allclose(pi_exact @ p_plus, pi_exact, atol=1e-12)   # stationary
+    J = probability_current(p_plus, pi_exact)
+    assert J.abs().max() < 1e-12                                     # detailed balance
+
+    # Power iteration should approximate the same pi -- at ITS accuracy,
+    # governed by the spectral gap, hence the loose tolerance.
+    pi_iter = stationary_distribution(p_plus)
+    assert (pi_iter - pi_exact).abs().max() < 1e-3
 
 
 def test_asymmetric_kernel_carries_current():

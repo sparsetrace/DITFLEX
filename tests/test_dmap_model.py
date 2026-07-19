@@ -106,10 +106,8 @@ def _dense_dmap_reference(attn, x, alpha):
 def test_dmap_processor_matches_dense_math(alpha):
     from diffusers.models.attention_processor import Attention
 
-    from ditflex.attention import (
-        DmapFlexSelfAttnProcessor,
-        IdentityFlexSelfAttnProcessor,
-    )
+    from ditflex.attention import IdentityFlexSelfAttnProcessor
+    from ditflex.diffusion import DmapFlexSelfAttnProcessor
 
     torch.manual_seed(0)
     heads, head_dim, n, c = 2, 8, 32, 16

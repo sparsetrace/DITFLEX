@@ -1,0 +1,67 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - src/ditflex/**
+      - tests/**
+      - pyproject.toml
+      - .github/workflows/tests.yml
+
+  pull_request:
+    paths:
+      - src/ditflex/**
+      - tests/**
+      - pyproject.toml
+
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: "GPU target (B300 | B200 | A100 | L40S)"
+        required: false
+        default: "B300"
+      test_file:
+        description: "Specific test file, empty = all"
+        required: false
+        default: ""
+      compile_check:
+        description: "Also verify the compiled Flex path"
+        required: false
+        default: "false"
+      smoke:
+        description: "Also run the overfit smoke (small model, both objectives)"
+        required: false
+        default: "false"
+
+jobs:
+  gates:
+    name: "ditflex gates · ${{ github.event.inputs.gpu || 'B300' }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      # No GH_TOKEN: `modal run` uploads the checkout into the container,
+      # so Modal never clones from GitHub. Only the Modal tokens are needed.
+      # The `huggingface` MODAL secret (not a GitHub secret) must exist for
+      # the latents gate: modal secret create huggingface HF_TOKEN=hf_...
+      - name: Run gates on Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          MODAL_GPU: ${{ github.event.inputs.gpu || 'B300' }}
+        run: |
+          modal run tests/modal_ci.py \
+            --test-file "${{ github.event.inputs.test_file || '' }}" \
+            ${{ github.event.inputs.compile_check == 'true' && '--compile-check' || '' }} \
+            ${{ github.event.inputs.smoke == 'true' && '--smoke' || '' }}

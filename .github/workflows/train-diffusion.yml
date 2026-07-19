@@ -1,0 +1,66 @@
+name: train-diffusion
+
+# The DMAP-DiT chain: EQ-sector attention (W_K tied to W_Q, R == 0),
+# same recipe and objective as the baseline chain, its OWN checkpoint
+# repo. Manual dispatch only, detached -- monitor in the Modal dashboard
+# (app: ditflex-train-dmap).
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpus:
+        description: "GPU count (2 is the certified sweet spot)"
+        required: false
+        default: "2"
+      gpu_kind:
+        description: "GPU kind (B300 | B200)"
+        required: false
+        default: "B300"
+      train_seconds:
+        description: "Stepping budget in seconds (14400 = 4 h)"
+        required: false
+        default: "14400"
+      objective:
+        description: "Objective (ddpm | flow)"
+        required: false
+        default: "flow"
+      hub_repo:
+        description: "Checkpoint repo for the DMAP chain (never share with the baseline)"
+        required: false
+        default: "sparsetrace/ditflex-L2-flow-dmap"
+      dmap_alpha:
+        description: "Coifman-Lafon exponent (0 | 0.5 | 1)"
+        required: false
+        default: "0.0"
+
+jobs:
+  launch:
+    name: "dmap · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install modal
+
+      - name: Launch detached DMAP training run
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODAL_GPU: ${{ inputs.gpu_kind }}
+          MODAL_GPUS: ${{ inputs.gpus }}
+          MODAL_TRAIN_SECONDS: ${{ inputs.train_seconds }}
+        run: |
+          modal run --detach train_diffusion/modal_train_dmap.py \
+            --train-seconds "${{ inputs.train_seconds }}" \
+            --objective "${{ inputs.objective }}" \
+            --hub-repo "${{ inputs.hub_repo }}" \
+            --dmap-alpha "${{ inputs.dmap_alpha }}"

@@ -11,9 +11,7 @@ on:
 
   pull_request:
     paths:
-      - src/ditflex/**
       - tests/**
-      - pyproject.toml
 
   workflow_dispatch:
     inputs:

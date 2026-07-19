@@ -33,6 +33,10 @@ on:
         description: "Also run the overfit smoke (small model, both objectives)"
         required: false
         default: "false"
+      latents_all:
+        description: "Check every latent shard (10.5 GB) instead of the first"
+        required: false
+        default: "false"
 
 jobs:
   gates:
@@ -64,4 +68,5 @@ jobs:
           modal run tests/modal_ci.py \
             --test-file "${{ github.event.inputs.test_file || '' }}" \
             ${{ github.event.inputs.compile_check == 'true' && '--compile-check' || '' }} \
-            ${{ github.event.inputs.smoke == 'true' && '--smoke' || '' }}
+            ${{ github.event.inputs.smoke == 'true' && '--smoke' || '' }} \
+            ${{ github.event.inputs.latents_all == 'true' && '--latents-all' || '' }}

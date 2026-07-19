@@ -31,6 +31,18 @@ class ModelConfig:
     # so sigma channels would be dead weights receiving zero gradient.
     out_channels: int = 4
     num_classes: int = 1000        # null class for CFG is index num_classes
+    # "amap": standard directed QK attention (the baseline).
+    # "dmap": EQ-sector / diffusion-map attention -- W_K tied to W_Q, so
+    #   every score matrix is symmetric (q_i . q_j) and R == 0 identically.
+    #   DEVIATIONS vs baseline: ~25M fewer params (no separate W_K), and
+    #   each head's bilinear is PSD (a subfamily of symmetric).
+    qk_mode: str = "amap"
+    # Coifman-Lafon density-correction exponent for qk_mode="dmap".
+    # 0 = pure squared-distance DMAP: softmax(2s_ij - g_j). NOTE this is
+    #   NOT plain attention -- the destination potential g_j survives the
+    #   row-softmax (only the source term g_i is killed).
+    # 0.5 = Fokker-Planck; 1 = Laplace-Beltrami. Ignored for amap.
+    dmap_alpha: float = 0.0
 
 
 @dataclass

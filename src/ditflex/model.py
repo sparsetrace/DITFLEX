@@ -61,4 +61,13 @@ def build_model(cfg: ModelConfig, score_mod: ScoreMod | None = None) -> DiTTrans
             f"has {cfg.num_layers} layers -- the DiT architecture is not one "
             "self-attention per block as assumed. Do not train on this."
         )
+
+    # GUARD, not a feature: this builder produces ONLY the certified
+    # baseline DiT. Variant configs must go through their own builders so
+    # a dmap-labeled config can never silently yield an untied baseline.
+    if getattr(cfg, "qk_mode", "amap") != "amap":
+        raise ValueError(
+            f"build_model builds the baseline only; qk_mode={cfg.qk_mode!r} "
+            "requires ditflex.diffusion_model.build_dmap_model."
+        )
     return model

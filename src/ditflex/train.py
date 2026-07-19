@@ -64,6 +64,17 @@ def parse_args() -> argparse.Namespace:
                    help="load only the first N latent shards (smokes)")
     p.add_argument("--max-steps", type=int, default=None,
                    help="hard step cap regardless of wall clock (smokes)")
+    p.add_argument("--qk-mode", choices=["amap", "dmap"], default="amap",
+                   help="amap = baseline directed attention; dmap = diffusion-map "
+                        "attention (W_K tied to W_Q, R == 0, plus Coifman-Lafon "
+                        "density correction)")
+    p.add_argument("--dmap-alpha", type=float, default=0.0,
+                   help="density-correction exponent for --qk-mode=dmap "
+                        "(0 = none, 0.5 = Fokker-Planck, 1 = Laplace-Beltrami)")
+    p.add_argument("--sample-count", type=int, default=16,
+                   help="images to sample after the final save (0 disables)")
+    p.add_argument("--sample-steps", type=int, default=50)
+    p.add_argument("--cfg-scale", type=float, default=4.0)
     return p.parse_args()
 
 
@@ -73,6 +84,8 @@ def main() -> int:
 
     cfg = Config()
     cfg.train.objective = args.objective
+    cfg.model.qk_mode = args.qk_mode
+    cfg.model.dmap_alpha = args.dmap_alpha
     if args.hub_repo:
         cfg.hub.checkpoint_repo = args.hub_repo
 
@@ -94,7 +107,14 @@ def main() -> int:
         resume_dir = CKPT_DIR
 
     # -- model / ema / optimizer, load BEFORE compile/wrap ---------------
-    model = build_model(cfg.model).to(ctx.device)
+    if cfg.model.qk_mode == "amap":
+        model = build_model(cfg.model).to(ctx.device)
+    elif cfg.model.qk_mode == "dmap":
+        from ditflex.diffusion_model import build_dmap_model
+
+        model = build_dmap_model(cfg.model).to(ctx.device)
+    else:
+        raise ValueError(f"unknown qk_mode: {cfg.model.qk_mode!r}")
     ema = EMA(model, cfg.train.ema_decay).to(ctx.device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
@@ -224,6 +244,30 @@ def main() -> int:
         print(f"[train] run done after {elapsed/60:.1f} min "
               f"({step - start_step:,} steps this run)")
         save_and_push(step, completed=True)
+
+    # -- fixed-seed sample grid: the time-lapse frame for this link ------
+    # Strictly AFTER the final save+push, and non-fatal: sampling must
+    # never be able to endanger a completed checkpoint. copy_to clobbers
+    # the training weights, which is fine -- they are already on the Hub.
+    if ctx.is_rank0 and args.sample_count > 0:
+        try:
+            from ditflex.sample import sample_and_push
+
+            ema.copy_to(model)
+            sample_and_push(
+                model,
+                objective=cfg.train.objective,
+                step=step,
+                repo_id=None if args.no_push else cfg.hub.checkpoint_repo,
+                device=ctx.device,
+                num_classes=cfg.model.num_classes,
+                n=args.sample_count,
+                ode_steps=args.sample_steps,
+                cfg_scale=args.cfg_scale,
+                out_dir=CKPT_DIR,
+            )
+        except Exception as e:  # noqa: BLE001 -- deliberately broad
+            print(f"[train] sampling failed (non-fatal; checkpoint already pushed): {e!r}")
     barrier(ctx)
     cleanup(ctx)
     return 0

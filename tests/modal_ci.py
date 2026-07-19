@@ -1,5 +1,4 @@
 """tests/modal_ci.py -- Modal runner for the ditflex gates and tests.
-====
 
 The source is NOT cloned from GitHub inside the container. `modal run`
 uploads the local checkout (the Actions checkout, in CI), so there is no
@@ -27,9 +26,10 @@ Environment
     TORCH_INDEX   torch wheel index. Default cu129: B300 is SM103 /
                   compute_103, which requires CUDA >= 12.9.
 
-Secrets: the `huggingface` Modal secret (HF_TOKEN) must exist -- the
-latents gate pulls from the Hub. Create it once:
-    modal secret create huggingface HF_TOKEN=hf_...
+    HF_TOKEN      HuggingFace token for the latents gate. Set as a
+                  GitHub repo secret; the workflow exports it and this
+                  launcher forwards it into the container via
+                  Secret.from_dict. For local runs: export HF_TOKEN=hf_...
 """
 
 from __future__ import annotations
@@ -72,7 +72,9 @@ app = modal.App("ditflex-ci", image=image)
 @app.function(
     gpu=GPU_TYPE,
     timeout=3600,
-    secrets=[modal.Secret.from_name("huggingface")],
+    # Captured from the launching environment (the Actions runner, which
+    # gets it from the GitHub repo secret) -- no Modal-side secret needed.
+    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
 def run_gates(
     test_files: list | None = None,

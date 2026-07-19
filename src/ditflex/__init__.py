@@ -7,12 +7,14 @@ from ditflex.attention import (
     reference_self_attention,
 )
 from ditflex.config import Config, DataConfig, HubConfig, ModelConfig, TrainConfig
+from ditflex.ema import EMA
 from ditflex.latents import LatentStore, batch_seed
 from ditflex.model import build_model
 from ditflex.objective import build_objective
 
 __all__ = [
     "Config",
+    "EMA",
     "DataConfig",
     "FlexSelfAttnProcessor",
     "HubConfig",

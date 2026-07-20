@@ -19,7 +19,7 @@ from pathlib import Path
 
 from huggingface_hub import HfApi, hf_hub_download
 
-FILES = ["model.safetensors", "ema.safetensors", "optimizer.safetensors", "state.json"]
+FILES = ["model.safetensors", "ema.safetensors", "optim.safetensors", "state.json"]
 
 
 def main() -> None:

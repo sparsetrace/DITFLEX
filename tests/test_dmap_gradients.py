@@ -26,8 +26,11 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 
 
 def tiny(qk_mode="dmap"):
+    # head_dim >= 16: Inductor's flex_attention lowering rejects smaller
+    # embedding dims (NYI at E=8) -- discovered the hard way. Real model
+    # uses 64.
     return ModelConfig(
-        num_attention_heads=2, attention_head_dim=8, num_layers=2,
+        num_attention_heads=2, attention_head_dim=16, num_layers=2,
         sample_size=8, patch_size=2, num_classes=10, qk_mode=qk_mode,
     )
 
@@ -63,29 +66,50 @@ def test_dmap_every_param_family_gets_gradient():
         )
 
 
-@requires_cuda
-def test_dmap_eager_micro_overfits():
-    """8 fixed samples, eager, fp32. If DMAP attention is a valid
-    trainable operator (it is -- the question is our plumbing), loss must
-    fall well below the zero-predictor floor. Failure here = modeling
-    problem; success here + compiled-stall = compile problem."""
+def _micro_overfit(qk_mode: str, steps: int = 600, lr: float = 1e-3):
+    from ditflex.model import build_model
+
     torch.manual_seed(0)
-    model = build_dmap_model(tiny()).cuda().train()
+    cfg = tiny(qk_mode)
+    model = (build_dmap_model(cfg) if qk_mode == "dmap" else build_model(cfg))
+    model = model.cuda().train()
     obj = build_objective("flow", label_dropout=0.0, num_classes=10)
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
     x0, y = batch("cuda")
 
     first = None
-    for _ in range(300):
+    for _ in range(steps):
         loss = obj.loss(model, x0, y)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         opt.step()
         if first is None:
             first = loss.item()
-    final = loss.item()
-    assert final < 0.5 * first, (
-        f"eager DMAP failed to learn 8 samples: {first:.4f} -> {final:.4f}"
+    return first, loss.item()
+
+
+@requires_cuda
+def test_micro_overfit_amap_vs_dmap():
+    """Same seed, same data, same budget -- amap is the CONTROL, so
+    'DMAP learns slowly' is measured against what this exact toy can do,
+    not against an arbitrary absolute threshold. The comparative
+    assertion is the diagnosis: if dmap needs > 3x amap's final loss,
+    the optimization pathology is real (temperature / sink-token
+    territory); if both land together, eager DMAP is healthy and the
+    real-training stall lives at scale or in DDP."""
+    a_first, a_final = _micro_overfit("amap")
+    d_first, d_final = _micro_overfit("dmap")
+    print(f"\namap: {a_first:.4f} -> {a_final:.4f}   "
+          f"dmap: {d_first:.4f} -> {d_final:.4f}")
+
+    assert a_final < 0.6 * a_first, "control failed -- test itself is broken"
+    assert d_final < 0.6 * d_first, (
+        f"eager DMAP barely learns where amap does: "
+        f"dmap {d_first:.4f}->{d_final:.4f} vs amap {a_first:.4f}->{a_final:.4f}"
+    )
+    assert d_final < 3.0 * a_final, (
+        f"eager DMAP learns {d_final/a_final:.1f}x worse than the amap "
+        f"control -- genuine optimization pathology"
     )
 
 

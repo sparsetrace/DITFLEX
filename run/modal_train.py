@@ -81,7 +81,7 @@ def train(
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
-    grad_ceiling: float = 25.0,
+    grad_ceiling: float = 0.0,
 ) -> int:
     import subprocess
     import sys
@@ -163,7 +163,7 @@ def main(
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
-    grad_ceiling: float = 25.0,
+    grad_ceiling: float = 0.0,
 ):
     if objective not in {"ddpm", "flow"}:
         raise SystemExit(f"unknown objective: {objective!r}")

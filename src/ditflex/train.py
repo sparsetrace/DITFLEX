@@ -71,6 +71,13 @@ def parse_args() -> argparse.Namespace:
                         "NOT modified, so the config-drift guard still passes. "
                         "Added for the 250K instability: dropping lr stalls the "
                         "norm growth that clipping alone only contains.")
+    p.add_argument("--wd", type=float, default=-1.0,
+                   help="override AdamW weight decay for THIS RUN (-1 = keep "
+                        "config value). Param-groups only, post-load; drift "
+                        "guard unaffected. Added for the 250K instability: lr "
+                        "cuts only DELAY the norm-growth blowup (1e-4: +850 "
+                        "steps; 3e-5: +4.7K steps); decay reverses the growth "
+                        "itself. Cumulative shrink ~ lr*wd*steps.")
     p.add_argument("--qk-mode", choices=["amap", "dmap"], default="amap",
                    help="amap = baseline directed attention; dmap = diffusion-map "
                         "attention (W_K tied to W_Q, R == 0, plus Coifman-Lafon "
@@ -142,6 +149,12 @@ def main() -> int:
         if ctx.is_rank0:
             print(f"[train] LR OVERRIDE for this run: {args.lr:g} "
                   f"(config value {cfg.train.lr:g} unchanged; drift guard unaffected)")
+    if args.wd >= 0.0:
+        for group in optimizer.param_groups:
+            group["weight_decay"] = args.wd
+        if ctx.is_rank0:
+            print(f"[train] WD OVERRIDE for this run: {args.wd:g} "
+                  "(decoupled AdamW decay; drift guard unaffected)")
 
     # -- latents: rank 0 warms the HF cache, then everyone loads ---------
     store_kw = dict(
@@ -291,8 +304,12 @@ def main() -> int:
             rate = LOG_EVERY / max(time.time() - getattr(main, "_t", t_start), 1e-9)
             main._t = time.time()
             avg = sum(losses[-LOG_EVERY:]) / len(losses[-LOG_EVERY:])
+            with torch.no_grad():
+                pnorm = torch.stack(
+                    [p.detach().norm() for p in model.parameters()]
+                ).norm().item()
             print(f"  step {step:>8,}  loss {avg:.5f}  {rate:5.2f} steps/s  "
-                  f"{rate * cfg.train.global_batch:7.0f} img/s")
+                  f"{rate * cfg.train.global_batch:7.0f} img/s  |w|={pnorm:8.2f}")
 
     # -- final save + push (rank 0), everyone waits ----------------------
     elapsed = time.time() - t_start

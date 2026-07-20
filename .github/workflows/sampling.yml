@@ -12,9 +12,9 @@ on:
         required: false
         default: "sparsetrace/ditflex-L2-flow,sparsetrace/ditflex-L2-flow-dmap"
       gpu:
-        description: "GPU kind for the sampler"
+        description: "GPU kind (L4 is plenty: 100 fwd passes @ batch 16, eager flex, no backward; ~5-10 cents/dispatch. Bump to A10G/B200 only if L4 is unavailable)"
         required: false
-        default: "B200"
+        default: "L4"
       sample_steps:
         description: "Euler steps"
         required: false

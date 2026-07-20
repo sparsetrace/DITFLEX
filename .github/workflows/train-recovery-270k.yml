@@ -1,0 +1,158 @@
+name: train-recovery-270k
+
+# Manual only: resumes a known-good checkpoint and runs a bounded,
+# transactional recovery segment on Modal.
+on:
+  workflow_dispatch:
+    inputs:
+      gpus:
+        description: "GPU count"
+        required: false
+        default: "1"
+      gpu_kind:
+        description: "Modal GPU kind"
+        required: false
+        default: "B200"
+      train_seconds:
+        description: "Total Modal supervisor budget in seconds"
+        required: false
+        default: "7200"
+      objective:
+        description: "Objective (ddpm | flow)"
+        required: false
+        default: "flow"
+      hub_repo:
+        description: "Hugging Face checkpoint repository"
+        required: false
+        default: "sparsetrace/ditflex-L2-flow"
+
+      # Recovery anchor and bounded diagnostic.
+      resume_step:
+        description: "Exact committed Hub step to resume"
+        required: false
+        default: "270000"
+      target_steps:
+        description: "Global training target used by the LR policy"
+        required: false
+        default: "400000"
+      max_steps:
+        description: "Maximum optimizer steps in this invocation (0 = time only)"
+        required: false
+        default: "5000"
+
+      # Keep the checkpoint's current LR/controller by default.
+      lr:
+        description: "LR override (0 = restore checkpoint LR)"
+        required: false
+        default: "0"
+      lr_policy:
+        description: "LR policy (constant | cosine | adaptive)"
+        required: false
+        default: "adaptive"
+      lr_backoff:
+        description: "Fresh-process retry LR multiplier"
+        required: false
+        default: "0.5"
+      lr_min_scale:
+        description: "Minimum adaptive scale"
+        required: false
+        default: "0.125"
+      max_retries:
+        description: "Maximum transactional retries"
+        required: false
+        default: "2"
+
+      wd:
+        description: "Weight decay override (-1 = restore recipe/checkpoint value)"
+        required: false
+        default: "-1"
+      clip:
+        description: "Global gradient clipping max norm"
+        required: false
+        default: "1.0"
+      spike_skip:
+        description: "Frozen-reference relative gradient skip multiplier"
+        required: false
+        default: "10.0"
+      grad_ceiling:
+        description: "Absolute pre-clip gradient skip ceiling (0 = disabled)"
+        required: false
+        default: "500.0"
+      grad_reference:
+        description: "Optional frozen gradient reference override (0 = checkpoint reference)"
+        required: false
+        default: "0"
+
+      # A high skip rate alone should warn before it rejects a flat-loss run.
+      skip_warn_rate:
+        description: "Window skip-rate warning threshold"
+        required: false
+        default: "0.30"
+      skip_retry_rate:
+        description: "Window skip-rate retry threshold"
+        required: false
+        default: "0.40"
+      skip_emergency_rate:
+        description: "Window skip-rate emergency threshold"
+        required: false
+        default: "0.60"
+
+      seed_offset:
+        description: "Base deterministic stochastic-stream offset"
+        required: false
+        default: "0"
+
+jobs:
+  launch:
+    name: >-
+      recovery · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} ·
+      step=${{ inputs.resume_step }} · max=${{ inputs.max_steps }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install 'modal<1.5'
+
+      - name: Launch detached transactional recovery
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODAL_GPU: ${{ inputs.gpu_kind }}
+          MODAL_GPUS: ${{ inputs.gpus }}
+          MODAL_TRAIN_SECONDS: ${{ inputs.train_seconds }}
+        run: |
+          set -euo pipefail
+          echo "Launching recovery from global step ${{ inputs.resume_step }}"
+          echo "Modal token id present: ${MODAL_TOKEN_ID:+yes}"
+
+          modal run --detach run/modal_train.py \
+            --train-seconds "${{ inputs.train_seconds }}" \
+            --objective "${{ inputs.objective }}" \
+            --hub-repo "${{ inputs.hub_repo }}" \
+            --resume-step "${{ inputs.resume_step }}" \
+            --no-auto-legacy-rollback \
+            --target-steps "${{ inputs.target_steps }}" \
+            --max-steps "${{ inputs.max_steps }}" \
+            --max-retries "${{ inputs.max_retries }}" \
+            --lr "${{ inputs.lr }}" \
+            --lr-policy "${{ inputs.lr_policy }}" \
+            --lr-backoff "${{ inputs.lr_backoff }}" \
+            --lr-min-scale "${{ inputs.lr_min_scale }}" \
+            --wd "${{ inputs.wd }}" \
+            --clip "${{ inputs.clip }}" \
+            --spike-skip "${{ inputs.spike_skip }}" \
+            --grad-ceiling "${{ inputs.grad_ceiling }}" \
+            --grad-reference "${{ inputs.grad_reference }}" \
+            --skip-warn-rate "${{ inputs.skip_warn_rate }}" \
+            --skip-retry-rate "${{ inputs.skip_retry_rate }}" \
+            --skip-emergency-rate "${{ inputs.skip_emergency_rate }}" \
+            --seed-offset "${{ inputs.seed_offset }}"

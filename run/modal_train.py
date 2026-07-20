@@ -256,7 +256,20 @@ def main() -> int:
         # saves+pushes behind it, so the DDP collectives never see a
         # half-absent rank during the upload.
         if cfg.hub.save_every_steps > 0 and step % cfg.hub.save_every_steps == 0:
-            if ctx.is_rank0:
+            # Push-health gate (the 250K lesson, stricter form): the Hub
+            # should only ever receive checkpoints from a model near its
+            # best. Noise is ~2%; +10% means something is off -- keep
+            # training (it may recover) but WITHHOLD the push. The 1.6x
+            # divergence guard above still aborts sustained blowups.
+            best = getattr(main, "_best_window", None)
+            healthy = True
+            if best is not None and len(losses) >= 200:
+                window = sum(losses[-200:]) / 200
+                healthy = window <= 1.10 * best
+                if not healthy and ctx.is_rank0:
+                    print(f"[train] step {step:,}: windowed loss {window:.4f} > "
+                          f"1.10x best {best:.4f} -- WITHHOLDING periodic push")
+            if ctx.is_rank0 and healthy:
                 save_and_push(step, completed=False)
             barrier(ctx)
 

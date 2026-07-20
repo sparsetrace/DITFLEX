@@ -48,6 +48,10 @@ on:
         description: "Skip steps with grad norm > this x EMA (0 = off)"
         required: false
         default: "4.0"
+      seed_offset:
+        description: "Data-order seed offset for this run (0 = recipe order)"
+        required: false
+        default: "0"
       max_steps:
         description: "Stop at this many steps THIS RUN (0 = time-boxed only). For a global target: target minus current step in state.json"
         required: false
@@ -95,4 +99,5 @@ jobs:
             --lr "${{ inputs.lr }}" \
             --wd "${{ inputs.wd }}" \
             --clip "${{ inputs.clip }}" \
-            --spike-skip "${{ inputs.spike_skip }}"
+            --spike-skip "${{ inputs.spike_skip }}" \
+            --seed-offset "${{ inputs.seed_offset }}"

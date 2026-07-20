@@ -78,6 +78,15 @@ def parse_args() -> argparse.Namespace:
                         "cuts only DELAY the norm-growth blowup (1e-4: +850 "
                         "steps; 3e-5: +4.7K steps); decay reverses the growth "
                         "itself. Cumulative shrink ~ lr*wd*steps.")
+    p.add_argument("--clip", type=float, default=1.0,
+                   help="gradient-clip max-norm for this run")
+    p.add_argument("--spike-skip", type=float, default=4.0,
+                   help="SKIP the optimizer step when the pre-clip grad norm "
+                        "exceeds this factor times its running EMA (0 = off). "
+                        "Clipping caps a bad step's SIZE but still takes it; "
+                        "skipping refuses it. Added after the DMAP 46K cliff: "
+                        "loss 0.80 -> floor in ~400 steps with |w| moving only "
+                        "0.002%% -- a single-event explosion, not norm growth.")
     p.add_argument("--qk-mode", choices=["amap", "dmap"], default="amap",
                    help="amap = baseline directed attention; dmap = diffusion-map "
                         "attention (W_K tied to W_Q, R == 0, plus Coifman-Lafon "
@@ -203,6 +212,16 @@ def main() -> int:
             "objective": cfg.train.objective,
             "completed": completed,
             "finished_at": datetime.now(timezone.utc).isoformat(),
+            # Effective hyperparameters ON THE RECORD: overrides are
+            # runtime-only (drift-safe), so without this the checkpoint
+            # would not know its own training history.
+            "effective": {
+                "lr": optimizer.param_groups[0]["lr"],
+                "weight_decay": optimizer.param_groups[0]["weight_decay"],
+                "clip": args.clip,
+                "spike_skip": args.spike_skip,
+                "steps_skipped": getattr(main, "_spikes", 0),
+            },
         }
 
     def save_and_push(at_step: int, completed: bool) -> None:
@@ -237,14 +256,35 @@ def main() -> int:
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        # DEVIATION (stability): DiT/SiT recipes do not clip. Added after a
-        # reproducible bf16 gradient explosion at step ~247.4K wiped the
-        # baseline weights (loss 0.77 -> zero-predictor floor 1.69 within
-        # 1.4K steps). The deterministic batch sampler replays the same
-        # batches on resume, so passing that region REQUIRES clipping.
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        ema.update(model)          # raw module: clean names, shared params
+        # DEVIATION (stability): DiT/SiT recipes neither clip nor skip.
+        # Clipping added after the baseline's ~247.4K norm-growth blowup;
+        # spike-skip added after the DMAP chain's 46K single-event cliff
+        # (sharp explosion at flat |w| -- clipping caps a bad step's size
+        # but still takes it in the bad direction; skipping refuses it).
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            model.parameters(), max_norm=args.clip
+        ).item()
+        gema = getattr(main, "_grad_ema", None)
+        spiked = (
+            args.spike_skip > 0.0
+            and gema is not None
+            and grad_norm > args.spike_skip * gema
+        )
+        if spiked:
+            optimizer.zero_grad(set_to_none=True)   # refuse the step entirely
+            main._spikes = getattr(main, "_spikes", 0) + 1
+            if ctx.is_rank0:
+                print(f"[train] step {step:,}: grad norm {grad_norm:.2f} > "
+                      f"{args.spike_skip:g}x EMA {gema:.2f} -- SKIPPING step "
+                      f"(total skipped: {main._spikes})")
+        else:
+            optimizer.step()
+            ema.update(model)      # raw module: clean names, shared params
+            # EMA of the grad norm updates only on accepted steps, so one
+            # spike cannot poison the baseline it is judged against.
+            main._grad_ema = (
+                grad_norm if gema is None else 0.99 * gema + 0.01 * grad_norm
+            )
 
         val = loss.item()
         if not torch.isfinite(loss):

@@ -21,6 +21,14 @@ on:
         description: "Objective (ddpm | flow)"
         required: false
         default: "flow"
+      lr:
+        description: "LR override for this run (0 = keep recipe 1e-4)"
+        required: false
+        default: "0"
+      max_steps:
+        description: "Stop at this many steps THIS RUN (0 = time-boxed only). For a global target: target minus current step"
+        required: false
+        default: "0"
       hub_repo:
         description: "Checkpoint repo. ONE PER OBJECTIVE: config-drift refusal (correctly) blocks resuming flow from a ddpm checkpoint"
         required: false
@@ -58,4 +66,6 @@ jobs:
           modal run --detach run/modal_train.py \
             --train-seconds "${{ inputs.train_seconds }}" \
             --objective "${{ inputs.objective }}" \
-            --hub-repo "${{ inputs.hub_repo }}"
+            --hub-repo "${{ inputs.hub_repo }}" \
+            --max-steps "${{ inputs.max_steps }}" \
+            --lr "${{ inputs.lr }}"

@@ -113,8 +113,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--grad-ceiling",
         type=float,
-        default=25.0,
-        help="absolute raw-gradient-norm skip ceiling (0 = off)",
+        default=0.0,
+        help=(
+            "absolute raw-gradient-norm skip ceiling (0 = off). Prefer the "
+            "relative guard; a low fixed ceiling can reject normal hard batches."
+        ),
     )
     p.add_argument(
         "--seed-offset",
@@ -205,7 +208,25 @@ def main() -> int:
     grad_ema = _optional_float(guard_state.get("grad_ema"))
     spikes_total = int(guard_state.get("spikes_total", 0))
     recent_losses = [float(x) for x in guard_state.get("recent_losses", [])][-LOSS_WINDOW:]
-    window_spikes = int(guard_state.get("window_spikes", 0))
+    controller_state = guard_state.get("lr_controller")
+    controller_state_version = (
+        int(controller_state.get("version", 1))
+        if isinstance(controller_state, dict)
+        else 0
+    )
+    # v1 counted every absolute-ceiling rejection as an LR-controller spike.
+    # Start fresh under v2 semantics rather than carrying a partial contaminated
+    # window across the upgrade.
+    window_relative_spikes = (
+        int(guard_state.get("window_spikes", 0))
+        if controller_state_version >= 2
+        else 0
+    )
+    window_skips = (
+        int(guard_state.get("window_skips", 0))
+        if controller_state_version >= 2
+        else 0
+    )
     spikes_at_start = spikes_total
     initial_loss = (
         sum(recent_losses[-LOSS_WINDOW:]) / LOSS_WINDOW
@@ -227,14 +248,17 @@ def main() -> int:
         emergency_ratio=args.loss_emergency_ratio,
     )
     legacy_best = _optional_float(guard_state.get("best_window"))
+    # A deliberate reset means scale=1 at the current cosine envelope.  The
+    # previous implementation still inherited a low checkpoint LR even when
+    # --reset-lr-controller was passed, which made the flag ineffective.
+    controller_seed_lr = base_lr if args.reset_lr_controller else checkpoint_lr
     lr_controller = AdaptiveLrController(
         lr_spec,
         start_step=start_step,
-        checkpoint_lr=checkpoint_lr,
+        checkpoint_lr=controller_seed_lr,
         initial_loss=initial_loss,
         legacy_best_loss=legacy_best,
     )
-    controller_state = guard_state.get("lr_controller")
     if controller_state and not args.reset_lr_controller:
         lr_controller.load_state_dict(controller_state)
     elif controller_state and args.reset_lr_controller and ctx.is_rank0:
@@ -262,8 +286,20 @@ def main() -> int:
             "[train] guard state: "
             f"grad_ema={grad_ema if grad_ema is not None else 'unset'}  "
             f"spikes_total={spikes_total}  recent_losses={len(recent_losses)}  "
-            f"window_spikes={window_spikes}  controller={status}"
+            f"window_relative_spikes={window_relative_spikes}  "
+            f"window_skips={window_skips}  controller={status}"
         )
+        if (
+            grad_ema is not None
+            and args.grad_ceiling > 0.0
+            and args.grad_ceiling < 2.0 * grad_ema
+        ):
+            print(
+                f"[train] WARNING: grad_ceiling={args.grad_ceiling:g} is only "
+                f"{args.grad_ceiling / grad_ema:.2f}x the resumed grad EMA "
+                f"({grad_ema:.2f}); this can skip many normal finite batches. "
+                "Use --grad-ceiling=0 to rely on clipping plus the relative guard."
+            )
 
     # -- latents: rank 0 warms cache, then every rank creates its GPU store --
     store_kw = dict(
@@ -322,7 +358,10 @@ def main() -> int:
             "grad_ema": grad_ema,
             "spikes_total": spikes_total,
             "recent_losses": recent_losses[-LOSS_WINDOW:],
-            "window_spikes": window_spikes,
+            # Only relative spikes are a controller signal.  Absolute-only
+            # guard skips are tracked separately for observability.
+            "window_spikes": window_relative_spikes,
+            "window_skips": window_skips,
             "loss_window": LOSS_WINDOW,
             "grad_ema_decay": GRAD_EMA_DECAY,
             "lr_controller": lr_controller.state_dict(),
@@ -452,7 +491,9 @@ def main() -> int:
         if spiked:
             optimizer.zero_grad(set_to_none=True)
             spikes_total += 1
-            window_spikes += 1
+            window_skips += 1
+            if relative_spike:
+                window_relative_spikes += 1
             if ctx.is_rank0:
                 reasons: list[str] = []
                 if relative_spike:
@@ -486,9 +527,11 @@ def main() -> int:
         if step % LOSS_WINDOW == 0 and len(recent_losses) >= LOSS_WINDOW:
             window = current_window()
             assert window is not None
-            spike_rate = window_spikes / LOSS_WINDOW
-            event = lr_controller.observe_window(window, spike_rate)
-            window_spikes = 0
+            relative_spike_rate = window_relative_spikes / LOSS_WINDOW
+            skip_rate = window_skips / LOSS_WINDOW
+            event = lr_controller.observe_window(window, relative_spike_rate)
+            window_relative_spikes = 0
+            window_skips = 0
 
             # Rank 0 owns external actions even though every rank updates the
             # deterministic controller from the same synchronized inputs.
@@ -505,7 +548,8 @@ def main() -> int:
             if ctx.is_rank0 and event.reason:
                 print(
                     f"[train] stability window @ {step:,}: loss={window:.6f}  "
-                    f"spikes={spike_rate:.1%}  {event.reason}"
+                    f"relative_spikes={relative_spike_rate:.1%}  "
+                    f"all_skips={skip_rate:.1%}  {event.reason}"
                 )
             if backoff_decision:
                 new_lr = lr_controller.apply(optimizer, step)

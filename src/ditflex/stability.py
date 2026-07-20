@@ -107,7 +107,7 @@ class StabilityEvent:
 class AdaptiveLrController:
     """Closed-form LR schedule plus a persistent loss-trend controller."""
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(
         self,
@@ -245,13 +245,26 @@ class AdaptiveLrController:
             self.last_trend_ratio >= self.spec.emergency_ratio
             or self.last_best_ratio >= self.spec.best_emergency_ratio
         )
-        spike_emergency = spike_rate >= self.spec.spike_rate_emergency
+
+        # A high pre-clip gradient norm is not, by itself, evidence that the LR
+        # is too high: the norm is measured before optimizer.step(), and the
+        # configured clip already bounds the applied update.  Spike rate may
+        # strengthen a loss-based decision, but it must never independently
+        # lower LR while the loss trend is flat.
+        spike_emergency = (
+            spike_rate >= self.spec.spike_rate_emergency
+            and self.last_trend_ratio >= self.spec.rise_ratio
+        )
         emergency = loss_emergency or spike_emergency
 
-        # Require both a rising short/long trend and a modest distance from the
-        # best smoothed loss, otherwise ordinary plateau noise can cause decay.
+        # Require a rising short/long loss trend and a modest distance from the
+        # best smoothed loss.  Spikes are corroborating evidence, not a trigger.
         loss_bad = self.last_trend_ratio >= self.spec.rise_ratio and self.last_best_ratio >= 1.03
-        spike_bad = spike_rate >= self.spec.spike_rate_threshold
+        spike_bad = (
+            spike_rate >= self.spec.spike_rate_threshold
+            and self.last_trend_ratio >= 1.02
+            and self.last_best_ratio >= 1.01
+        )
         bad = loss_bad or spike_bad
 
         if emergency:
@@ -263,7 +276,7 @@ class AdaptiveLrController:
                     f"loss trend={self.last_trend_ratio:.3f}, best-ratio={self.last_best_ratio:.3f}"
                 )
             if spike_emergency:
-                reasons.append(f"spike-rate={spike_rate:.1%}")
+                reasons.append(f"corroborating relative-spike-rate={spike_rate:.1%}")
             reason = "; ".join(reasons)
             if self._can_backoff():
                 return self._backoff(f"emergency backoff: {reason}")
@@ -300,6 +313,17 @@ class AdaptiveLrController:
             return StabilityEvent(reason=f"instability warning {self.bad_windows}: {reason}")
 
         self.bad_windows = 0
+        self.emergency_windows = 0
+
+        # Keep the operator informed about a noisy gradient distribution, but
+        # do not convert a stable-loss spike window into an LR action.
+        spike_warning = ""
+        if spike_rate >= self.spec.spike_rate_threshold:
+            spike_warning = (
+                f"high relative-spike-rate={spike_rate:.1%} with stable loss; "
+                "LR unchanged"
+            )
+
         request_checkpoint = False
         if self.pending_recovery_checkpoint:
             self.good_windows_after_backoff += 1
@@ -307,7 +331,10 @@ class AdaptiveLrController:
                 self.pending_recovery_checkpoint = False
                 self.good_windows_after_backoff = 0
                 request_checkpoint = True
-        return StabilityEvent(request_checkpoint=request_checkpoint)
+        return StabilityEvent(
+            reason=spike_warning,
+            request_checkpoint=request_checkpoint,
+        )
 
     # -- checkpoint health / state -----------------------------------
 
@@ -371,7 +398,8 @@ class AdaptiveLrController:
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
-        if int(state.get("version", -1)) != self.VERSION:
+        version = int(state.get("version", -1))
+        if version not in {1, self.VERSION}:
             raise ValueError(
                 f"unsupported LR-controller state version {state.get('version')!r}; "
                 "pass --reset-lr-controller to deliberately start a new controller"
@@ -403,3 +431,13 @@ class AdaptiveLrController:
             state.get("pending_recovery_checkpoint", False)
         )
         self.good_windows_after_backoff = int(state.get("good_windows_after_backoff", 0))
+
+        if version == 1:
+            # v1 allowed spike-only windows to accumulate loss-controller
+            # warnings/backoffs.  Preserve the learned LR scale and loss EMAs,
+            # but clear unresolved decisions created under that coupling.
+            self.bad_windows = 0
+            self.emergency_windows = 0
+            self.cooldown_remaining = 0
+            self.pending_recovery_checkpoint = False
+            self.good_windows_after_backoff = 0

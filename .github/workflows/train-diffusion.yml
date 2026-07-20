@@ -28,6 +28,14 @@ on:
         description: "Checkpoint repo for the DMAP chain (never share with the baseline)"
         required: false
         default: "sparsetrace/ditflex-L2-flow-dmap"
+      clip:
+        description: "Gradient-clip max-norm (46K cliff protocol: 0.25)"
+        required: false
+        default: "1.0"
+      spike_skip:
+        description: "Skip steps with grad norm > this x EMA (0 = off)"
+        required: false
+        default: "4.0"
       dmap_alpha:
         description: "Coifman-Lafon exponent (0 | 0.5 | 1)"
         required: false
@@ -48,7 +56,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install Modal
-        run: pip install modal
+        run: pip install 'modal<1.5'
 
       - name: Launch detached DMAP training run
         env:
@@ -63,4 +71,6 @@ jobs:
             --train-seconds "${{ inputs.train_seconds }}" \
             --objective "${{ inputs.objective }}" \
             --hub-repo "${{ inputs.hub_repo }}" \
-            --dmap-alpha "${{ inputs.dmap_alpha }}"
+            --dmap-alpha "${{ inputs.dmap_alpha }}" \
+            --clip "${{ inputs.clip }}" \
+            --spike-skip "${{ inputs.spike_skip }}"

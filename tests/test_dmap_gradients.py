@@ -243,3 +243,58 @@ def test_dmap_compiled_matches_eager():
             f"|eager|={g_e.norm().item():.4e} |compiled|={g_c.norm().item():.4e} "
             f"cos={torch.nn.functional.cosine_similarity(g_c.flatten(), g_e.flatten(), dim=0).item():.4f}"
         )
+
+
+@requires_cuda
+def test_compiled_scoremod_capture_probe():
+    """The historical-bug interrogation, DE-ISLANDED: compile
+    flex_attention directly with the capturing score_mod (bypassing
+    _dmap_attention_eager entirely) at non-degenerate inputs, and compare
+    outputs and input gradients against eager.
+
+    PASS -> compiled capture is fine, the eager island is unnecessary:
+            delete the @torch.compiler.disable decorator and the chain
+            runs the score_mod form at full compiled speed. (And the
+            production stall's cause moves back to unknown -- flag it.)
+    FAIL -> the capture bug is real at last, this test is the minimal
+            upstream repro, and the island (or the augmentation form)
+            stays.
+    """
+    from torch.nn.attention.flex_attention import flex_attention as fa
+
+    torch.manual_seed(0)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    B, H, N, D = 2, 2, 64, 16
+    q = torch.randn(B, H, N, D, device="cuda", requires_grad=True)
+    v = torch.randn(B, H, N, D, device="cuda", requires_grad=True)
+    scale = D ** -0.5
+
+    def run(fn):
+        g = scale * (q * q).sum(dim=-1)          # tied: k is q; g differentiable
+
+        def mod(score, b, h, q_idx, kv_idx):
+            return 2.0 * score - g[b, h, kv_idx]
+
+        return fn(q, q, v, score_mod=mod, scale=scale)
+
+    out_e = run(fa)
+    out_e.square().mean().backward()
+    ge_q, ge_v = q.grad.detach().clone(), v.grad.detach().clone()
+    q.grad = None
+    v.grad = None
+
+    torch._dynamo.reset()
+    out_c = run(torch.compile(fa))
+    out_c.square().mean().backward()
+
+    def close(a, b, what):
+        max_abs = (a - b).abs().max().item()
+        ref = b.abs().max().item()
+        assert max_abs <= 1e-5 + 2e-2 * ref, (
+            f"compiled capture diverges [{what}]: abs={max_abs:.3e} ref={ref:.3e} "
+            f"cos={torch.nn.functional.cosine_similarity(a.flatten(), b.flatten(), dim=0).item():.4f}"
+        )
+
+    close(out_c.detach(), out_e.detach(), "forward")
+    close(q.grad.detach(), ge_q, "grad q (includes the g-capture path)")
+    close(v.grad.detach(), ge_v, "grad v")

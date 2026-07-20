@@ -86,9 +86,9 @@ on:
         required: false
         default: "4.0"
       grad_ceiling:
-        description: "Absolute raw gradient-norm skip ceiling (0 = off)"
+        description: "Absolute raw gradient-norm skip ceiling (0 = off; recommended)"
         required: false
-        default: "25.0"
+        default: "0"
       seed_offset:
         description: "Runtime-only data-order seed offset"
         required: false

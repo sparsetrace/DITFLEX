@@ -116,6 +116,9 @@ def train(
     spike_skip: float = 4.0,
     seed_offset: int = 0,
     grad_ceiling: float = 0.0,
+    skip_warn_rate: float = 0.30,
+    skip_retry_rate: float = 0.40,
+    skip_emergency_rate: float = 0.60,
 ) -> int:
     import subprocess
     import sys
@@ -130,6 +133,12 @@ def train(
         return 2
     if train_seconds <= 0:
         print("[modal] train_seconds must be positive")
+        return 2
+    if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
+        print(
+            "[modal] skip thresholds must satisfy "
+            "0 <= warn <= retry <= emergency <= 1"
+        )
         return 2
 
     n_gpu = torch.cuda.device_count()
@@ -245,6 +254,9 @@ def train(
             f"--clip={clip}",
             f"--spike-skip={spike_skip}",
             f"--grad-ceiling={grad_ceiling}",
+            f"--skip-warn-rate={skip_warn_rate}",
+            f"--skip-retry-rate={skip_retry_rate}",
+            f"--skip-emergency-rate={skip_emergency_rate}",
         ]
         if hub_repo:
             command.append(f"--hub-repo={hub_repo}")
@@ -351,11 +363,19 @@ def main(
     spike_skip: float = 4.0,
     seed_offset: int = 0,
     grad_ceiling: float = 0.0,
+    skip_warn_rate: float = 0.30,
+    skip_retry_rate: float = 0.40,
+    skip_emergency_rate: float = 0.60,
 ):
     if objective not in {"ddpm", "flow"}:
         raise SystemExit(f"unknown objective: {objective!r}")
     if lr_policy not in {"constant", "cosine", "adaptive"}:
         raise SystemExit(f"unknown lr_policy: {lr_policy!r}")
+    if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
+        raise SystemExit(
+            "skip thresholds must satisfy "
+            "0 <= warn <= retry <= emergency <= 1"
+        )
 
     return_code = train.remote(
         train_seconds=train_seconds,
@@ -392,6 +412,9 @@ def main(
         spike_skip=spike_skip,
         seed_offset=seed_offset,
         grad_ceiling=grad_ceiling,
+        skip_warn_rate=skip_warn_rate,
+        skip_retry_rate=skip_retry_rate,
+        skip_emergency_rate=skip_emergency_rate,
     )
     if return_code != 0:
         raise SystemExit(return_code)

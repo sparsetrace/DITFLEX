@@ -1,319 +1,153 @@
-"""src/ditflex/train.py -- time-boxed DDP training loop.
+"""run/modal_train.py -- time-boxed DiT-L/2 training on Modal.
 
-Launched by run/modal_train.py via torchrun:
+The training counterpart to tests/modal_ci.py. Launched detached so the
+GitHub Actions job that starts it can exit after minutes while the run
+continues:
 
-    python -m torch.distributed.run --nproc-per-node=8 --standalone \
-        -m ditflex.train --train-seconds 7200 --objective ddpm
+    MODAL_GPUS=8 modal run --detach run/modal_train.py --train-seconds 7200 --objective ddpm
 
-Long training is many short runs: pull latest checkpoint from the Hub
-(if any) -> train until the wall-clock budget is spent (rank 0 checks the
-deadline every cfg.train.deadline_check_every steps and broadcasts the
-stop, so per-rank clock drift cannot desynchronise the exit) -> save ->
-push -> exit. Resume is exact because data sampling is stateless in
-(global_step, rank).
+Long training is many short runs, not one long one: each invocation pulls
+the latest checkpoint from the HF Hub (if any), trains until the wall-clock
+budget is spent, saves, uploads, and exits. Chain invocations to accumulate
+steps. Resume is exact because data sampling is stateless -- indices are
+drawn from a generator seeded by (global_step, rank).
 
-Order of operations (each is load-bearing):
-    build raw model -> load checkpoint into it -> EMA on raw params
-    -> torch.compile(model) -> DDP-wrap the compiled module
-Compile-inner-then-DDP is the README's chosen order; the interaction is
-version-sensitive, so if compile fails here, flipping to
-torch.compile(DDP(model)) is the first thing to try.
+GPU kind and count are fixed when the Modal function is built, so they are
+env vars (set by the workflow), not CLI flags:
 
-Recipe fidelity: AdamW lr 1e-4 constant, no warmup, no weight decay,
-EMA 0.9999, bf16 autocast with fp32 master weights, label dropout 0.1
-(inside the objective), NO gradient clipping (published DiT does not
-clip; the overfit smoke's clipping is smoke-only).
+    MODAL_GPU    B300 (default) | B200 | ...
+    MODAL_GPUS   8 (default) | 2 for smoke
+
+HF_TOKEN (write scope: pulls latents AND pushes checkpoints) comes from
+the launching environment -- a GitHub repo secret exported by train.yml,
+or `export HF_TOKEN=...` locally -- and is forwarded into the container
+via Secret.from_dict. No Modal-side secret needed.
+
+NOTE: this launcher is ready; the entrypoint it launches (ditflex.train)
+is Phase 1 and does not exist yet. Until it does, this file is
+scaffolding -- do not wire train.yml to real GPU hours before
+tests/modal_ci.py is green and the overfit smoke passes.
 """
 
 from __future__ import annotations
 
-import argparse
 import os
-import time
-from datetime import datetime, timezone
+from pathlib import Path
 
-import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
+import modal
 
-from ditflex.checkpoint import (
-    load_checkpoint,
-    pull_from_hub,
-    push_to_hub,
-    save_checkpoint,
+REPO_ROOT = Path(__file__).parent.parent
+
+GPU_KIND = os.environ.get("MODAL_GPU", "B300")
+GPU_COUNT = int(os.environ.get("MODAL_GPUS", "8"))
+TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
+
+# The Modal function timeout must cover train_seconds PLUS checkpoint
+# download (~12 min), upload (~12 min), and cold compile (~3 min) -- but
+# NOT much more: a hung run bills until the timeout kills it. So the
+# ceiling derives from the requested budget: the workflow exports
+# MODAL_TRAIN_SECONDS and we add a 1-hour overhead allowance. A 2-hour
+# dispatch can never bill more than ~3 hours, even if everything hangs.
+_BUDGET = int(os.environ.get("MODAL_TRAIN_SECONDS", "7200"))
+TIMEOUT_CEILING = _BUDGET + 3600
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git")
+    .pip_install("torch", extra_options=f"--index-url {TORCH_INDEX}")
+    .pip_install(
+        "diffusers>=0.31",
+        "transformers>=4.44",
+        "safetensors>=0.4.5",
+        "huggingface_hub>=0.26",
+        "numpy>=1.26",
+        "tqdm",
+        "pillow",          # sample-grid PNG at end of each link
+    )
+    .add_local_dir(
+        REPO_ROOT,
+        remote_path="/repo",
+        ignore=[".git", "**/__pycache__", "*.egg-info", ".venv", ".ruff_cache", ".pytest_cache"],
+    )
 )
-from ditflex.config import Config
-from ditflex.distributed import barrier, broadcast_flag, cleanup, setup
-from ditflex.ema import EMA
-from ditflex.latents import LatentStore
-from ditflex.model import build_model
-from ditflex.objective import build_objective
 
-CKPT_DIR = "/tmp/ditflex_ckpt"
-LOG_EVERY = 50
+app = modal.App("ditflex-train", image=image)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--train-seconds", type=int, required=True)
-    p.add_argument("--objective", choices=["ddpm", "flow"], required=True)
-    p.add_argument("--hub-repo", type=str, default=None,
-                   help="override cfg.hub.checkpoint_repo")
-    p.add_argument("--no-push", action="store_true",
-                   help="skip the Hub upload (local smokes)")
-    p.add_argument("--max-latent-files", type=int, default=None,
-                   help="load only the first N latent shards (smokes)")
-    p.add_argument("--max-steps", type=int, default=None,
-                   help="hard step cap regardless of wall clock (smokes)")
-    p.add_argument("--qk-mode", choices=["amap", "dmap"], default="amap",
-                   help="amap = baseline directed attention; dmap = diffusion-map "
-                        "attention (W_K tied to W_Q, R == 0, plus Coifman-Lafon "
-                        "density correction)")
-    p.add_argument("--dmap-alpha", type=float, default=0.0,
-                   help="density-correction exponent for --qk-mode=dmap "
-                        "(0 = none, 0.5 = Fokker-Planck, 1 = Laplace-Beltrami)")
-    p.add_argument("--sample-count", type=int, default=16,
-                   help="images to sample after the final save (0 disables)")
-    p.add_argument("--sample-steps", type=int, default=50)
-    p.add_argument("--cfg-scale", type=float, default=4.0)
-    return p.parse_args()
+@app.function(
+    gpu=f"{GPU_KIND}:{GPU_COUNT}",
+    timeout=TIMEOUT_CEILING,
+    secrets=[
+        modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")}),
+        # add WANDB_API_KEY here the same way when logging lands
+    ],
+)
+def train(
+    train_seconds: int = 7200,
+    objective: str = "flow",
+    hub_repo: str = "",
+    max_steps: int = 0,
+) -> int:
+    import subprocess
+    import sys
 
+    import torch
 
-def main() -> int:
-    args = parse_args()
-    ctx = setup()
+    n_gpu = torch.cuda.device_count()
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+        capture_output=True,
+        text=True,
+    )
+    print(f"[modal] {n_gpu} GPUs:\n{result.stdout.strip()}")
 
-    cfg = Config()
-    cfg.train.objective = args.objective
-    cfg.model.qk_mode = args.qk_mode
-    cfg.model.dmap_alpha = args.dmap_alpha
-    if args.hub_repo:
-        cfg.hub.checkpoint_repo = args.hub_repo
-
-    if cfg.train.global_batch % ctx.world != 0:
-        raise ValueError(f"global_batch {cfg.train.global_batch} % world {ctx.world} != 0")
-    per_rank_batch = cfg.train.global_batch // ctx.world
-
-    if ctx.is_rank0:
-        print(f"[train] world={ctx.world}  per_rank_batch={per_rank_batch}")
-        print(cfg.to_json())
-
-    # -- checkpoint pull (rank 0 downloads, shared FS on one node) -------
-    resume_dir = None
-    if ctx.is_rank0:
-        resume_dir = pull_from_hub(cfg.hub.checkpoint_repo, CKPT_DIR)
-        print(f"[train] resume checkpoint: {resume_dir or 'none (fresh start)'}")
-    barrier(ctx)
-    if not ctx.is_rank0 and os.path.exists(os.path.join(CKPT_DIR, "state.json")):
-        resume_dir = CKPT_DIR
-
-    # -- model / ema / optimizer, load BEFORE compile/wrap ---------------
-    if cfg.model.qk_mode == "amap":
-        model = build_model(cfg.model).to(ctx.device)
-    elif cfg.model.qk_mode == "dmap":
-        from ditflex.diffusion_model import build_dmap_model
-
-        model = build_dmap_model(cfg.model).to(ctx.device)
-    else:
-        raise ValueError(f"unknown qk_mode: {cfg.model.qk_mode!r}")
-    ema = EMA(model, cfg.train.ema_decay).to(ctx.device)
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"], check=True
     )
 
-    start_step = 0
-    run_history: list = []
-    if resume_dir is not None:
-        state = load_checkpoint(resume_dir, model, ema, optimizer, cfg)
-        start_step = int(state["step"])
-        run_history = state.get("run_history", [])
-        if ctx.is_rank0:
-            print(f"[train] resumed at step {start_step:,}")
+    # torchrun handles per-rank process spawn + env for single-node DDP.
+    # nproc comes from what the container actually has, so the launcher
+    # cannot disagree with the reservation.
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        f"--nproc-per-node={n_gpu}",
+        "--standalone",
+        "-m",
+        "ditflex.train",
+        f"--train-seconds={train_seconds}",
+        f"--objective={objective}",
+    ]
+    if hub_repo:
+        cmd.append(f"--hub-repo={hub_repo}")
+    if max_steps > 0:
+        cmd.append(f"--max-steps={max_steps}")
+    print(f"\n[modal] running: {' '.join(cmd)}\n")
+    return subprocess.run(cmd, cwd="/repo").returncode
 
-    # -- latents: rank 0 warms the HF cache, then everyone loads ---------
-    store_kw = dict(
-        repo_id=cfg.data.hub_repo,
-        device=ctx.device,
-        max_files=args.max_latent_files,
-        expected_total=cfg.data.expected_total,
-        latent_shape=cfg.data.latent_shape,
-        num_classes=cfg.model.num_classes,
+
+@app.local_entrypoint()
+def main(
+    train_seconds: int = 7200,
+    objective: str = "flow",
+    hub_repo: str = "",
+    max_steps: int = 0,
+):
+    """
+    Args:
+        train_seconds: stepping budget (checkpoint I/O and compile are on top)
+        objective:     ddpm | flow
+        hub_repo:      checkpoint repo override. SMOKES MUST SET THIS to a
+                       scratch repo -- a smoke that pushes to the real repo
+                       would be silently resumed by the real run.
+    """
+    if objective not in ("ddpm", "flow"):
+        raise SystemExit(f"unknown objective: {objective!r}")
+
+    rc = train.remote(
+        train_seconds=train_seconds, objective=objective,
+        hub_repo=hub_repo, max_steps=max_steps,
     )
-    if ctx.is_rank0:
-        store = LatentStore.from_hub(**store_kw)
-    barrier(ctx)
-    if not ctx.is_rank0:
-        store = LatentStore.from_hub(**store_kw)
-    if ctx.is_rank0:
-        print(f"[train] latents resident: {len(store):,} "
-              f"({store.latents.numel() * 2 / 1024**3:.2f} GiB bf16)")
-
-    objective = build_objective(
-        cfg.train.objective,
-        label_dropout=cfg.train.label_dropout,
-        num_classes=cfg.model.num_classes,
-    )
-
-    # -- compile inner, then DDP-wrap (README order; version-sensitive) --
-    compiled = torch.compile(model)
-    wrapped = (
-        DDP(compiled, device_ids=[ctx.local_rank]) if ctx.is_distributed else compiled
-    )
-
-    # -- the loop --------------------------------------------------------
-    step = start_step
-    t_start = time.time()
-    deadline = t_start + args.train_seconds
-    losses: list[float] = []
-    last_archive_bucket = start_step // cfg.hub.archive_every_steps
-    wrapped.train()
-
-    def run_record(end_step: int, completed: bool) -> dict:
-        return {
-            "start_step": start_step,
-            "end_step": end_step,
-            "seconds": round(time.time() - t_start, 1),
-            "world": ctx.world,
-            "objective": cfg.train.objective,
-            "completed": completed,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-    def save_and_push(at_step: int, completed: bool) -> None:
-        """Rank-0 only. Periodic saves record the run-in-progress
-        (completed=False) so a crash-resume still sees honest history."""
-        nonlocal last_archive_bucket
-        state = {
-            "step": at_step,
-            "run_history": run_history + [run_record(at_step, completed)],
-        }
-        save_checkpoint(CKPT_DIR, model, ema, optimizer, cfg, state)
-        tag = "final" if completed else "periodic"
-        print(f"[train] saved step {at_step:,} ({tag})")
-        if not args.no_push:
-            bucket = at_step // cfg.hub.archive_every_steps
-            archive = at_step if bucket != last_archive_bucket else None
-            last_archive_bucket = bucket
-            push_to_hub(CKPT_DIR, cfg.hub.checkpoint_repo, archive_step=archive)
-            print(f"[train] pushed to {cfg.hub.checkpoint_repo}")
-
-    while True:
-        if step % cfg.train.deadline_check_every == 0 and step > start_step:
-            stop = ctx.is_rank0 and time.time() >= deadline
-            if broadcast_flag(ctx, stop):
-                break
-        if args.max_steps is not None and (step - start_step) >= args.max_steps:
-            break
-
-        x0, y = store.batch(step, ctx.rank, per_rank_batch, cfg.train.base_seed)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = objective.loss(wrapped, x0, y)
-
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        # DEVIATION (stability): DiT/SiT recipes do not clip. Added after a
-        # reproducible bf16 gradient explosion at step ~247.4K wiped the
-        # baseline weights (loss 0.77 -> zero-predictor floor 1.69 within
-        # 1.4K steps). The deterministic batch sampler replays the same
-        # batches on resume, so passing that region REQUIRES clipping.
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        ema.update(model)          # raw module: clean names, shared params
-
-        val = loss.item()
-        if not torch.isfinite(loss):
-            print(f"[train][rank {ctx.rank}] step {step}: loss={val} -- diverged, "
-                  "aborting WITHOUT saving so the Hub 'latest' stays healthy.")
-            cleanup(ctx)
-            return 1
-
-        losses.append(val)
-        step += 1
-
-        # Divergence guard (the 247K lesson): NaN is not the only failure
-        # mode -- a gradient explosion can collapse the model to the
-        # zero-predictor floor while every loss stays finite, and periodic
-        # saves would then push poisoned checkpoints for hours. Track the
-        # best 200-step mean; if the current mean exceeds 1.6x best for
-        # two consecutive windows, abort WITHOUT saving.
-        if step % 200 == 0 and len(losses) >= 200 and (step - start_step) > 400:
-            window = sum(losses[-200:]) / 200
-            best = getattr(main, "_best_window", None)
-            if best is None or window < best:
-                main._best_window = window
-                main._blown_windows = 0
-            elif window > 1.6 * best:
-                main._blown_windows = getattr(main, "_blown_windows", 0) + 1
-                if main._blown_windows >= 2:
-                    print(f"[train][rank {ctx.rank}] step {step}: windowed loss "
-                          f"{window:.4f} > 1.6x best {best:.4f} for 2 windows -- "
-                          "DIVERGENCE, aborting WITHOUT saving.")
-                    cleanup(ctx)
-                    return 1
-            else:
-                main._blown_windows = 0
-
-        # Periodic checkpoint: every rank reaches the barrier, rank 0
-        # saves+pushes behind it, so the DDP collectives never see a
-        # half-absent rank during the upload.
-        if cfg.hub.save_every_steps > 0 and step % cfg.hub.save_every_steps == 0:
-            # Push-health gate (the 250K lesson, stricter form): the Hub
-            # should only ever receive checkpoints from a model near its
-            # best. Noise is ~2%; +10% means something is off -- keep
-            # training (it may recover) but WITHHOLD the push. The 1.6x
-            # divergence guard above still aborts sustained blowups.
-            best = getattr(main, "_best_window", None)
-            healthy = True
-            if best is not None and len(losses) >= 200:
-                window = sum(losses[-200:]) / 200
-                healthy = window <= 1.10 * best
-                if not healthy and ctx.is_rank0:
-                    print(f"[train] step {step:,}: windowed loss {window:.4f} > "
-                          f"1.10x best {best:.4f} -- WITHHOLDING periodic push")
-            if ctx.is_rank0 and healthy:
-                save_and_push(step, completed=False)
-            barrier(ctx)
-
-        if ctx.is_rank0 and step % LOG_EVERY == 0:
-            rate = LOG_EVERY / max(time.time() - getattr(main, "_t", t_start), 1e-9)
-            main._t = time.time()
-            avg = sum(losses[-LOG_EVERY:]) / len(losses[-LOG_EVERY:])
-            print(f"  step {step:>8,}  loss {avg:.5f}  {rate:5.2f} steps/s  "
-                  f"{rate * cfg.train.global_batch:7.0f} img/s")
-
-    # -- final save + push (rank 0), everyone waits ----------------------
-    elapsed = time.time() - t_start
-    if ctx.is_rank0:
-        print(f"[train] run done after {elapsed/60:.1f} min "
-              f"({step - start_step:,} steps this run)")
-        save_and_push(step, completed=True)
-
-    # -- fixed-seed sample grid: the time-lapse frame for this link ------
-    # Strictly AFTER the final save+push, and non-fatal: sampling must
-    # never be able to endanger a completed checkpoint. copy_to clobbers
-    # the training weights, which is fine -- they are already on the Hub.
-    if ctx.is_rank0 and args.sample_count > 0:
-        try:
-            from ditflex.sample import sample_and_push
-
-            ema.copy_to(model)
-            sample_and_push(
-                model,
-                objective=cfg.train.objective,
-                step=step,
-                repo_id=None if args.no_push else cfg.hub.checkpoint_repo,
-                device=ctx.device,
-                num_classes=cfg.model.num_classes,
-                n=args.sample_count,
-                ode_steps=args.sample_steps,
-                cfg_scale=args.cfg_scale,
-                out_dir=CKPT_DIR,
-            )
-        except Exception as e:  # noqa: BLE001 -- deliberately broad
-            print(f"[train] sampling failed (non-fatal; checkpoint already pushed): {e!r}")
-    barrier(ctx)
-    cleanup(ctx)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    if rc != 0:
+        raise SystemExit(rc)

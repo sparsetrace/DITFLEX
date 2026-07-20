@@ -56,7 +56,21 @@ jobs:
         # If 'Token not found' appears with the probe printing 'yes',
         # a Modal client release changed credential handling: pin with
         #   pip install 'modal<1.5'
-        run: pip install 'modal<1.5'
+        run: |
+          pip install 'modal<1.5'
+          modal --version
+
+      # Explicit authentication: writes the config file AND validates the
+      # credentials against the server. Failure HERE with a clear message
+      # means the token was rotated/revoked -> mint a new one in the Modal
+      # dashboard and update the GitHub secrets. Success here followed by
+      # a working `modal run` means env-var pickup was the broken piece.
+      - name: Authenticate Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          modal token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
 
       # No GH_TOKEN: `modal run` uploads the checkout into the container,
       # so Modal never clones from GitHub. HF_TOKEN is a GitHub repo secret,

@@ -210,6 +210,12 @@ def main() -> int:
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        # DEVIATION (stability): DiT/SiT recipes do not clip. Added after a
+        # reproducible bf16 gradient explosion at step ~247.4K wiped the
+        # baseline weights (loss 0.77 -> zero-predictor floor 1.69 within
+        # 1.4K steps). The deterministic batch sampler replays the same
+        # batches on resume, so passing that region REQUIRES clipping.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         ema.update(model)          # raw module: clean names, shared params
 
@@ -223,11 +229,47 @@ def main() -> int:
         losses.append(val)
         step += 1
 
+        # Divergence guard (the 247K lesson): NaN is not the only failure
+        # mode -- a gradient explosion can collapse the model to the
+        # zero-predictor floor while every loss stays finite, and periodic
+        # saves would then push poisoned checkpoints for hours. Track the
+        # best 200-step mean; if the current mean exceeds 1.6x best for
+        # two consecutive windows, abort WITHOUT saving.
+        if step % 200 == 0 and len(losses) >= 200 and (step - start_step) > 400:
+            window = sum(losses[-200:]) / 200
+            best = getattr(main, "_best_window", None)
+            if best is None or window < best:
+                main._best_window = window
+                main._blown_windows = 0
+            elif window > 1.6 * best:
+                main._blown_windows = getattr(main, "_blown_windows", 0) + 1
+                if main._blown_windows >= 2:
+                    print(f"[train][rank {ctx.rank}] step {step}: windowed loss "
+                          f"{window:.4f} > 1.6x best {best:.4f} for 2 windows -- "
+                          "DIVERGENCE, aborting WITHOUT saving.")
+                    cleanup(ctx)
+                    return 1
+            else:
+                main._blown_windows = 0
+
         # Periodic checkpoint: every rank reaches the barrier, rank 0
         # saves+pushes behind it, so the DDP collectives never see a
         # half-absent rank during the upload.
         if cfg.hub.save_every_steps > 0 and step % cfg.hub.save_every_steps == 0:
-            if ctx.is_rank0:
+            # Push-health gate (the 250K lesson, stricter form): the Hub
+            # should only ever receive checkpoints from a model near its
+            # best. Noise is ~2%; +10% means something is off -- keep
+            # training (it may recover) but WITHHOLD the push. The 1.6x
+            # divergence guard above still aborts sustained blowups.
+            best = getattr(main, "_best_window", None)
+            healthy = True
+            if best is not None and len(losses) >= 200:
+                window = sum(losses[-200:]) / 200
+                healthy = window <= 1.10 * best
+                if not healthy and ctx.is_rank0:
+                    print(f"[train] step {step:,}: windowed loss {window:.4f} > "
+                          f"1.10x best {best:.4f} -- WITHHOLDING periodic push")
+            if ctx.is_rank0 and healthy:
                 save_and_push(step, completed=False)
             barrier(ctx)
 

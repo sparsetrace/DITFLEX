@@ -1,32 +1,15 @@
-"""run/modal_train.py -- time-boxed DiT-L/2 training on Modal.
+"""run/modal_train.py -- detached Modal launcher for DiT/SiT training.
 
-The training counterpart to tests/modal_ci.py. Launched detached so the
-GitHub Actions job that starts it can exit after minutes while the run
-continues:
+GitHub Actions starts this app and exits; the Modal function pulls the latest
+healthy checkpoint, launches torchrun, trains for the requested budget, pushes
+a new healthy checkpoint, and exits.
 
-    MODAL_GPUS=8 modal run --detach run/modal_train.py --train-seconds 7200 --objective ddpm
+GPU reservation is configured by environment variables because Modal needs it
+when the function is defined:
 
-Long training is many short runs, not one long one: each invocation pulls
-the latest checkpoint from the HF Hub (if any), trains until the wall-clock
-budget is spent, saves, uploads, and exits. Chain invocations to accumulate
-steps. Resume is exact because data sampling is stateless -- indices are
-drawn from a generator seeded by (global_step, rank).
-
-GPU kind and count are fixed when the Modal function is built, so they are
-env vars (set by the workflow), not CLI flags:
-
-    MODAL_GPU    B300 (default) | B200 | ...
-    MODAL_GPUS   8 (default) | 2 for smoke
-
-HF_TOKEN (write scope: pulls latents AND pushes checkpoints) comes from
-the launching environment -- a GitHub repo secret exported by train.yml,
-or `export HF_TOKEN=...` locally -- and is forwarded into the container
-via Secret.from_dict. No Modal-side secret needed.
-
-NOTE: this launcher is ready; the entrypoint it launches (ditflex.train)
-is Phase 1 and does not exist yet. Until it does, this file is
-scaffolding -- do not wire train.yml to real GPU hours before
-tests/modal_ci.py is green and the overfit smoke passes.
+    MODAL_GPU=B200
+    MODAL_GPUS=1
+    MODAL_TRAIN_SECONDS=14400
 """
 
 from __future__ import annotations
@@ -37,17 +20,10 @@ from pathlib import Path
 import modal
 
 REPO_ROOT = Path(__file__).parent.parent
-
 GPU_KIND = os.environ.get("MODAL_GPU", "B300")
 GPU_COUNT = int(os.environ.get("MODAL_GPUS", "8"))
 TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
 
-# The Modal function timeout must cover train_seconds PLUS checkpoint
-# download (~12 min), upload (~12 min), and cold compile (~3 min) -- but
-# NOT much more: a hung run bills until the timeout kills it. So the
-# ceiling derives from the requested budget: the workflow exports
-# MODAL_TRAIN_SECONDS and we add a 1-hour overhead allowance. A 2-hour
-# dispatch can never bill more than ~3 hours, even if everything hangs.
 _BUDGET = int(os.environ.get("MODAL_TRAIN_SECONDS", "7200"))
 TIMEOUT_CEILING = _BUDGET + 3600
 
@@ -62,12 +38,19 @@ image = (
         "huggingface_hub>=0.26",
         "numpy>=1.26",
         "tqdm",
-        "pillow",          # sample-grid PNG at end of each link
+        "pillow",
     )
     .add_local_dir(
         REPO_ROOT,
         remote_path="/repo",
-        ignore=[".git", "**/__pycache__", "*.egg-info", ".venv", ".ruff_cache", ".pytest_cache"],
+        ignore=[
+            ".git",
+            "**/__pycache__",
+            "*.egg-info",
+            ".venv",
+            ".ruff_cache",
+            ".pytest_cache",
+        ],
     )
 )
 
@@ -77,17 +60,23 @@ app = modal.App("ditflex-train", image=image)
 @app.function(
     gpu=f"{GPU_KIND}:{GPU_COUNT}",
     timeout=TIMEOUT_CEILING,
-    secrets=[
-        modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")}),
-        # add WANDB_API_KEY here the same way when logging lands
-    ],
+    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
 def train(
     train_seconds: int = 7200,
     objective: str = "flow",
     hub_repo: str = "",
     max_steps: int = 0,
+    target_steps: int = 400_000,
     lr: float = 0.0,
+    lr_policy: str = "adaptive",
+    lr_min: float = 1e-5,
+    lr_hard_min: float = 1e-6,
+    lr_backoff: float = 0.5,
+    lr_min_scale: float = 0.125,
+    loss_rise_ratio: float = 1.08,
+    loss_emergency_ratio: float = 1.35,
+    reset_lr_controller: bool = False,
     wd: float = -1.0,
     clip: float = 1.0,
     spike_skip: float = 4.0,
@@ -106,14 +95,15 @@ def train(
         text=True,
     )
     print(f"[modal] {n_gpu} GPUs:\n{result.stdout.strip()}")
+    if n_gpu <= 0:
+        print("[modal] no CUDA devices visible")
+        return 2
 
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"], check=True
+        [sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"],
+        check=True,
     )
 
-    # torchrun handles per-rank process spawn + env for single-node DDP.
-    # nproc comes from what the container actually has, so the launcher
-    # cannot disagree with the reservation.
     cmd = [
         sys.executable,
         "-m",
@@ -124,6 +114,17 @@ def train(
         "ditflex.train",
         f"--train-seconds={train_seconds}",
         f"--objective={objective}",
+        f"--target-steps={target_steps}",
+        f"--lr-policy={lr_policy}",
+        f"--lr-min={lr_min}",
+        f"--lr-hard-min={lr_hard_min}",
+        f"--lr-backoff={lr_backoff}",
+        f"--lr-min-scale={lr_min_scale}",
+        f"--loss-rise-ratio={loss_rise_ratio}",
+        f"--loss-emergency-ratio={loss_emergency_ratio}",
+        f"--clip={clip}",
+        f"--spike-skip={spike_skip}",
+        f"--grad-ceiling={grad_ceiling}",
     ]
     if hub_repo:
         cmd.append(f"--hub-repo={hub_repo}")
@@ -133,11 +134,11 @@ def train(
         cmd.append(f"--lr={lr}")
     if wd >= 0.0:
         cmd.append(f"--wd={wd}")
-    cmd.append(f"--clip={clip}")
-    cmd.append(f"--spike-skip={spike_skip}")
     if seed_offset != 0:
         cmd.append(f"--seed-offset={seed_offset}")
-    cmd.append(f"--grad-ceiling={grad_ceiling}")
+    if reset_lr_controller:
+        cmd.append("--reset-lr-controller")
+
     print(f"\n[modal] running: {' '.join(cmd)}\n")
     return subprocess.run(cmd, cwd="/repo").returncode
 
@@ -148,28 +149,46 @@ def main(
     objective: str = "flow",
     hub_repo: str = "",
     max_steps: int = 0,
+    target_steps: int = 400_000,
     lr: float = 0.0,
+    lr_policy: str = "adaptive",
+    lr_min: float = 1e-5,
+    lr_hard_min: float = 1e-6,
+    lr_backoff: float = 0.5,
+    lr_min_scale: float = 0.125,
+    loss_rise_ratio: float = 1.08,
+    loss_emergency_ratio: float = 1.35,
+    reset_lr_controller: bool = False,
     wd: float = -1.0,
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
     grad_ceiling: float = 25.0,
 ):
-    """
-    Args:
-        train_seconds: stepping budget (checkpoint I/O and compile are on top)
-        objective:     ddpm | flow
-        hub_repo:      checkpoint repo override. SMOKES MUST SET THIS to a
-                       scratch repo -- a smoke that pushes to the real repo
-                       would be silently resumed by the real run.
-    """
-    if objective not in ("ddpm", "flow"):
+    if objective not in {"ddpm", "flow"}:
         raise SystemExit(f"unknown objective: {objective!r}")
+    if lr_policy not in {"constant", "cosine", "adaptive"}:
+        raise SystemExit(f"unknown lr_policy: {lr_policy!r}")
 
     rc = train.remote(
-        train_seconds=train_seconds, objective=objective,
-        hub_repo=hub_repo, max_steps=max_steps, lr=lr, wd=wd,
-        clip=clip, spike_skip=spike_skip, seed_offset=seed_offset,
+        train_seconds=train_seconds,
+        objective=objective,
+        hub_repo=hub_repo,
+        max_steps=max_steps,
+        target_steps=target_steps,
+        lr=lr,
+        lr_policy=lr_policy,
+        lr_min=lr_min,
+        lr_hard_min=lr_hard_min,
+        lr_backoff=lr_backoff,
+        lr_min_scale=lr_min_scale,
+        loss_rise_ratio=loss_rise_ratio,
+        loss_emergency_ratio=loss_emergency_ratio,
+        reset_lr_controller=reset_lr_controller,
+        wd=wd,
+        clip=clip,
+        spike_skip=spike_skip,
+        seed_offset=seed_offset,
         grad_ceiling=grad_ceiling,
     )
     if rc != 0:

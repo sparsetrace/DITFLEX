@@ -177,28 +177,36 @@ def test_dmap_compiled_matches_eager():
 
     from ditflex import diffusion as _dmod
 
-    src = inspect.getsource(_dmod)
-    assert "compiler.disable" in src, (
-        "STALE diffusion.py deployed: the eager-island decorator is absent "
-        "from the installed source. Re-copy src/ditflex/diffusion.py."
-    )
+    # Island-aware detectors: the test asserts the deployed source and
+    # the compile behavior AGREE, in either world. With the decorator
+    # present, fullgraph must graph-break (island engages); with it
+    # removed (post-probe, capture exonerated), fullgraph must succeed
+    # (fully compiled) and the numerical comparison below becomes a
+    # genuine compiled-vs-eager certification.
+    island_declared = "compiler.disable" in inspect.getsource(_dmod)
 
     torch._dynamo.reset()
     probe = build_dmap_model(tiny()).cuda().eval()
     xp, yp = batch("cuda", n=2)
     tp = torch.full((2,), 500.0, device="cuda")
-    island_engaged = False
+    fullgraph_ok = True
     try:
         torch.compile(probe, fullgraph=True)(
             hidden_states=xp, timestep=tp, class_labels=yp
         )
     except Exception:
-        island_engaged = True
-    assert island_engaged, (
-        "eager island NOT engaging: the dmap model compiled with "
-        "fullgraph=True (no graph break) -- torch.compiler.disable is not "
-        "taking effect on this torch build."
-    )
+        fullgraph_ok = False
+    if island_declared:
+        assert not fullgraph_ok, (
+            "source declares the eager island but the dmap model compiled "
+            "with fullgraph=True -- torch.compiler.disable is not taking "
+            "effect on this torch build."
+        )
+    else:
+        assert fullgraph_ok, (
+            "island removed from source but fullgraph compilation FAILS -- "
+            "an unexpected graph break remains in the dmap path."
+        )
     torch._dynamo.reset()
     torch.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = False

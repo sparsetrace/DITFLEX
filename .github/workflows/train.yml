@@ -1,73 +1,104 @@
 name: train
 
-# Manual dispatch ONLY. This spends real GPU-hours -- it must never
-# trigger from a push.
-#
-# Chain economics ($/1K steps = hourly price / (3.6 * steps/s), measured):
-#   2xB300: 9.3-9.5 steps/s  ~$11.75/h  ~$0.35/1K
-#   2xB200: 8.4     steps/s  ~$12.5/h   ~$0.41/1K
-#   1xB200: 5.52    steps/s  ~$6.25/h   ~$0.31/1K
-#   1xRTX-PRO-6000: unmeasured -- the current default is a price probe;
-#     read its steady-state steps/s from the first link and fill this row.
-# Links are detached, so wall-clock per link is irrelevant; only $/step
-# matters. Single-GPU also deletes DDP entirely (no allreduce, no rank
-# desync in the guards).
+# Manual dispatch only.  Each run is detached: GitHub exits after launch while
+# Modal pulls the latest healthy checkpoint, trains, saves, and pushes.
 
 on:
   workflow_dispatch:
     inputs:
       gpus:
-        description: "GPU count (1 = full batch 256 on one die, no DDP; 2 if a single card OOMs)"
+        description: "GPU count (1 = full global batch 256 on one GPU)"
         required: false
         default: "1"
       gpu_kind:
-        description: "GPU kind (RTX-PRO-6000 | B200 | B300). If Modal rejects the RTX string, its error lists the valid names -- fix and re-dispatch."
+        description: "Modal GPU kind (B200 | B300 | RTX-PRO-6000)"
         required: false
-        default: "RTX-PRO-6000"
+        default: "B200"
       train_seconds:
-        description: "Stepping budget in seconds (14400 = 4 h; Modal timeout = this + 3600. GitHub's 6h limit does NOT apply -- the job detaches in minutes)"
+        description: "Stepping budget in seconds; Modal timeout adds one hour"
         required: false
         default: "14400"
       objective:
         description: "Objective (ddpm | flow)"
         required: false
         default: "flow"
-      lr:
-        description: "LR override for this run (0 = keep recipe 1e-4). Post-250K instability protocol: 0.00003"
+      hub_repo:
+        description: "Checkpoint repo; keep one repo per objective/variant"
+        required: false
+        default: "sparsetrace/ditflex-L2-flow"
+      target_steps:
+        description: "Global stop and cosine horizon"
+        required: false
+        default: "400000"
+      max_steps:
+        description: "Maximum data steps this invocation (0 = time-box only)"
         required: false
         default: "0"
+
+      lr_policy:
+        description: "constant | cosine | adaptive (cosine plus loss/spike backoff)"
+        required: false
+        default: "adaptive"
+      lr:
+        description: "Base LR before scheduling (0 = recipe 1e-4). Leave 0 for adaptive migration."
+        required: false
+        default: "0"
+      lr_min:
+        description: "Cosine envelope floor at target_steps"
+        required: false
+        default: "0.00001"
+      lr_hard_min:
+        description: "Absolute floor after adaptive backoffs"
+        required: false
+        default: "0.000001"
+      lr_backoff:
+        description: "Adaptive multiplier after sustained instability"
+        required: false
+        default: "0.5"
+      lr_min_scale:
+        description: "Minimum adaptive multiplier"
+        required: false
+        default: "0.125"
+      loss_rise_ratio:
+        description: "Fast-loss EMA / slow-loss EMA warning threshold"
+        required: false
+        default: "1.08"
+      loss_emergency_ratio:
+        description: "Fast-loss EMA / slow-loss EMA emergency threshold"
+        required: false
+        default: "1.35"
+      reset_lr_controller:
+        description: "Discard persisted controller state after intentional policy changes"
+        required: false
+        type: boolean
+        default: false
+
       wd:
-        description: "Weight-decay override for this run (-1 = keep recipe 0). Post-250K instability protocol: 0.1"
+        description: "Weight decay override (-1 = keep checkpoint/config; recommended for this chain)"
         required: false
         default: "-1"
       clip:
-        description: "Gradient-clip max-norm (default 1.0; DMAP cliff protocol: 0.25)"
+        description: "Global gradient-clip max norm"
         required: false
         default: "1.0"
       spike_skip:
-        description: "Skip steps with grad norm > this x EMA (0 = off)"
+        description: "Skip update above this multiple of gradient-norm EMA (0 = off)"
         required: false
         default: "4.0"
-      seed_offset:
-        description: "Data-order seed offset for this run (0 = recipe order)"
-        required: false
-        default: "0"
       grad_ceiling:
-        description: "Absolute grad-norm skip ceiling (0 = off)"
+        description: "Absolute raw gradient-norm skip ceiling (0 = off)"
         required: false
         default: "25.0"
-      max_steps:
-        description: "Stop at this many steps THIS RUN (0 = time-boxed only). For a global target: target minus current step in state.json"
+      seed_offset:
+        description: "Runtime-only data-order seed offset"
         required: false
         default: "0"
-      hub_repo:
-        description: "Checkpoint repo. ONE PER OBJECTIVE/VARIANT: config-drift refusal (correctly) blocks cross-resume"
-        required: false
-        default: "sparsetrace/ditflex-L2-flow"
 
 jobs:
   launch:
-    name: "launch · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }} · lr=${{ inputs.lr }} wd=${{ inputs.wd }}"
+    name: >-
+      launch · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }} ·
+      ${{ inputs.lr_policy }} to ${{ inputs.target_steps }}
     runs-on: ubuntu-latest
 
     steps:
@@ -82,9 +113,6 @@ jobs:
       - name: Install Modal
         run: pip install 'modal<1.5'
 
-      # --detach: the Modal app outlives this job. The Actions job ends in
-      # minutes; training continues on Modal for the full budget. Monitor
-      # via the Modal dashboard, not the Actions log.
       - name: Launch detached training run
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
@@ -99,10 +127,19 @@ jobs:
             --train-seconds "${{ inputs.train_seconds }}" \
             --objective "${{ inputs.objective }}" \
             --hub-repo "${{ inputs.hub_repo }}" \
+            --target-steps "${{ inputs.target_steps }}" \
             --max-steps "${{ inputs.max_steps }}" \
+            --lr-policy "${{ inputs.lr_policy }}" \
             --lr "${{ inputs.lr }}" \
+            --lr-min "${{ inputs.lr_min }}" \
+            --lr-hard-min "${{ inputs.lr_hard_min }}" \
+            --lr-backoff "${{ inputs.lr_backoff }}" \
+            --lr-min-scale "${{ inputs.lr_min_scale }}" \
+            --loss-rise-ratio "${{ inputs.loss_rise_ratio }}" \
+            --loss-emergency-ratio "${{ inputs.loss_emergency_ratio }}" \
             --wd "${{ inputs.wd }}" \
             --clip "${{ inputs.clip }}" \
             --spike-skip "${{ inputs.spike_skip }}" \
             --grad-ceiling "${{ inputs.grad_ceiling }}" \
-            --seed-offset "${{ inputs.seed_offset }}"
+            --seed-offset "${{ inputs.seed_offset }}" \
+            ${{ inputs.reset_lr_controller && '--reset-lr-controller' || '' }}

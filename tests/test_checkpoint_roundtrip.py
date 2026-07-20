@@ -64,3 +64,29 @@ def test_config_drift_is_refused(tmp_path):
 def test_clean_state_dict_strips_wrapper_prefixes():
     sd = {"_orig_mod.module.blocks.0.w": 1, "module.head.b": 2, "plain": 3}
     assert set(clean_state_dict(sd)) == {"blocks.0.w", "head.b", "plain"}
+
+
+def test_candidate_validation_allows_model_buffers(tmp_path):
+    from ditflex.checkpoint import copy_checkpoint, validate_checkpoint
+
+    class WithBuffer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(3, 3)
+            self.register_buffer("fixed", torch.ones(3))
+
+        def forward(self, x):
+            return self.linear(x) + self.fixed
+
+    source = tmp_path / "candidate"
+    copied = tmp_path / "copied"
+    model = WithBuffer()
+    ema = EMA(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    cfg = Config()
+    save_checkpoint(source, model, ema, optimizer, cfg, {"step": 123})
+
+    state = validate_checkpoint(source, expected_step=123)
+    assert state["step"] == 123
+    copy_checkpoint(source, copied)
+    assert validate_checkpoint(copied)["step"] == 123

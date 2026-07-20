@@ -11,15 +11,15 @@ on:
       gpus:
         description: "GPU count (2 is the certified sweet spot)"
         required: false
-        default: "2"
+        default: "1"
       gpu_kind:
         description: "GPU kind (B300 | B200)"
         required: false
-        default: "B300"
+        default: "B200"
       train_seconds:
         description: "Stepping budget in seconds (14400 = 4 h)"
         required: false
-        default: "14400"
+        default: "3600"
       objective:
         description: "Objective (ddpm | flow)"
         required: false

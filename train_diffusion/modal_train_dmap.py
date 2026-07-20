@@ -61,7 +61,7 @@ app = modal.App("ditflex-train-dmap", image=image)
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
 def train(
-    train_seconds: int = 14400,
+    train_seconds: int = 600,
     objective: str = "flow",
     hub_repo: str = "sparsetrace/ditflex-L2-flow-dmap",
     dmap_alpha: float = 0.0,

@@ -64,6 +64,13 @@ def parse_args() -> argparse.Namespace:
                    help="load only the first N latent shards (smokes)")
     p.add_argument("--max-steps", type=int, default=None,
                    help="hard step cap regardless of wall clock (smokes)")
+    p.add_argument("--lr", type=float, default=0.0,
+                   help="override the learning rate for THIS RUN (0 = keep the "
+                        "config/checkpoint value). Applied to optimizer param "
+                        "groups only, after checkpoint load -- cfg.train.lr is "
+                        "NOT modified, so the config-drift guard still passes. "
+                        "Added for the 250K instability: dropping lr stalls the "
+                        "norm growth that clipping alone only contains.")
     p.add_argument("--qk-mode", choices=["amap", "dmap"], default="amap",
                    help="amap = baseline directed attention; dmap = diffusion-map "
                         "attention (W_K tied to W_Q, R == 0, plus Coifman-Lafon "
@@ -128,6 +135,13 @@ def main() -> int:
         run_history = state.get("run_history", [])
         if ctx.is_rank0:
             print(f"[train] resumed at step {start_step:,}")
+
+    if args.lr > 0.0:
+        for group in optimizer.param_groups:
+            group["lr"] = args.lr
+        if ctx.is_rank0:
+            print(f"[train] LR OVERRIDE for this run: {args.lr:g} "
+                  f"(config value {cfg.train.lr:g} unchanged; drift guard unaffected)")
 
     # -- latents: rank 0 warms the HF cache, then everyone loads ---------
     store_kw = dict(

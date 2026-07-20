@@ -25,6 +25,10 @@ on:
         description: "LR override for this run (0 = keep recipe 1e-4)"
         required: false
         default: "0"
+      wd:
+        description: "Weight-decay override for this run (-1 = keep recipe 0)"
+        required: false
+        default: "-1"
       max_steps:
         description: "Stop at this many steps THIS RUN (0 = time-boxed only). For a global target: target minus current step"
         required: false
@@ -68,4 +72,5 @@ jobs:
             --objective "${{ inputs.objective }}" \
             --hub-repo "${{ inputs.hub_repo }}" \
             --max-steps "${{ inputs.max_steps }}" \
-            --lr "${{ inputs.lr }}"
+            --lr "${{ inputs.lr }}" \
+            --wd "${{ inputs.wd }}"

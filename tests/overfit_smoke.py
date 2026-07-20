@@ -52,7 +52,7 @@ N_CLASSES = 1000
 PASS_RATIO = 0.10
 
 
-def build_model(small: bool, device, dtype) -> DiTTransformer2DModel:
+def build_model_smoke(small: bool, qk_mode: str, device, dtype) -> DiTTransformer2DModel:
     # DiT-L/2: width 1024 = 16 heads x 64, depth 24, patch 2.
     # out_channels 8 = 4 eps + 4 sigma (DiT learns sigma; we use the first 4).
     model = DiTTransformer2DModel(
@@ -68,8 +68,22 @@ def build_model(small: bool, device, dtype) -> DiTTransformer2DModel:
         norm_elementwise_affine=False,
         norm_eps=1e-6,
     )
-    # The only attention path in this repo.
-    model.set_attn_processor(IdentityFlexSelfAttnProcessor())
+    # The only attention path in this repo (per-module: model-level
+    # set_attn_processor was removed from DiT in newer diffusers).
+    from diffusers.models.attention_processor import Attention as _Attn
+
+    for _m in model.modules():
+        if isinstance(_m, _Attn):
+            _m.set_processor(IdentityFlexSelfAttnProcessor())
+    if qk_mode == "dmap":
+        from diffusers.models.attention_processor import Attention
+
+        from ditflex.diffusion import DmapFlexSelfAttnProcessor
+
+        for module in model.modules():
+            if isinstance(module, Attention):
+                module.to_k = module.to_q
+                module.set_processor(DmapFlexSelfAttnProcessor(alpha=0.0))
     return model.to(device=device, dtype=dtype)
 
 
@@ -116,6 +130,9 @@ def loss_flow(model, x0, y, _):
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--objective", choices=["ddpm", "flow"], default="ddpm")
+    parser.add_argument("--qk-mode", choices=["amap", "dmap"], default="amap")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the model (the training path)")
     parser.add_argument("--small", action="store_true", help="6 layers instead of 24")
     parser.add_argument("--steps", type=int, default=600)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -130,12 +147,15 @@ def main() -> int:
     torch.manual_seed(args.seed)
 
     print(f"torch {torch.__version__} | {torch.cuda.get_device_name(0)}")
-    print(f"objective={args.objective}  attention=Flex(identity)  "
-          f"layers={6 if args.small else 24}  steps={args.steps}")
+    print(f"objective={args.objective}  qk_mode={args.qk_mode}  "
+          f"compile={args.compile}  layers={6 if args.small else 24}  steps={args.steps}")
 
-    model = build_model(args.small, device, torch.float32)
+    model = build_model_smoke(args.small, args.qk_mode, device, torch.float32)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"params: {n_params / 1e6:.1f}M\n")
+
+    if args.compile:
+        model = torch.compile(model)
 
     x0, y = make_data(args, device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)

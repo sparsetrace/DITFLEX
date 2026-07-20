@@ -56,7 +56,7 @@ jobs:
         # If 'Token not found' appears with the probe printing 'yes',
         # a Modal client release changed credential handling: pin with
         #   pip install 'modal<1.5'
-        run: pip install modal
+        run: pip install 'modal<1.5'
 
       # No GH_TOKEN: `modal run` uploads the checkout into the container,
       # so Modal never clones from GitHub. HF_TOKEN is a GitHub repo secret,

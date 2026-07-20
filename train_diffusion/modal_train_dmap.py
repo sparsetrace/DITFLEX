@@ -61,10 +61,14 @@ app = modal.App("ditflex-train-dmap", image=image)
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
 def train(
-    train_seconds: int = 600,
+    train_seconds: int = 14400,
     objective: str = "flow",
     hub_repo: str = "sparsetrace/ditflex-L2-flow-dmap",
     dmap_alpha: float = 0.0,
+    lr: float = 0.0,
+    wd: float = -1.0,
+    clip: float = 1.0,
+    spike_skip: float = 4.0,
 ) -> int:
     import subprocess
     import sys
@@ -96,7 +100,13 @@ def train(
         f"--hub-repo={hub_repo}",
         "--qk-mode=dmap",              # the defining property of this chain
         f"--dmap-alpha={dmap_alpha}",
+        f"--clip={clip}",
+        f"--spike-skip={spike_skip}",
     ]
+    if lr > 0.0:
+        cmd.append(f"--lr={lr}")
+    if wd >= 0.0:
+        cmd.append(f"--wd={wd}")
     print(f"\n[modal] running: {' '.join(cmd)}\n")
     return subprocess.run(cmd, cwd="/repo").returncode
 
@@ -107,12 +117,17 @@ def main(
     objective: str = "flow",
     hub_repo: str = "sparsetrace/ditflex-L2-flow-dmap",
     dmap_alpha: float = 0.0,
+    lr: float = 0.0,
+    wd: float = -1.0,
+    clip: float = 1.0,
+    spike_skip: float = 4.0,
 ):
     if objective not in ("ddpm", "flow"):
         raise SystemExit(f"unknown objective: {objective!r}")
     rc = train.remote(
         train_seconds=train_seconds, objective=objective,
         hub_repo=hub_repo, dmap_alpha=dmap_alpha,
+        lr=lr, wd=wd, clip=clip, spike_skip=spike_skip,
     )
     if rc != 0:
         raise SystemExit(rc)

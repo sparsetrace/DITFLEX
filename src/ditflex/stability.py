@@ -1,21 +1,23 @@
-"""Transactional stability control for long DiT/SiT training chains.
+"""Practical stability control for long DiT/SiT training runs.
 
-The key distinction in this module is between a *live diagnostic* and a
-*committed reference*.
+This module deliberately favors continuing a finite, loss-stable run over
+restarting because one noisy gradient statistic crossed a warning threshold.
 
-A fast gradient EMA is useful for logs, but it must not define normality: a
-sustained unstable regime can drag that EMA upward and make a relative spike
-guard progressively less protective.  Instead, checkpoint promotion stores a
-robust loss/gradient reference.  Every candidate window is compared with that
-frozen reference until the candidate is promoted.
+Policy summary
+--------------
+* Warning thresholds are diagnostic only.  Repeated warnings never become a
+  retry by themselves.
+* A retry requires a clear loss problem, a severe sustained median-gradient
+  shift, or multiple corroborating retry-level signals.
+* A large p90 or skip rate alone is not enough to roll back; heavy-tailed
+  gradients are expected in diffusion/flow training and are already bounded by
+  the per-step rejection guard and gradient clipping.
+* The reference remains frozen while a candidate is running, then moves slowly
+  after a successful checkpoint promotion.
 
-The learning-rate schedule is also resume-safe.  A deterministic global-step
-cosine envelope is multiplied by a monotonic committed scale.  A fresh retry
-process may apply an additional attempt factor (for example 0.5); that lower
-scale becomes permanent only when the candidate is successfully promoted.
-
-All state is JSON serializable and lives under ``guard_state`` so the policy
-can be adopted by an existing checkpoint without changing ``Config``.
+The public API is compatible with the v3 transactional trainer.  Version 4 can
+load v1/v2/v3 controller state and preserves the committed LR scale and health
+reference while adopting the less-picky decision policy.
 """
 
 from __future__ import annotations
@@ -27,12 +29,7 @@ from typing import Any
 
 @dataclass(frozen=True)
 class StabilitySpec:
-    """Runtime-only policy settings.
-
-    Defaults are intentionally conservative for late-stage DiT-L/2 or SiT-L/2
-    training.  They are ratios against the last committed healthy reference,
-    not against a live EMA that can chase an unstable regime.
-    """
+    """Runtime-only stability and learning-rate settings."""
 
     policy: str = "adaptive"  # constant | cosine | adaptive
     total_steps: int = 400_000
@@ -41,16 +38,13 @@ class StabilitySpec:
     hard_min_lr: float = 1e-6
     min_scale: float = 0.03125
 
-    # Candidate-window requirements.
     commit_patience_windows: int = 2
-    warning_patience_windows: int = 2
+    warning_patience_windows: int = 2  # logging cadence only in v4
 
-    # Loss ratios against the committed window loss.
     loss_warn_ratio: float = 1.015
     loss_retry_ratio: float = 1.025
     loss_emergency_ratio: float = 1.05
 
-    # Robust gradient distribution ratios against committed median / p90.
     grad_warn_ratio: float = 2.0
     grad_retry_ratio: float = 4.0
     grad_emergency_ratio: float = 8.0
@@ -58,16 +52,14 @@ class StabilitySpec:
     grad_p90_retry_ratio: float = 5.0
     grad_p90_emergency_ratio: float = 10.0
 
-    # Update-skip rates within the same window.
     skip_warn_rate: float = 0.05
     skip_retry_rate: float = 0.10
     skip_emergency_rate: float = 0.20
 
-    # A healthy promoted reference may move, but only slowly upward.  This
-    # prevents a sequence of checkpoints from normalizing away gradual drift.
-    reference_decay: float = 0.90
+    # A promoted reference can adapt to a genuinely healthy new regime.
+    reference_decay: float = 0.80
     loss_reference_max_growth: float = 1.01
-    grad_reference_max_growth: float = 1.25
+    grad_reference_max_growth: float = 1.50
 
     def __post_init__(self) -> None:
         if self.policy not in {"constant", "cosine", "adaptive"}:
@@ -97,7 +89,9 @@ class StabilitySpec:
             < self.grad_p90_emergency_ratio
         ):
             raise ValueError("gradient-p90 ratios must satisfy 1 < warn < retry < emergency")
-        if not (0.0 <= self.skip_warn_rate < self.skip_retry_rate < self.skip_emergency_rate <= 1.0):
+        if not (
+            0.0 <= self.skip_warn_rate < self.skip_retry_rate < self.skip_emergency_rate <= 1.0
+        ):
             raise ValueError("skip rates must satisfy 0 <= warn < retry < emergency <= 1")
         if not (0.0 <= self.reference_decay < 1.0):
             raise ValueError("reference_decay must lie in [0, 1)")
@@ -117,7 +111,7 @@ class WindowMetrics:
 
     def __post_init__(self) -> None:
         values = (self.loss, self.grad_median, self.grad_p90, self.skip_rate)
-        if not all(math.isfinite(float(v)) for v in values):
+        if not all(math.isfinite(float(value)) for value in values):
             raise ValueError(f"non-finite window metrics: {self}")
         if self.loss < 0.0 or self.grad_median < 0.0 or self.grad_p90 < 0.0:
             raise ValueError(f"negative window metric: {self}")
@@ -142,7 +136,7 @@ class WindowMetrics:
 
 @dataclass(frozen=True)
 class HealthReference:
-    """Frozen definition of normality from the last promoted checkpoint."""
+    """Definition of normality from the last promoted checkpoint."""
 
     loss: float
     grad_median: float
@@ -186,18 +180,13 @@ class StabilityEvent:
 
     @property
     def promotion_ready(self) -> bool:
-        return self.action == "none" and self.healthy_windows > 0
+        return self.action in {"none", "warn"} and self.healthy_windows > 0
 
 
 class AdaptiveLrController:
-    """Global-step LR plus transactional health-reference controller.
+    """Resume-safe LR controller with deliberately tolerant health decisions."""
 
-    The class name is retained for compatibility with the v1/v2 bundle.  Its
-    v3 behavior is transactional: it requests a fresh-process retry rather
-    than modifying model state in place after a bad candidate window.
-    """
-
-    VERSION = 3
+    VERSION = 4
 
     def __init__(
         self,
@@ -229,10 +218,10 @@ class AdaptiveLrController:
         self.last_grad_p90_ratio = 1.0
         self.healthy_windows = 0
         self.warning_windows = 0
+        self.retry_windows = 0
         self.windows_seen = 0
         self.retry_count = 0
 
-        # Kept for v1/v2 migration and familiar logs.
         self.fast_loss = initial_loss
         self.slow_loss = initial_loss
         if initial_loss is None:
@@ -270,7 +259,6 @@ class AdaptiveLrController:
         return lr
 
     def commit_attempt_scale(self) -> None:
-        """Make a successful retry's lower LR scale permanent."""
         if self.spec.policy == "adaptive":
             self.committed_scale = self.scale
         self.attempt_factor = 1.0
@@ -285,33 +273,31 @@ class AdaptiveLrController:
         grad_p90: float | None,
         step: int,
     ) -> None:
-        """Install a reference only when v3 state did not already provide one."""
         if self.reference is not None:
             return
-        grad_median = max(float(grad_median), 1e-12)
-        p90 = max(float(grad_p90 if grad_p90 is not None else grad_median * 2.0), grad_median)
+        median = max(float(grad_median), 1e-12)
+        p90 = max(float(grad_p90 if grad_p90 is not None else median * 2.0), median)
         self.reference = HealthReference(
             loss=max(float(loss), 1e-12),
-            grad_median=grad_median,
+            grad_median=median,
             grad_p90=p90,
             step=int(step),
         )
 
     def grad_limit(self, spike_multiple: float) -> float | None:
-        """Frozen pre-clip rejection threshold for the current candidate.
+        """Return a frozen pre-clip outlier threshold.
 
-        The p90 floor prevents an unusually tight median from rejecting the
-        ordinary upper tail.  Neither component moves until checkpoint
-        promotion, so an unhealthy regime cannot normalize itself.
+        The threshold is intentionally based on both median and upper-tail
+        history.  It does not chase the live EMA during a candidate run.
         """
         if spike_multiple <= 0.0 or self.reference is None:
             return None
         return max(
             float(spike_multiple) * self.reference.grad_median,
-            1.25 * self.reference.grad_p90,
+            4.0 * self.reference.grad_p90,
         )
 
-    # -- window decisions ---------------------------------------------
+    # -- decisions -----------------------------------------------------
 
     def _ratios(self, metrics: WindowMetrics) -> tuple[float, float, float]:
         assert self.reference is not None
@@ -322,11 +308,121 @@ class AdaptiveLrController:
             metrics.grad_p90 / max(self.reference.grad_p90, eps),
         )
 
+    def _warning_reasons(
+        self,
+        metrics: WindowMetrics,
+        loss_ratio: float,
+        grad_ratio: float,
+        p90_ratio: float,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if loss_ratio >= self.spec.loss_warn_ratio:
+            reasons.append(f"loss ratio {loss_ratio:.3f} >= {self.spec.loss_warn_ratio:.3f}")
+        if grad_ratio >= self.spec.grad_warn_ratio:
+            reasons.append(
+                f"grad-median ratio {grad_ratio:.2f} >= {self.spec.grad_warn_ratio:.2f}"
+            )
+        if p90_ratio >= self.spec.grad_p90_warn_ratio:
+            reasons.append(
+                f"grad-p90 ratio {p90_ratio:.2f} >= {self.spec.grad_p90_warn_ratio:.2f}"
+            )
+        if metrics.skip_rate >= self.spec.skip_warn_rate:
+            reasons.append(
+                f"skip rate {metrics.skip_rate:.1%} >= {self.spec.skip_warn_rate:.1%}"
+            )
+        return reasons
+
+    def _emergency_reasons(
+        self,
+        metrics: WindowMetrics,
+        loss_ratio: float,
+        grad_ratio: float,
+        p90_ratio: float,
+    ) -> list[str]:
+        reasons: list[str] = []
+
+        # Loss and median-gradient emergencies are independently meaningful.
+        if loss_ratio >= self.spec.loss_emergency_ratio:
+            reasons.append(
+                f"loss ratio {loss_ratio:.3f} >= {self.spec.loss_emergency_ratio:.3f}"
+            )
+        if grad_ratio >= self.spec.grad_emergency_ratio:
+            reasons.append(
+                f"grad-median ratio {grad_ratio:.2f} >= {self.spec.grad_emergency_ratio:.2f}"
+            )
+
+        # A noisy tail or many rejected batches must be corroborated before it
+        # can terminate a run.
+        if (
+            p90_ratio >= self.spec.grad_p90_emergency_ratio
+            and grad_ratio >= self.spec.grad_warn_ratio
+        ):
+            reasons.append(
+                f"grad-p90 ratio {p90_ratio:.2f} >= "
+                f"{self.spec.grad_p90_emergency_ratio:.2f} with elevated median"
+            )
+        if (
+            metrics.skip_rate >= self.spec.skip_emergency_rate
+            and (
+                loss_ratio >= self.spec.loss_warn_ratio
+                or grad_ratio >= self.spec.grad_warn_ratio
+            )
+        ):
+            reasons.append(
+                f"skip rate {metrics.skip_rate:.1%} >= "
+                f"{self.spec.skip_emergency_rate:.1%} with corroborating drift"
+            )
+        return reasons
+
+    def _retry_reasons(
+        self,
+        metrics: WindowMetrics,
+        loss_ratio: float,
+        grad_ratio: float,
+        p90_ratio: float,
+    ) -> list[str]:
+        reasons: list[str] = []
+
+        # Loss drift is the strongest signal and can stand alone.
+        if loss_ratio >= self.spec.loss_retry_ratio:
+            reasons.append(f"loss ratio {loss_ratio:.3f} >= {self.spec.loss_retry_ratio:.3f}")
+
+        # Median-gradient drift can stand alone only at the retry threshold.
+        if grad_ratio >= self.spec.grad_retry_ratio:
+            reasons.append(
+                f"grad-median ratio {grad_ratio:.2f} >= {self.spec.grad_retry_ratio:.2f}"
+            )
+
+        # p90 and skip-rate conditions are too noisy to stand alone.  Require
+        # corroboration from loss or the central gradient distribution.
+        if (
+            p90_ratio >= self.spec.grad_p90_retry_ratio
+            and (
+                loss_ratio >= self.spec.loss_warn_ratio
+                or grad_ratio >= self.spec.grad_warn_ratio
+            )
+        ):
+            reasons.append(
+                f"grad-p90 ratio {p90_ratio:.2f} >= "
+                f"{self.spec.grad_p90_retry_ratio:.2f} with corroborating drift"
+            )
+        if (
+            metrics.skip_rate >= self.spec.skip_retry_rate
+            and (
+                loss_ratio >= self.spec.loss_warn_ratio
+                or grad_ratio >= self.spec.grad_warn_ratio
+            )
+        ):
+            reasons.append(
+                f"skip rate {metrics.skip_rate:.1%} >= "
+                f"{self.spec.skip_retry_rate:.1%} with corroborating drift"
+            )
+        return reasons
+
     def observe_window(self, metrics: WindowMetrics) -> StabilityEvent:
         self.windows_seen += 1
         self.last_metrics = metrics
 
-        # Familiar fast/slow loss diagnostics, but not the source of truth.
         if self.fast_loss is None:
             self.fast_loss = metrics.loss
             self.slow_loss = metrics.loss
@@ -346,142 +442,88 @@ class AdaptiveLrController:
             )
             self.healthy_windows = 1
             self.warning_windows = 0
+            self.retry_windows = 0
             return StabilityEvent(
                 action="none",
                 reason="bootstrapped committed health reference",
-                healthy_windows=self.healthy_windows,
+                healthy_windows=1,
             )
 
-        loss_ratio, grad_ratio, grad_p90_ratio = self._ratios(metrics)
+        loss_ratio, grad_ratio, p90_ratio = self._ratios(metrics)
         self.last_loss_ratio = loss_ratio
         self.last_grad_ratio = grad_ratio
-        self.last_grad_p90_ratio = grad_p90_ratio
+        self.last_grad_p90_ratio = p90_ratio
 
-        emergency_reasons: list[str] = []
-        if loss_ratio >= self.spec.loss_emergency_ratio:
-            emergency_reasons.append(
-                f"loss ratio {loss_ratio:.3f} >= {self.spec.loss_emergency_ratio:.3f}"
-            )
-        if grad_ratio >= self.spec.grad_emergency_ratio:
-            emergency_reasons.append(
-                f"grad-median ratio {grad_ratio:.2f} >= {self.spec.grad_emergency_ratio:.2f}"
-            )
-        if grad_p90_ratio >= self.spec.grad_p90_emergency_ratio:
-            emergency_reasons.append(
-                f"grad-p90 ratio {grad_p90_ratio:.2f} >= "
-                f"{self.spec.grad_p90_emergency_ratio:.2f}"
-            )
-        if metrics.skip_rate >= self.spec.skip_emergency_rate:
-            emergency_reasons.append(
-                f"skip rate {metrics.skip_rate:.1%} >= {self.spec.skip_emergency_rate:.1%}"
-            )
-        if emergency_reasons:
+        emergency = self._emergency_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+        if emergency:
             self.healthy_windows = 0
             self.warning_windows += 1
+            self.retry_windows += 1
             self.retry_count += 1
             return StabilityEvent(
                 action="retry",
-                reason="emergency candidate rejection: " + "; ".join(emergency_reasons),
+                reason="emergency candidate rejection: " + "; ".join(emergency),
                 warning_windows=self.warning_windows,
                 loss_ratio=loss_ratio,
                 grad_ratio=grad_ratio,
-                grad_p90_ratio=grad_p90_ratio,
+                grad_p90_ratio=p90_ratio,
             )
 
-        retry_reasons: list[str] = []
-        if loss_ratio >= self.spec.loss_retry_ratio:
-            retry_reasons.append(
-                f"loss ratio {loss_ratio:.3f} >= {self.spec.loss_retry_ratio:.3f}"
-            )
-        if grad_ratio >= self.spec.grad_retry_ratio:
-            retry_reasons.append(
-                f"grad-median ratio {grad_ratio:.2f} >= {self.spec.grad_retry_ratio:.2f}"
-            )
-        if grad_p90_ratio >= self.spec.grad_p90_retry_ratio:
-            retry_reasons.append(
-                f"grad-p90 ratio {grad_p90_ratio:.2f} >= {self.spec.grad_p90_retry_ratio:.2f}"
-            )
-        if metrics.skip_rate >= self.spec.skip_retry_rate:
-            retry_reasons.append(
-                f"skip rate {metrics.skip_rate:.1%} >= {self.spec.skip_retry_rate:.1%}"
-            )
+        retry_reasons = self._retry_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+        warnings = self._warning_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+
         if retry_reasons:
             self.healthy_windows = 0
             self.warning_windows += 1
-            if self.warning_windows >= self.spec.warning_patience_windows:
+            self.retry_windows += 1
+            if self.retry_windows >= self.spec.warning_patience_windows:
                 self.retry_count += 1
                 return StabilityEvent(
                     action="retry",
-                    reason="persistent candidate rejection: " + "; ".join(retry_reasons),
+                    reason="persistent corroborated instability: " + "; ".join(retry_reasons),
                     warning_windows=self.warning_windows,
                     loss_ratio=loss_ratio,
                     grad_ratio=grad_ratio,
-                    grad_p90_ratio=grad_p90_ratio,
+                    grad_p90_ratio=p90_ratio,
                 )
             return StabilityEvent(
                 action="warn",
                 reason=(
-                    f"candidate warning {self.warning_windows}/"
+                    f"retry-level signal {self.retry_windows}/"
                     f"{self.spec.warning_patience_windows}: " + "; ".join(retry_reasons)
                 ),
                 warning_windows=self.warning_windows,
                 loss_ratio=loss_ratio,
                 grad_ratio=grad_ratio,
-                grad_p90_ratio=grad_p90_ratio,
+                grad_p90_ratio=p90_ratio,
             )
 
-        warning_reasons: list[str] = []
-        if loss_ratio >= self.spec.loss_warn_ratio:
-            warning_reasons.append(
-                f"loss ratio {loss_ratio:.3f} >= {self.spec.loss_warn_ratio:.3f}"
-            )
-        if grad_ratio >= self.spec.grad_warn_ratio:
-            warning_reasons.append(
-                f"grad-median ratio {grad_ratio:.2f} >= {self.spec.grad_warn_ratio:.2f}"
-            )
-        if grad_p90_ratio >= self.spec.grad_p90_warn_ratio:
-            warning_reasons.append(
-                f"grad-p90 ratio {grad_p90_ratio:.2f} >= {self.spec.grad_p90_warn_ratio:.2f}"
-            )
-        if metrics.skip_rate >= self.spec.skip_warn_rate:
-            warning_reasons.append(
-                f"skip rate {metrics.skip_rate:.1%} >= {self.spec.skip_warn_rate:.1%}"
-            )
-        if warning_reasons:
-            self.healthy_windows = 0
+        # Any acceptable window clears retry persistence.  Warning-only windows
+        # still count toward checkpoint promotion because they are explicitly
+        # below the retry policy.
+        self.retry_windows = 0
+        self.healthy_windows += 1
+
+        if warnings:
             self.warning_windows += 1
-            if self.warning_windows >= self.spec.warning_patience_windows:
-                self.retry_count += 1
-                return StabilityEvent(
-                    action="retry",
-                    reason="persistent candidate warning: " + "; ".join(warning_reasons),
-                    warning_windows=self.warning_windows,
-                    loss_ratio=loss_ratio,
-                    grad_ratio=grad_ratio,
-                    grad_p90_ratio=grad_p90_ratio,
-                )
             return StabilityEvent(
                 action="warn",
-                reason=(
-                    f"candidate warning {self.warning_windows}/"
-                    f"{self.spec.warning_patience_windows}: "
-                    + "; ".join(warning_reasons)
-                ),
+                reason="diagnostic warning; continuing: " + "; ".join(warnings),
+                healthy_windows=self.healthy_windows,
                 warning_windows=self.warning_windows,
                 loss_ratio=loss_ratio,
                 grad_ratio=grad_ratio,
-                grad_p90_ratio=grad_p90_ratio,
+                grad_p90_ratio=p90_ratio,
             )
 
         self.warning_windows = 0
-        self.healthy_windows += 1
         return StabilityEvent(
             action="none",
             reason="stable",
             healthy_windows=self.healthy_windows,
             loss_ratio=loss_ratio,
             grad_ratio=grad_ratio,
-            grad_p90_ratio=grad_p90_ratio,
+            grad_p90_ratio=p90_ratio,
         )
 
     def checkpoint_is_healthy(
@@ -495,26 +537,26 @@ class AdaptiveLrController:
             return False, "no complete stability window yet"
         if self.reference is None:
             return False, "no committed health reference"
-        if self.warning_windows > 0:
-            return False, f"{self.warning_windows} unresolved warning window(s)"
+
         required = (
             self.spec.commit_patience_windows
             if required_windows is None
             else max(1, int(required_windows))
         )
         if self.healthy_windows < required:
-            return False, (
-                f"only {self.healthy_windows}/{required} consecutive healthy windows"
-            )
-        loss_ratio, grad_ratio, grad_p90_ratio = self._ratios(metrics)
-        if loss_ratio >= self.spec.loss_warn_ratio:
-            return False, f"loss ratio {loss_ratio:.3f} is outside healthy range"
-        if grad_ratio >= self.spec.grad_warn_ratio:
-            return False, f"grad-median ratio {grad_ratio:.2f} is outside healthy range"
-        if grad_p90_ratio >= self.spec.grad_p90_warn_ratio:
-            return False, f"grad-p90 ratio {grad_p90_ratio:.2f} is outside healthy range"
-        if metrics.skip_rate >= self.spec.skip_warn_rate:
-            return False, f"skip rate {metrics.skip_rate:.1%} is outside healthy range"
+            return False, f"only {self.healthy_windows}/{required} acceptable windows"
+
+        loss_ratio, grad_ratio, p90_ratio = self._ratios(metrics)
+        emergency = self._emergency_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+        retry = self._retry_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+        if emergency:
+            return False, "emergency metrics: " + "; ".join(emergency)
+        if retry:
+            return False, "retry-level metrics: " + "; ".join(retry)
+
+        warnings = self._warning_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+        if warnings:
+            return True, "acceptable candidate with diagnostic warnings"
         return True, "stable candidate"
 
     @staticmethod
@@ -529,7 +571,6 @@ class AdaptiveLrController:
         return min(candidate, old * max_growth)
 
     def commit_candidate(self, step: int, metrics: WindowMetrics) -> HealthReference:
-        """Promote candidate metrics and retry LR scale to committed state."""
         self.commit_attempt_scale()
         if self.reference is None:
             reference = HealthReference(
@@ -565,9 +606,10 @@ class AdaptiveLrController:
         self.reference = reference
         self.healthy_windows = 0
         self.warning_windows = 0
+        self.retry_windows = 0
         return reference
 
-    # -- persistence ----------------------------------------------------
+    # -- persistence ---------------------------------------------------
 
     def status(self) -> dict[str, Any]:
         return {
@@ -582,6 +624,7 @@ class AdaptiveLrController:
             "grad_p90_ratio": self.last_grad_p90_ratio,
             "healthy_windows": self.healthy_windows,
             "warning_windows": self.warning_windows,
+            "retry_windows": self.retry_windows,
             "retry_count": self.retry_count,
             "reference": None if self.reference is None else self.reference.state_dict(),
         }
@@ -602,37 +645,39 @@ class AdaptiveLrController:
             "last_grad_p90_ratio": self.last_grad_p90_ratio,
             "healthy_windows": self.healthy_windows,
             "warning_windows": self.warning_windows,
+            "retry_windows": self.retry_windows,
             "windows_seen": self.windows_seen,
             "retry_count": self.retry_count,
         }
 
-    def load_state_dict(self, state: dict[str, Any], *, attempt_factor: float | None = None) -> None:
+    def load_state_dict(
+        self,
+        state: dict[str, Any],
+        *,
+        attempt_factor: float | None = None,
+    ) -> None:
         version = int(state.get("version", 1))
-        if version not in {1, 2, self.VERSION}:
+        if version not in {1, 2, 3, self.VERSION}:
             raise ValueError(
                 f"unsupported stability state version {version}; "
                 "use --reset-lr-controller only for a deliberate migration"
             )
 
         stored_spec_data = dict(state.get("spec", {}))
-        if version < self.VERSION:
-            # v1/v2 contain fields removed in v3; only compare the schedule
-            # fields that must remain resume-compatible.
-            for name in ("policy", "total_steps", "base_lr", "min_lr", "hard_min_lr"):
-                if name in stored_spec_data and stored_spec_data[name] != getattr(self.spec, name):
-                    raise ValueError(
-                        f"persisted LR setting {name}={stored_spec_data[name]!r} differs from "
-                        f"requested {getattr(self.spec, name)!r}; use --reset-lr-controller "
-                        "only when that change is deliberate"
-                    )
+
+        # Policy thresholds are intentionally allowed to change across v4
+        # adoption.  Only LR schedule fields must remain resume-compatible.
+        for name in ("policy", "total_steps", "base_lr", "min_lr", "hard_min_lr"):
+            if name in stored_spec_data and stored_spec_data[name] != getattr(self.spec, name):
+                raise ValueError(
+                    f"persisted LR setting {name}={stored_spec_data[name]!r} differs from "
+                    f"requested {getattr(self.spec, name)!r}; use --reset-lr-controller "
+                    "only when that LR change is deliberate"
+                )
+
+        if version < 3:
             self.committed_scale = float(state.get("scale", self.committed_scale))
         else:
-            stored_spec = StabilitySpec(**stored_spec_data)
-            if stored_spec != self.spec:
-                raise ValueError(
-                    "persisted stability spec differs from requested runtime policy; "
-                    "use --reset-lr-controller only when the change is deliberate"
-                )
             self.committed_scale = float(
                 state.get("committed_scale", state.get("scale", self.committed_scale))
             )
@@ -650,9 +695,12 @@ class AdaptiveLrController:
             self.windows_seen = int(state.get("windows_seen", 0))
             self.retry_count = int(state.get("retry_count", 0))
 
+        # Do not inherit v3's warning-to-retry momentum.
+        self.retry_windows = 0
         self.fast_loss = _optional_float(state.get("fast_loss", self.fast_loss))
         self.slow_loss = _optional_float(state.get("slow_loss", self.slow_loss))
         self.best_loss = _optional_float(state.get("best_loss", self.best_loss))
+
         if attempt_factor is not None:
             if not (0.0 < attempt_factor <= 1.0):
                 raise ValueError("attempt_factor must lie in (0, 1]")

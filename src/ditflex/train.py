@@ -78,6 +78,12 @@ def parse_args() -> argparse.Namespace:
                         "cuts only DELAY the norm-growth blowup (1e-4: +850 "
                         "steps; 3e-5: +4.7K steps); decay reverses the growth "
                         "itself. Cumulative shrink ~ lr*wd*steps.")
+    p.add_argument("--seed-offset", type=int, default=0,
+                   help="offset added to the data base seed for this run "
+                        "(runtime-only; drift-safe). Discriminator for the "
+                        "247-256K instability cluster: four onsets across "
+                        "three trajectories share deterministic batches -- a "
+                        "shifted order tests data-region vs state-intrinsic.")
     p.add_argument("--clip", type=float, default=1.0,
                    help="gradient-clip max-norm for this run")
     p.add_argument("--spike-skip", type=float, default=4.0,
@@ -221,6 +227,7 @@ def main() -> int:
                 "clip": args.clip,
                 "spike_skip": args.spike_skip,
                 "steps_skipped": getattr(main, "_spikes", 0),
+                "seed_offset": args.seed_offset,
             },
         }
 
@@ -250,7 +257,10 @@ def main() -> int:
         if args.max_steps is not None and (step - start_step) >= args.max_steps:
             break
 
-        x0, y = store.batch(step, ctx.rank, per_rank_batch, cfg.train.base_seed)
+        x0, y = store.batch(
+            step, ctx.rank, per_rank_batch,
+            cfg.train.base_seed + args.seed_offset,
+        )
         with torch.autocast("cuda", dtype=torch.bfloat16):
             loss = objective.loss(wrapped, x0, y)
 
@@ -345,11 +355,23 @@ def main() -> int:
             main._t = time.time()
             avg = sum(losses[-LOG_EVERY:]) / len(losses[-LOG_EVERY:])
             with torch.no_grad():
-                pnorm = torch.stack(
-                    [p.detach().norm() for p in model.parameters()]
-                ).norm().item()
+                # Per-family norms: the global scalar HID the disease (it
+                # fell while the instability re-emerged), so decompose --
+                # whichever family moves against the tide is the culprit.
+                fams = dict.fromkeys(("qk", "vo", "mlp", "ada", "emb", "oth"), 0.0)
+                for pname, p_ in model.named_parameters():
+                    key = ("qk" if ("to_q" in pname or "to_k" in pname) else
+                           "vo" if ("to_v" in pname or "to_out" in pname) else
+                           "mlp" if ".ff." in pname else
+                           "ada" if ("norm1" in pname or "norm_out" in pname
+                                     or "adaln" in pname.lower()) else
+                           "emb" if ("emb" in pname or "pos_embed" in pname
+                                     or "proj_out" in pname) else "oth")
+                    fams[key] += p_.detach().float().pow(2).sum().item()
+                pnorm = sum(fams.values()) ** 0.5
+                fstr = " ".join(f"{k}={v**0.5:7.1f}" for k, v in fams.items())
             print(f"  step {step:>8,}  loss {avg:.5f}  {rate:5.2f} steps/s  "
-                  f"{rate * cfg.train.global_batch:7.0f} img/s  |w|={pnorm:8.2f}")
+                  f"{rate * cfg.train.global_batch:7.0f} img/s  |w|={pnorm:8.2f}  {fstr}")
 
     # -- final save + push (rank 0), everyone waits ----------------------
     elapsed = time.time() - t_start

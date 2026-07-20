@@ -88,6 +88,7 @@ def train(
     hub_repo: str = "",
     max_steps: int = 0,
     lr: float = 0.0,
+    wd: float = -1.0,
 ) -> int:
     import subprocess
     import sys
@@ -126,6 +127,8 @@ def train(
         cmd.append(f"--max-steps={max_steps}")
     if lr > 0.0:
         cmd.append(f"--lr={lr}")
+    if wd >= 0.0:
+        cmd.append(f"--wd={wd}")
     print(f"\n[modal] running: {' '.join(cmd)}\n")
     return subprocess.run(cmd, cwd="/repo").returncode
 
@@ -137,6 +140,7 @@ def main(
     hub_repo: str = "",
     max_steps: int = 0,
     lr: float = 0.0,
+    wd: float = -1.0,
 ):
     """
     Args:
@@ -151,7 +155,7 @@ def main(
 
     rc = train.remote(
         train_seconds=train_seconds, objective=objective,
-        hub_repo=hub_repo, max_steps=max_steps, lr=lr,
+        hub_repo=hub_repo, max_steps=max_steps, lr=lr, wd=wd,
     )
     if rc != 0:
         raise SystemExit(rc)

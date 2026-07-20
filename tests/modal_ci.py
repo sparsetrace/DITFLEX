@@ -1,5 +1,4 @@
 """tests/modal_ci.py -- Modal runner for the ditflex gates and tests.
-==
 
 The source is NOT cloned from GitHub inside the container. `modal run`
 uploads the local checkout (the Actions checkout, in CI), so there is no
@@ -126,6 +125,12 @@ def run_gates(
     if smoke:
         for objective in ("ddpm", "flow"):
             run([sys.executable, "tests/overfit_smoke.py", "--small", "--objective", objective])
+        # DMAP diagnosis pair: eager vs compiled. Divergent outcomes
+        # localize a compile-path bug; joint failure means modeling.
+        run([sys.executable, "tests/overfit_smoke.py", "--small",
+             "--objective", "flow", "--qk-mode", "dmap"])
+        run([sys.executable, "tests/overfit_smoke.py", "--small",
+             "--objective", "flow", "--qk-mode", "dmap", "--compile"])
 
     return rc
 

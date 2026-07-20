@@ -65,10 +65,11 @@ def train(
     objective: str = "flow",
     hub_repo: str = "sparsetrace/ditflex-L2-flow-dmap",
     dmap_alpha: float = 0.0,
-    lr: float = 1e-5,
+    lr: float = 0.0,
     wd: float = -1.0,
     clip: float = 1.0,
     spike_skip: float = 4.0,
+    grad_ceiling: float = 25.0,
 ) -> int:
     import subprocess
     import sys
@@ -102,6 +103,7 @@ def train(
         f"--dmap-alpha={dmap_alpha}",
         f"--clip={clip}",
         f"--spike-skip={spike_skip}",
+        f"--grad-ceiling={grad_ceiling}",
     ]
     if lr > 0.0:
         cmd.append(f"--lr={lr}")
@@ -121,6 +123,7 @@ def main(
     wd: float = -1.0,
     clip: float = 1.0,
     spike_skip: float = 4.0,
+    grad_ceiling: float = 25.0,
 ):
     if objective not in ("ddpm", "flow"):
         raise SystemExit(f"unknown objective: {objective!r}")
@@ -128,6 +131,7 @@ def main(
         train_seconds=train_seconds, objective=objective,
         hub_repo=hub_repo, dmap_alpha=dmap_alpha,
         lr=lr, wd=wd, clip=clip, spike_skip=spike_skip,
+        grad_ceiling=grad_ceiling,
     )
     if rc != 0:
         raise SystemExit(rc)

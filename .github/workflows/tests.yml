@@ -53,6 +53,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install Modal
+        # If 'Token not found' appears with the probe printing 'yes',
+        # a Modal client release changed credential handling: pin with
+        #   pip install 'modal<1.5'
         run: pip install modal
 
       # No GH_TOKEN: `modal run` uploads the checkout into the container,
@@ -65,6 +68,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           MODAL_GPU: ${{ github.event.inputs.gpu || 'B300' }}
         run: |
+          echo "modal token id present: ${MODAL_TOKEN_ID:+yes}"
           modal run tests/modal_ci.py \
             --test-file "${{ github.event.inputs.test_file || '' }}" \
             ${{ github.event.inputs.compile_check == 'true' && '--compile-check' || '' }} \

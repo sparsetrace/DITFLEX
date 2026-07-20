@@ -5,6 +5,7 @@ uploads the local checkout (the Actions checkout, in CI), so there is no
 GH_TOKEN, no clone step, and the code under test is exactly the code in
 the working tree -- including uncommitted changes when run locally.
 
+======
 Gates, in order (each blocks the next from meaning anything):
   1. tests/verify_identity.py   Flex path vs fp64 math reference
   2. tests/verify_latents.py    first latent shard from the Hub

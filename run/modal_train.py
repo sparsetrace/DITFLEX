@@ -148,6 +148,22 @@ def train(
         check=True,
     )
 
+    # The editable install above happens after this Modal worker interpreter
+    # has already started.  pip writes a .pth/editable-finder file, but the
+    # running interpreter does not automatically re-process newly created
+    # .pth files.  Add the src-layout directory explicitly for imports in this
+    # supervisor process and export it for every fresh torchrun child.
+    repo_src = Path("/repo/src")
+    if not repo_src.is_dir():
+        raise RuntimeError(f"expected source directory is missing: {repo_src}")
+    repo_src_str = str(repo_src)
+    if repo_src_str not in sys.path:
+        sys.path.insert(0, repo_src_str)
+    inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+    pythonpath_parts = [part for part in inherited_pythonpath.split(os.pathsep) if part]
+    if repo_src_str not in pythonpath_parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([repo_src_str, *pythonpath_parts])
+
     from ditflex.checkpoint import (
         resolve_revision_for_step,
         select_stable_resume_revision,

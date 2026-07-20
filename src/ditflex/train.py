@@ -78,6 +78,13 @@ def parse_args() -> argparse.Namespace:
                         "cuts only DELAY the norm-growth blowup (1e-4: +850 "
                         "steps; 3e-5: +4.7K steps); decay reverses the growth "
                         "itself. Cumulative shrink ~ lr*wd*steps.")
+    p.add_argument("--grad-ceiling", type=float, default=25.0,
+                   help="ABSOLUTE skip ceiling: refuse any step whose raw grad "
+                        "norm exceeds this, regardless of the EMA (0 = off). "
+                        "The relative 4x-EMA guard RATCHETS under a drifting "
+                        "distribution (observed: EMA 1.8 -> 600 in 4K steps as "
+                        "near-threshold steps fed the average); the ceiling "
+                        "cannot be chased.")
     p.add_argument("--seed-offset", type=int, default=0,
                    help="offset added to the data base seed for this run "
                         "(runtime-only; drift-safe). Discriminator for the "
@@ -228,6 +235,7 @@ def main() -> int:
                 "spike_skip": args.spike_skip,
                 "steps_skipped": getattr(main, "_spikes", 0),
                 "seed_offset": args.seed_offset,
+                "grad_ceiling": args.grad_ceiling,
             },
         }
 
@@ -279,7 +287,7 @@ def main() -> int:
             args.spike_skip > 0.0
             and gema is not None
             and grad_norm > args.spike_skip * gema
-        )
+        ) or (args.grad_ceiling > 0.0 and grad_norm > args.grad_ceiling)
         if spiked:
             optimizer.zero_grad(set_to_none=True)   # refuse the step entirely
             main._spikes = getattr(main, "_spikes", 0) + 1

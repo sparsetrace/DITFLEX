@@ -219,39 +219,64 @@ def temperature_score_mod(beta: float) -> ScoreMod:
 # ---------------------------------------------------------------------------
 
 
+@torch.compiler.disable
+def _dmap_attention_eager(query, key, value, scale: float, alpha: float):
+    """The DMAP logit modification, executed as an EAGER ISLAND.
+
+    Literal logit deformation, as the framework intends:
+        logits = 2*score - g[kv]            (alpha = 0)
+        logits = 2*score - g[kv] - alpha*log_q[kv]   (alpha > 0)
+    with g the destination potential and log_q the degrees of exp(-H).
+
+    Why eager: torch.compile's flex backward mis-differentiates score_mods
+    that capture DIFFERENTIABLE tensors (forward matches eager to <1e-2,
+    gradients diverge up to ~1.9 relative on to_q.bias --
+    tests/test_dmap_gradients.py::test_dmap_compiled_matches_eager is the
+    regression gate and the minimal upstream repro). The eager flex
+    backward is certified correct by that suite, so this helper is
+    excluded from compilation; the rest of the model compiles normally.
+    Cost: one graph break per layer plus eager flex on N=256 tokens.
+    When the upstream capture bug is fixed, delete the decorator -- the
+    score_mod code itself is already the final form. (A score_mod-free
+    equivalent exists -- fold the potential into an augmented key
+    coordinate -- if performance ever demands full compilation.)
+    """
+    g = scale * (query * key).sum(dim=-1)                  # [B, H, N]
+
+    def dmap_mod(score, b, h, q_idx, kv_idx):
+        return 2.0 * score - g[b, h, kv_idx]
+
+    if alpha == 0.0:
+        return flex_attention(query, key, value, score_mod=dmap_mod, scale=scale)
+
+    _, lse = flex_attention(
+        query, key, value, score_mod=dmap_mod, scale=scale, return_lse=True
+    )
+    log_q = lse - g                                        # degrees of exp(-H)
+
+    def corrected_mod(score, b, h, q_idx, kv_idx):
+        return 2.0 * score - g[b, h, kv_idx] - alpha * log_q[b, h, kv_idx]
+
+    return flex_attention(query, key, value, score_mod=corrected_mod, scale=scale)
+
+
 class DmapFlexSelfAttnProcessor(FlexSelfAttnProcessor):
-    """Diffusion-map attention: row-normalization of the squared-distance
-    kernel exp(-H), optionally with the Coifman-Lafon density correction.
+    """Diffusion-map attention: row-normalization of exp(-H), applied as
+    a LOGIT MODIFICATION (score_mod), computed in an eager island.
 
-    With scores s_ij = scale * (q_i . k_j) and self-scores g = diag(s),
-    the symmetric squared-distance is H_ij = g_i + g_j - 2 s_ij. The
-    row-softmax of -H kills only the SOURCE term g_i (row-constant); the
-    DESTINATION term g_j survives as a potential:
+    logits(alpha=0) = scale*(2 q_i.k_j - q_j.k_j): the squared-distance
+    kernel's surviving destination potential (the source term g_i is
+    row-constant and dies in softmax; the destination term g_j does not).
+    alpha > 0 adds the Coifman-Lafon Doob correction by the degrees of
+    the actual kernel exp(-H). Gradients flow through g and log_q on
+    purpose -- the potentials are learned computation.
 
-        DMAP(alpha=0):  softmax_j( 2 s_ij - g_j )
+    See _dmap_attention_eager for why the flex call is excluded from
+    torch.compile, and tests/test_dmap_gradients.py for the certification
+    (gradient flow, micro-overfit parity with amap, compiled==eager).
 
-    -- doubled effective temperature plus a destination-norm tilt. This
-    is NOT plain attention (softmax of s_ij); the surviving potential is
-    the difference, and it needs no second pass: g_j = scale*(q_j . k_j)
-    is a per-token vector computed before Flex. One pass, one score_mod.
-
-    alpha > 0 adds the Coifman-Lafon correction: a further Doob tilt by
-    q^{-alpha}, where q are the degrees of the ACTUAL kernel exp(-H).
-    Pass 1 runs Flex on the alpha=0 scores with return_lse=True, and
-    log q_i = lse_i - g_i (the row-constant e^{-g_i} factored back in).
-    Pass 2 applies  2 s_ij - g_j - alpha * log q_j.
-    (alpha = 0.5: Fokker-Planck; alpha = 1: Laplace-Beltrami.)
-
-    Gradients flow through g and log_q on purpose: the potentials are
-    part of the learned computation, not frozen statistics.
-
-    NOTE: EQ/DMAP semantics additionally require symmetric scores; that
-    is enforced by weight tying in model.py (qk_mode="dmap"), not here.
-    On untied weights this computes the analogous construction over the
-    symmetric part's geometry with g_j = scale*(q_j . k_j).
-
-    Cost: alpha=0 is a single Flex pass (baseline cost + a trivial
-    elementwise g). alpha>0 adds one extra attention pass per layer."""
+    DMAP semantics additionally require symmetric scores -- enforced by
+    weight tying in model.py (qk_mode="dmap"), not here."""
 
     def __init__(self, alpha: float = 0.0):
         super().__init__(score_mod=identity_score_mod)
@@ -281,29 +306,7 @@ class DmapFlexSelfAttnProcessor(FlexSelfAttnProcessor):
         key = key.view(batch, seq_len, heads, head_dim).transpose(1, 2)
         value = value.view(batch, seq_len, heads, head_dim).transpose(1, 2)
 
-        # The potential softmax does not kill: g_j = scale * (q_j . k_j).
-        g = attn.scale * (query * key).sum(dim=-1)          # [B, H, N]
-
-        def dmap_mod(score, b, h, q_idx, kv_idx):
-            return 2.0 * score - g[b, h, kv_idx]
-
-        if self.alpha == 0.0:
-            out = flex_attention(query, key, value, score_mod=dmap_mod, scale=attn.scale)
-        else:
-            # Degrees of the actual kernel exp(-H):
-            # lse_i = log sum_j exp(2 s_ij - g_j) = g_i + log q_i.
-            _, lse = flex_attention(
-                query, key, value, score_mod=dmap_mod, scale=attn.scale, return_lse=True
-            )
-            log_q = lse - g
-            alpha = self.alpha
-
-            def corrected_mod(score, b, h, q_idx, kv_idx):
-                return 2.0 * score - g[b, h, kv_idx] - alpha * log_q[b, h, kv_idx]
-
-            out = flex_attention(
-                query, key, value, score_mod=corrected_mod, scale=attn.scale
-            )
+        out = _dmap_attention_eager(query, key, value, attn.scale, self.alpha)
 
         out = out.transpose(1, 2).reshape(batch, seq_len, heads * head_dim)
         out = attn.to_out[0](out)

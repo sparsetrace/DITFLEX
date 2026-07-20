@@ -11,15 +11,15 @@ on:
       gpus:
         description: "GPU count (2 is the certified sweet spot)"
         required: false
-        default: "1"
+        default: "2"
       gpu_kind:
         description: "GPU kind (B300 | B200)"
         required: false
-        default: "B200"
+        default: "B300"
       train_seconds:
         description: "Stepping budget in seconds (14400 = 4 h)"
         required: false
-        default: "3600"
+        default: "14400"
       objective:
         description: "Objective (ddpm | flow)"
         required: false
@@ -28,6 +28,14 @@ on:
         description: "Checkpoint repo for the DMAP chain (never share with the baseline)"
         required: false
         default: "sparsetrace/ditflex-L2-flow-dmap"
+      lr:
+        description: "LR override for this run (0 = keep recipe 1e-4; gain-compensation: 0.00005)"
+        required: false
+        default: "0"
+      wd:
+        description: "Weight-decay override for this run (-1 = keep recipe 0)"
+        required: false
+        default: "-1"
       clip:
         description: "Gradient-clip max-norm (46K cliff protocol: 0.25)"
         required: false
@@ -36,6 +44,10 @@ on:
         description: "Skip steps with grad norm > this x EMA (0 = off)"
         required: false
         default: "4.0"
+      grad_ceiling:
+        description: "Absolute grad-norm skip ceiling (0 = off)"
+        required: false
+        default: "25.0"
       dmap_alpha:
         description: "Coifman-Lafon exponent (0 | 0.5 | 1)"
         required: false
@@ -73,4 +85,7 @@ jobs:
             --hub-repo "${{ inputs.hub_repo }}" \
             --dmap-alpha "${{ inputs.dmap_alpha }}" \
             --clip "${{ inputs.clip }}" \
-            --spike-skip "${{ inputs.spike_skip }}"
+            --spike-skip "${{ inputs.spike_skip }}" \
+            --grad-ceiling "${{ inputs.grad_ceiling }}" \
+            --lr "${{ inputs.lr }}" \
+            --wd "${{ inputs.wd }}"

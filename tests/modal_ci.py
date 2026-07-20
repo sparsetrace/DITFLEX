@@ -1,39 +1,24 @@
-"""tests/modal_ci.py -- Modal runner for the ditflex gates and tests.
+"""Modal CI runner for ditflex correctness, stability, and GPU smoke gates.
 
-The source is NOT cloned from GitHub inside the container. `modal run`
-uploads the local checkout (the Actions checkout, in CI), so there is no
-GH_TOKEN, no clone step, and the code under test is exactly the code in
-the working tree -- including uncommitted changes when run locally.
+The Actions checkout is mounted directly into the container, so the code under
+CI is exactly the working tree being tested.  In addition to the existing
+FlexAttention, latent, pytest, and overfit gates, this runner now verifies the
+transactional training additions before any expensive smoke run:
 
-===============
-Gates, in order (each blocks the next from meaning anything):
-  1. tests/verify_identity.py   Flex path vs fp64 math reference
-  2. tests/verify_latents.py    first latent shard from the Hub
-                                (--latents-all: every shard, ~10.5 GB,
-                                checks N == 1,281,167 and class coverage)
-  3. pytest tests/
-  4. (--smoke) tests/overfit_smoke.py, small model, both objectives
+* Ruff and bytecode compilation;
+* committed-reference stability-controller tests;
+* deterministic objective RNG tests;
+* checkpoint validation/selection tests;
+* importability of the Modal training supervisor.
 
 Usage
 -----
     modal run tests/modal_ci.py
+    modal run tests/modal_ci.py --transactional-only
     modal run tests/modal_ci.py --compile-check
     modal run tests/modal_ci.py --smoke
     modal run tests/modal_ci.py --latents-all
-    modal run tests/modal_ci.py --test-file test_attention_identity.py
-
-Environment
------------
-    MODAL_TOKEN_ID / MODAL_TOKEN_SECRET   auth (or ~/.modal.toml locally)
-    MODAL_GPU     GPU target. Default B300 -- the training hardware, so
-                  the gates certify the kernels that will actually run.
-    TORCH_INDEX   torch wheel index. Default cu129: B300 is SM103 /
-                  compute_103, which requires CUDA >= 12.9.
-
-    HF_TOKEN      HuggingFace token for the latents gate. Set as a
-                  GitHub repo secret; the workflow exports it and this
-                  launcher forwards it into the container via
-                  Secret.from_dict. For local runs: export HF_TOKEN=hf_...
+    modal run tests/modal_ci.py --test-file test_stability.py
 """
 
 from __future__ import annotations
@@ -43,12 +28,17 @@ from pathlib import Path
 
 import modal
 
-# This file lives in tests/. The mount MUST be the repo root, or the
-# container is missing src/, run/, and pyproject.toml.
 REPO_ROOT = Path(__file__).parent.parent
 
 GPU_TYPE = os.environ.get("MODAL_GPU", "B300")
 TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu129")
+
+TRANSACTIONAL_TESTS = [
+    "tests/test_stability.py",
+    "tests/test_objective_rng.py",
+    "tests/test_checkpoint_selection.py",
+    "tests/test_checkpoint_roundtrip.py",
+]
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -62,11 +52,19 @@ image = (
         "numpy>=1.26",
         "tqdm",
         "pytest>=8.0",
+        "ruff>=0.6",
     )
     .add_local_dir(
         REPO_ROOT,
         remote_path="/repo",
-        ignore=[".git", "**/__pycache__", "*.egg-info", ".venv", ".ruff_cache", ".pytest_cache"],
+        ignore=[
+            ".git",
+            "**/__pycache__",
+            "*.egg-info",
+            ".venv",
+            ".ruff_cache",
+            ".pytest_cache",
+        ],
     )
 )
 
@@ -75,18 +73,15 @@ app = modal.App("ditflex-ci", image=image)
 
 @app.function(
     gpu=GPU_TYPE,
-    # Generous: the everything-enabled dispatch (full latents download +
-    # smoke x2 objectives + compile checks) can pass an hour.
     timeout=7200,
-    # Captured from the launching environment (the Actions runner, which
-    # gets it from the GitHub repo secret) -- no Modal-side secret needed.
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
 def run_gates(
-    test_files: list | None = None,
+    test_files: list[str] | None = None,
     compile_check: bool = False,
     smoke: bool = False,
     latents_all: bool = False,
+    transactional_only: bool = False,
 ) -> int:
     import subprocess
     import sys
@@ -95,19 +90,47 @@ def run_gates(
         ["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"],
         capture_output=True,
         text=True,
+        check=False,
     )
     print(f"[modal] GPU: {result.stdout.strip()}")
 
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"], check=True
+        [sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"],
+        check=True,
     )
 
-    rc = 0
+    first_failure = 0
 
     def run(cmd: list[str]) -> None:
-        nonlocal rc
-        print(f"\n[modal] running: {' '.join(cmd)}\n")
-        rc = subprocess.run(cmd, cwd="/repo").returncode or rc
+        nonlocal first_failure
+        print(f"\n[modal] running: {' '.join(cmd)}\n", flush=True)
+        result = subprocess.run(cmd, cwd="/repo", check=False)
+        if result.returncode != 0 and first_failure == 0:
+            first_failure = result.returncode
+
+    # Cheap source gates first.  These catch malformed supervisor/train changes
+    # before spending time downloading latents or compiling GPU kernels.
+    run([sys.executable, "-m", "ruff", "check", "src", "run", "tests"])
+    run([sys.executable, "-m", "compileall", "-q", "src", "run", "tests"])
+    run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import run.modal_train as m; "
+                "assert m.RETRY_EXIT_CODE == 75; "
+                "assert m.RETRY_MARKER.name == 'ditflex_retry.json'; "
+                "assert m.PROMOTION_MARKER.name == 'ditflex_promotion.json'"
+            ),
+        ]
+    )
+
+    # Always run the focused transactional tests, even when --test-file selects
+    # another test.  They protect rollback/promotion behavior used in production.
+    run([sys.executable, "-m", "pytest", "-v", "--tb=short", *TRANSACTIONAL_TESTS])
+
+    if transactional_only:
+        return first_failure
 
     gate_cmd = [sys.executable, "tests/verify_identity.py"]
     if compile_check:
@@ -116,24 +139,48 @@ def run_gates(
 
     latents_cmd = [sys.executable, "tests/verify_latents.py"]
     if latents_all:
-        latents_cmd.append("--all")  # replaces the fast check; shard 0 is cached
+        latents_cmd.append("--all")
     run(latents_cmd)
 
-    pytest_cmd = [sys.executable, "-m", "pytest", "-v", "--tb=short"]
-    pytest_cmd += test_files or ["tests"]
-    run(pytest_cmd)
+    selected = test_files or ["tests"]
+    run([sys.executable, "-m", "pytest", "-v", "--tb=short", *selected])
 
     if smoke:
         for objective in ("ddpm", "flow"):
-            run([sys.executable, "tests/overfit_smoke.py", "--small", "--objective", objective])
-        # DMAP diagnosis pair: eager vs compiled. Divergent outcomes
-        # localize a compile-path bug; joint failure means modeling.
-        run([sys.executable, "tests/overfit_smoke.py", "--small",
-             "--objective", "flow", "--qk-mode", "dmap"])
-        run([sys.executable, "tests/overfit_smoke.py", "--small",
-             "--objective", "flow", "--qk-mode", "dmap", "--compile"])
+            run(
+                [
+                    sys.executable,
+                    "tests/overfit_smoke.py",
+                    "--small",
+                    "--objective",
+                    objective,
+                ]
+            )
+        run(
+            [
+                sys.executable,
+                "tests/overfit_smoke.py",
+                "--small",
+                "--objective",
+                "flow",
+                "--qk-mode",
+                "dmap",
+            ]
+        )
+        run(
+            [
+                sys.executable,
+                "tests/overfit_smoke.py",
+                "--small",
+                "--objective",
+                "flow",
+                "--qk-mode",
+                "dmap",
+                "--compile",
+            ]
+        )
 
-    return rc
+    return first_failure
 
 
 @app.local_entrypoint()
@@ -142,13 +189,16 @@ def main(
     compile_check: bool = False,
     smoke: bool = False,
     latents_all: bool = False,
+    transactional_only: bool = False,
 ):
-    """
+    """Run Modal CI gates.
+
     Args:
-        test_file:     specific pytest file (e.g. test_attention_identity.py), empty = all
-        compile_check: also verify the torch.compile'd Flex path
-        smoke:         also run the small-model overfit smoke, both objectives
-        latents_all:   check every latent shard (10.5 GB download) instead of the first
+        test_file: Specific pytest file, or empty for the full suite.
+        compile_check: Also verify the compiled FlexAttention path.
+        smoke: Also run small-model overfit smoke tests.
+        latents_all: Validate every latent shard instead of only shard zero.
+        transactional_only: Run only static and transactional stability gates.
     """
     files = None
     if test_file:
@@ -157,7 +207,11 @@ def main(
         files = [test_file]
 
     rc = run_gates.remote(
-        test_files=files, compile_check=compile_check, smoke=smoke, latents_all=latents_all
+        test_files=files,
+        compile_check=compile_check,
+        smoke=smoke,
+        latents_all=latents_all,
+        transactional_only=transactional_only,
     )
     if rc != 0:
         raise SystemExit(rc)

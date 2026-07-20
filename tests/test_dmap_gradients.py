@@ -1,6 +1,5 @@
 """Diagnosis suite for the DMAP training stall (loss pinned at the
 zero-predictor floor ~1.69 for 100K steps).
-===
 
 The certification gap: the dense-math test proved the DMAP processor in
 EAGER mode; training runs it under torch.compile. These tests close the
@@ -115,9 +114,92 @@ def test_micro_overfit_amap_vs_dmap():
 
 
 @requires_cuda
+def test_dmap_eager_backward_matches_finite_differences():
+    """The compiler-free oracle: eager DMAP attention's autograd gradient
+    on to_q.bias checked against central finite differences. If THIS
+    fails, eager flex mis-differentiates the captured g too, and the
+    entire score_mod route (eager or compiled) is unusable for
+    differentiable captures -- the feature-augmentation form becomes the
+    only correct implementation."""
+    from diffusers.models.attention_processor import Attention
+
+    from ditflex.diffusion import DmapFlexSelfAttnProcessor
+
+    torch.manual_seed(0)
+    heads, head_dim, n, c = 2, 16, 32, 32
+    attn = Attention(query_dim=c, heads=heads, dim_head=head_dim, dropout=0.0, bias=True)
+    attn = attn.to(device="cuda", dtype=torch.float32).eval()
+    attn.to_k = attn.to_q
+    attn.set_processor(DmapFlexSelfAttnProcessor(alpha=0.0))
+    x = torch.randn(2, n, c, device="cuda")
+
+    def loss_fn():
+        return attn(x).square().mean()
+
+    for p_ in attn.parameters():
+        p_.requires_grad_(True)
+    attn.zero_grad(set_to_none=True)
+    loss_fn().backward()
+    bias = attn.to_q.bias
+    autograd_g = bias.grad.detach().clone()
+
+    eps = 1e-3
+    for idx in (0, 7, 15):
+        with torch.no_grad():
+            orig = bias[idx].item()
+            bias[idx] = orig + eps
+            lp = loss_fn().item()
+            bias[idx] = orig - eps
+            lm = loss_fn().item()
+            bias[idx] = orig
+        fd = (lp - lm) / (2 * eps)
+        ag = autograd_g[idx].item()
+        denom = max(abs(fd), abs(ag), 1e-6)
+        rel = abs(fd - ag) / denom
+        assert rel < 5e-2, (
+            f"EAGER backward wrong at to_q.bias[{idx}]: autograd={ag:.6e} "
+            f"finite-diff={fd:.6e} rel={rel:.3e} -- the capture bug is in "
+            "eager flex too; only the augmentation form is correct."
+        )
+
+
+@requires_cuda
 def test_dmap_compiled_matches_eager():
     """THE previously uncertified surface: the DMAP score_mod (captured
-    g tensor) under torch.compile, forward AND backward."""
+    g tensor) under torch.compile, forward AND backward.
+
+    Now self-diagnosing: first verifies the deployed diffusion.py
+    actually contains the eager-island decorator (staleness detector),
+    then verifies the island ENGAGES (a fullgraph compile of the dmap
+    model must graph-break). Only then does the numerical comparison
+    mean anything."""
+    import inspect
+
+    from ditflex import diffusion as _dmod
+
+    src = inspect.getsource(_dmod)
+    assert "compiler.disable" in src, (
+        "STALE diffusion.py deployed: the eager-island decorator is absent "
+        "from the installed source. Re-copy src/ditflex/diffusion.py."
+    )
+
+    torch._dynamo.reset()
+    probe = build_dmap_model(tiny()).cuda().eval()
+    xp, yp = batch("cuda", n=2)
+    tp = torch.full((2,), 500.0, device="cuda")
+    island_engaged = False
+    try:
+        torch.compile(probe, fullgraph=True)(
+            hidden_states=xp, timestep=tp, class_labels=yp
+        )
+    except Exception:
+        island_engaged = True
+    assert island_engaged, (
+        "eager island NOT engaging: the dmap model compiled with "
+        "fullgraph=True (no graph break) -- torch.compiler.disable is not "
+        "taking effect on this torch build."
+    )
+    torch._dynamo.reset()
     torch.manual_seed(0)
     torch.backends.cuda.matmul.allow_tf32 = False
     model = build_dmap_model(tiny()).cuda().eval()
@@ -150,4 +232,8 @@ def test_dmap_compiled_matches_eager():
         g_c = dict(model.named_parameters())[name].grad
         assert g_c is not None and torch.isfinite(g_c).all(), f"compiled grad bad: {name}"
         rel = ((g_c - g_e).abs().max() / (g_e.abs().max() + 1e-12)).item()
-        assert rel < 5e-2, f"compiled grad diverges on {name}: rel={rel:.3e}"
+        assert rel < 5e-2, (
+            f"compiled grad diverges on {name}: rel={rel:.3e}  "
+            f"|eager|={g_e.norm().item():.4e} |compiled|={g_c.norm().item():.4e} "
+            f"cos={torch.nn.functional.cosine_similarity(g_c.flatten(), g_e.flatten(), dim=0).item():.4f}"
+        )

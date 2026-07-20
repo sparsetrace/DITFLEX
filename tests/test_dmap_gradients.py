@@ -1,5 +1,6 @@
 """Diagnosis suite for the DMAP training stall (loss pinned at the
 zero-predictor floor ~1.69 for 100K steps).
+===
 
 The certification gap: the dense-math test proved the DMAP processor in
 EAGER mode; training runs it under torch.compile. These tests close the

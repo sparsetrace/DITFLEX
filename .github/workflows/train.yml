@@ -1,20 +1,31 @@
 name: train
 
-# Manual dispatch ONLY. This spends real 8-GPU hours -- it must never
+# Manual dispatch ONLY. This spends real GPU-hours -- it must never
 # trigger from a push.
+#
+# Chain economics ($/1K steps = hourly price / (3.6 * steps/s), measured):
+#   2xB300: 9.3-9.5 steps/s  ~$11.75/h  ~$0.35/1K
+#   2xB200: 8.4     steps/s  ~$12.5/h   ~$0.41/1K
+#   1xB200: 5.52    steps/s  ~$6.25/h   ~$0.31/1K
+#   1xRTX-PRO-6000: unmeasured -- the current default is a price probe;
+#     read its steady-state steps/s from the first link and fill this row.
+# Links are detached, so wall-clock per link is irrelevant; only $/step
+# matters. Single-GPU also deletes DDP entirely (no allreduce, no rank
+# desync in the guards).
+
 on:
   workflow_dispatch:
     inputs:
       gpus:
-        description: "GPU count (2 is the certified sweet spot: fixed batch 256 makes 8 GPUs slower AND ~6x costlier)"
+        description: "GPU count (1 = full batch 256 on one die, no DDP; 2 if a single card OOMs)"
         required: false
-        default: "2"
+        default: "1"
       gpu_kind:
-        description: "GPU kind (B300 | B200)"
+        description: "GPU kind (RTX-PRO-6000 | B200 | B300). If Modal rejects the RTX string, its error lists the valid names -- fix and re-dispatch."
         required: false
-        default: "B300"
+        default: "RTX-PRO-6000"
       train_seconds:
-        description: "Stepping budget in seconds (14400 = 4 h ~= 136K steps ~= $60 on 2xB300)"
+        description: "Stepping budget in seconds (14400 = 4 h; Modal timeout = this + 3600. GitHub's 6h limit does NOT apply -- the job detaches in minutes)"
         required: false
         default: "14400"
       objective:
@@ -22,25 +33,25 @@ on:
         required: false
         default: "flow"
       lr:
-        description: "LR override for this run (0 = keep recipe 1e-4)"
+        description: "LR override for this run (0 = keep recipe 1e-4). Post-250K instability protocol: 0.00003"
         required: false
         default: "0"
       wd:
-        description: "Weight-decay override for this run (-1 = keep recipe 0)"
+        description: "Weight-decay override for this run (-1 = keep recipe 0). Post-250K instability protocol: 0.1"
         required: false
         default: "-1"
       max_steps:
-        description: "Stop at this many steps THIS RUN (0 = time-boxed only). For a global target: target minus current step"
+        description: "Stop at this many steps THIS RUN (0 = time-boxed only). For a global target: target minus current step in state.json"
         required: false
         default: "0"
       hub_repo:
-        description: "Checkpoint repo. ONE PER OBJECTIVE: config-drift refusal (correctly) blocks resuming flow from a ddpm checkpoint"
+        description: "Checkpoint repo. ONE PER OBJECTIVE/VARIANT: config-drift refusal (correctly) blocks cross-resume"
         required: false
         default: "sparsetrace/ditflex-L2-flow"
 
 jobs:
   launch:
-    name: "launch · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }}"
+    name: "launch · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }} · lr=${{ inputs.lr }} wd=${{ inputs.wd }}"
     runs-on: ubuntu-latest
 
     steps:
@@ -67,6 +78,7 @@ jobs:
           MODAL_GPUS: ${{ inputs.gpus }}
           MODAL_TRAIN_SECONDS: ${{ inputs.train_seconds }}
         run: |
+          echo "modal token id present: ${MODAL_TOKEN_ID:+yes}"
           modal run --detach run/modal_train.py \
             --train-seconds "${{ inputs.train_seconds }}" \
             --objective "${{ inputs.objective }}" \

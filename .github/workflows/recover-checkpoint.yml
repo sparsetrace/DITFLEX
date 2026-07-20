@@ -1,0 +1,54 @@
+name: recover-checkpoint
+
+# Restore a healthy checkpoint from Hub revision history after a
+# divergence poisoned 'latest'. Walks the commit ledger, finds the
+# commit whose state.json reports the requested step, re-uploads those
+# files as the new latest.
+#
+# SAFETY: defaults to dry_run=true, which only prints the commit ledger
+# (commit-id + step for every revision) and what would be restored.
+# Inspect that output, then re-dispatch with dry_run=false to execute.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Checkpoint repo to operate on"
+        required: false
+        default: "sparsetrace/ditflex-L2-flow"
+      step:
+        description: "Step to restore as latest (e.g. 240000)"
+        required: true
+      dry_run:
+        description: "true = print the ledger only; false = actually restore"
+        required: false
+        default: "true"
+
+jobs:
+  recover:
+    name: "recover ${{ inputs.repo }} -> step ${{ inputs.step }} (dry_run=${{ inputs.dry_run }})"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install huggingface_hub
+        run: pip install "huggingface_hub>=0.26"
+
+      - name: Run recovery
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "false" ]; then
+            python run/recover_checkpoint.py \
+              --repo "${{ inputs.repo }}" --step "${{ inputs.step }}"
+          else
+            python run/recover_checkpoint.py \
+              --repo "${{ inputs.repo }}" --step "${{ inputs.step }}" --dry-run
+          fi

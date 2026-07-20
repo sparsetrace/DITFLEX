@@ -224,16 +224,22 @@ def test_dmap_compiled_matches_eager():
     model.zero_grad(set_to_none=True)
     out_comp.square().mean().backward()
 
-    fwd_rel = ((out_comp - out_eager).abs().max()
-               / (out_eager.abs().max() + 1e-12)).item()
-    assert fwd_rel < 1e-2, f"compiled forward diverges from eager: rel={fwd_rel:.3e}"
+    fwd_abs = (out_comp - out_eager).abs().max().item()
+    fwd_ref = out_eager.abs().max().item()
+    assert fwd_abs <= 1e-5 + 1e-2 * fwd_ref, (
+        f"compiled forward diverges from eager: abs={fwd_abs:.3e} ref={fwd_ref:.3e}"
+    )
 
     for name, g_e in grads_eager.items():
         g_c = dict(model.named_parameters())[name].grad
         assert g_c is not None and torch.isfinite(g_c).all(), f"compiled grad bad: {name}"
-        rel = ((g_c - g_e).abs().max() / (g_e.abs().max() + 1e-12)).item()
-        assert rel < 5e-2, (
-            f"compiled grad diverges on {name}: rel={rel:.3e}  "
+        # Combined criterion (|a-b| <= atol + rtol*|ref|): the atol floor
+        # absorbs mathematically-tiny gradients so noise can never fail a
+        # relative test again.
+        max_abs = (g_c - g_e).abs().max().item()
+        ref = g_e.abs().max().item()
+        assert max_abs <= 1e-6 + 5e-2 * ref, (
+            f"compiled grad diverges on {name}: abs={max_abs:.3e} ref={ref:.3e}  "
             f"|eager|={g_e.norm().item():.4e} |compiled|={g_c.norm().item():.4e} "
             f"cos={torch.nn.functional.cosine_similarity(g_c.flatten(), g_e.flatten(), dim=0).item():.4f}"
         )

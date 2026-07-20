@@ -92,6 +92,7 @@ def train(
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
+    grad_ceiling: float = 25.0,
 ) -> int:
     import subprocess
     import sys
@@ -136,6 +137,7 @@ def train(
     cmd.append(f"--spike-skip={spike_skip}")
     if seed_offset != 0:
         cmd.append(f"--seed-offset={seed_offset}")
+    cmd.append(f"--grad-ceiling={grad_ceiling}")
     print(f"\n[modal] running: {' '.join(cmd)}\n")
     return subprocess.run(cmd, cwd="/repo").returncode
 
@@ -151,6 +153,7 @@ def main(
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
+    grad_ceiling: float = 25.0,
 ):
     """
     Args:
@@ -167,6 +170,7 @@ def main(
         train_seconds=train_seconds, objective=objective,
         hub_repo=hub_repo, max_steps=max_steps, lr=lr, wd=wd,
         clip=clip, spike_skip=spike_skip, seed_offset=seed_offset,
+        grad_ceiling=grad_ceiling,
     )
     if rc != 0:
         raise SystemExit(rc)

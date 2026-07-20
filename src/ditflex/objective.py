@@ -1,27 +1,16 @@
-"""src/ditflex/objective.py -- DDPM eps and flow matching behind one interface.
+"""DDPM epsilon prediction and flow matching behind one deterministic interface.
 
-Both objectives expose  loss(model, x0, y) -> scalar , so train.py swaps
-them by name and nothing else changes -- the same discipline as the
-attention: when the DDPM and flow runs differ, the objective is the only
-difference.
+Both objectives expose ``loss(model, x0, y, generator=None) -> scalar``.  The
+optional generator makes every source of objective randomness deterministic in
+``(global_step, rank, retry_seed_offset)``:
 
-The interpolant/noising math lives in pure functions (add_noise,
-linear_interpolant, apply_label_dropout) so tests can check it exactly,
-without a model.
+* diffusion / flow timestep;
+* Gaussian noise;
+* classifier-free label dropout.
 
-Recipe notes:
-  - DDPM: linear betas 1e-4..0.02, T=1000, eps-prediction MSE.
-    DEVIATION: published DiT adds a VLB term on learned sigma; we train
-    eps-only (see ModelConfig.out_channels).
-  - Flow: linear interpolant x_t = (1-t) x0 + t eps, velocity target
-    v = eps - x0, t ~ Uniform(0,1)  (SiT parity -- NOT the logit-normal
-    used by the overfit smoke, which is a smoke-only shortcut).
-    Continuous timestep is passed as t * 1000.0 (float) through the same
-    embedder the DDPM branch uses; test_objective_math.py proves the
-    diffusers DiT accepts float timesteps, since that is an assumption,
-    not a documented guarantee.
-  - Label dropout to the null class (index num_classes) happens inside
-    loss(), because CFG-readiness is part of the training objective.
+This matters for transactional retries.  Re-running the same attempt reproduces
+the exact stochastic objective, while changing the retry seed offset changes
+all objective randomness together rather than changing only latent indices.
 """
 
 from __future__ import annotations
@@ -30,6 +19,51 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
+
+# -- deterministic RNG ----------------------------------------------------
+
+_MASK64 = (1 << 64) - 1
+_TORCH_SEED_MAX = (1 << 63) - 1
+
+
+def _splitmix64(value: int) -> int:
+    """Small stable 64-bit mixer; independent of Python's randomized hash()."""
+    z = (int(value) + 0x9E3779B97F4A7C15) & _MASK64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return (z ^ (z >> 31)) & _MASK64
+
+
+def objective_seed(base_seed: int, global_step: int, rank: int, seed_offset: int = 0) -> int:
+    """Return a deterministic torch seed for one objective batch.
+
+    Constants are namespace separators rather than cryptographic values.  The
+    function intentionally does not depend on world size, so a resumed run is
+    deterministic for each rank even if the number of ranks changes.
+    """
+    value = _splitmix64(base_seed)
+    value ^= _splitmix64(global_step + 0xD17F1E5)
+    value ^= _splitmix64(rank + 0x51A7)
+    value ^= _splitmix64(seed_offset + 0xC0FFEE)
+    seed = value % _TORCH_SEED_MAX
+    return int(seed if seed != 0 else 1)
+
+
+def make_step_generator(
+    device: torch.device | str,
+    *,
+    base_seed: int,
+    global_step: int,
+    rank: int,
+    seed_offset: int = 0,
+) -> torch.Generator:
+    """Create a device-local generator for one training step."""
+    device = torch.device(device)
+    generator_device = device if device.type == "cuda" else torch.device("cpu")
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(objective_seed(base_seed, global_step, rank, seed_offset))
+    return generator
+
 
 # -- pure math, exactly testable -----------------------------------------
 
@@ -43,19 +77,28 @@ def add_noise(x0: torch.Tensor, eps: torch.Tensor, abar_t: torch.Tensor) -> torc
 def linear_interpolant(
     x0: torch.Tensor, eps: torch.Tensor, t: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """x_t = (1-t) x0 + t eps ; velocity target v = d/dt x_t = eps - x0."""
+    """x_t = (1-t) x0 + t eps; velocity target v = eps - x0."""
     tb = t.view(-1, 1, 1, 1)
     return (1.0 - tb) * x0 + tb * eps, eps - x0
 
 
 def apply_label_dropout(
-    y: torch.Tensor, p: float, null_index: int, generator: torch.Generator | None = None
+    y: torch.Tensor,
+    p: float,
+    null_index: int,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Replace labels with the CFG null class with probability p."""
+    """Replace labels with the classifier-free-guidance null class."""
     if p <= 0.0:
         return y
     drop = torch.rand(y.shape, device=y.device, generator=generator) < p
     return torch.where(drop, torch.full_like(y, null_index), y)
+
+
+def _randn_like(x: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
+    # ``torch.randn_like(..., generator=...)`` has varied across torch builds;
+    # the explicit shape form is supported by every build used by this repo.
+    return torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
 
 
 # -- objectives -----------------------------------------------------------
@@ -74,18 +117,39 @@ class DDPMObjective:
         key = str(device)
         if key not in self._abar_cache:
             betas = torch.linspace(
-                self.beta_start, self.beta_end, self.num_train_timesteps,
-                device=device, dtype=torch.float32,
+                self.beta_start,
+                self.beta_end,
+                self.num_train_timesteps,
+                device=device,
+                dtype=torch.float32,
             )
             self._abar_cache[key] = torch.cumprod(1.0 - betas, dim=0)
         return self._abar_cache[key]
 
-    def loss(self, model, x0: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def loss(
+        self,
+        model,
+        x0: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
         abar = self.alphas_cumprod(x0.device)
-        t = torch.randint(0, self.num_train_timesteps, (x0.shape[0],), device=x0.device)
-        eps = torch.randn_like(x0)
+        t = torch.randint(
+            0,
+            self.num_train_timesteps,
+            (x0.shape[0],),
+            device=x0.device,
+            generator=generator,
+        )
+        eps = _randn_like(x0, generator)
         xt = add_noise(x0, eps, abar[t])
-        y = apply_label_dropout(y, self.label_dropout, self.null_class)
+        y = apply_label_dropout(
+            y,
+            self.label_dropout,
+            self.null_class,
+            generator=generator,
+        )
         pred = model(hidden_states=xt, timestep=t, class_labels=y).sample
         return F.mse_loss(pred[:, : x0.shape[1]], eps)
 
@@ -94,17 +158,31 @@ class DDPMObjective:
 class FlowMatchingObjective:
     label_dropout: float = 0.1
     null_class: int = 1000
-    timestep_scale: float = 1000.0   # continuous t in [0,1] -> embedder scale
+    timestep_scale: float = 1000.0
 
-    def loss(self, model, x0: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        t = torch.rand(x0.shape[0], device=x0.device)   # Uniform: SiT parity
-        eps = torch.randn_like(x0)
-        xt, v = linear_interpolant(x0, eps, t)
-        y = apply_label_dropout(y, self.label_dropout, self.null_class)
+    def loss(
+        self,
+        model,
+        x0: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        t = torch.rand(x0.shape[0], device=x0.device, generator=generator)
+        eps = _randn_like(x0, generator)
+        xt, velocity = linear_interpolant(x0, eps, t)
+        y = apply_label_dropout(
+            y,
+            self.label_dropout,
+            self.null_class,
+            generator=generator,
+        )
         pred = model(
-            hidden_states=xt, timestep=t * self.timestep_scale, class_labels=y
+            hidden_states=xt,
+            timestep=t * self.timestep_scale,
+            class_labels=y,
         ).sample
-        return F.mse_loss(pred[:, : x0.shape[1]], v)
+        return F.mse_loss(pred[:, : x0.shape[1]], velocity)
 
 
 def build_objective(name: str, label_dropout: float = 0.1, num_classes: int = 1000):

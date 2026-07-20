@@ -219,27 +219,28 @@ def temperature_score_mod(beta: float) -> ScoreMod:
 # ---------------------------------------------------------------------------
 
 
-@torch.compiler.disable
 def _dmap_attention_eager(query, key, value, scale: float, alpha: float):
-    """The DMAP logit modification, executed as an EAGER ISLAND.
+    """The DMAP logit modification, as a score_mod.
 
     Literal logit deformation, as the framework intends:
         logits = 2*score - g[kv]            (alpha = 0)
         logits = 2*score - g[kv] - alpha*log_q[kv]   (alpha > 0)
     with g the destination potential and log_q the degrees of exp(-H).
 
-    Why eager: torch.compile's flex backward mis-differentiates score_mods
-    that capture DIFFERENTIABLE tensors (forward matches eager to <1e-2,
-    gradients diverge up to ~1.9 relative on to_q.bias --
-    tests/test_dmap_gradients.py::test_dmap_compiled_matches_eager is the
-    regression gate and the minimal upstream repro). The eager flex
-    backward is certified correct by that suite, so this helper is
-    excluded from compilation; the rest of the model compiles normally.
-    Cost: one graph break per layer plus eager flex on N=256 tokens.
-    When the upstream capture bug is fixed, delete the decorator -- the
-    score_mod code itself is already the final form. (A score_mod-free
-    equivalent exists -- fold the potential into an augmented key
-    coordinate -- if performance ever demands full compilation.)
+    HISTORY: this helper spent a debugging arc as an eager island
+    (excluded from compilation) while a compiled-capture gradient bug
+    was suspected (a 100K-step production stall at the zero-predictor floor).
+    The suspicion was retracted -- the apparent gradient divergences were
+    noise-vs-noise at the adaLN-zero degenerate init -- and
+    tests/test_dmap_gradients.py::test_compiled_scoremod_capture_probe
+    then certified compiled flex with this differentiable capture against
+    eager directly. The decorator was removed; the function name remains
+    as a scar. The full certification chain: finite-difference oracle
+    (eager backward vs arithmetic), capture probe (compiled vs eager,
+    kernel-level), and test_dmap_compiled_matches_eager (compiled vs
+    eager, model-level, non-degenerate weights) -- which now also asserts
+    the model compiles fullgraph with no stray breaks. The production
+    stall's cause is recorded as undetermined.
     """
     g = scale * (query * key).sum(dim=-1)                  # [B, H, N]
 
@@ -271,9 +272,10 @@ class DmapFlexSelfAttnProcessor(FlexSelfAttnProcessor):
     the actual kernel exp(-H). Gradients flow through g and log_q on
     purpose -- the potentials are learned computation.
 
-    See _dmap_attention_eager for why the flex call is excluded from
-    torch.compile, and tests/test_dmap_gradients.py for the certification
-    (gradient flow, micro-overfit parity with amap, compiled==eager).
+    Fully compiled: the score_mod's differentiable capture was certified
+    against eager by the kernel-level probe and against arithmetic by the
+    finite-difference oracle (tests/test_dmap_gradients.py); see
+    _dmap_attention_eager's HISTORY note for the debugging arc.
 
     DMAP semantics additionally require symmetric scores -- enforced by
     weight tying in model.py (qk_mode="dmap"), not here."""

@@ -43,6 +43,17 @@ class ModelConfig:
     #   row-softmax (only the source term g_i is killed).
     # 0.5 = Fokker-Planck; 1 = Laplace-Beltrami. Ignored for amap.
     dmap_alpha: float = 0.0
+    # DEVIATION (adopted at the 344K migration, amap chain only): per-head
+    # RMSNorm(head_dim, eps=1e-6) on Q and K before attention. Forced by
+    # evidence: unbounded block-1 QK logits (8.6e6 at 312.5K) driven by
+    # adaLN weight growth produced the gradient-spike instability; RMSNorm
+    # bounds per-head logits by construction. INVALID for qk_mode="dmap":
+    # untied norms would break the R == 0 symmetry, tied norms would
+    # flatten the destination potential g_j that defines the DMAP kernel
+    # (build_dmap_model refuses the combination). Old checkpoints lacking
+    # this key deserialize to False, so pre-migration configs round-trip
+    # unchanged.
+    qk_norm: bool = False
 
 
 @dataclass

@@ -20,12 +20,29 @@ Three things live here:
      that depends on no fused kernel at all. Test utility only, never a
      training path.
 
+QK-NORM (added at the 344K migration; DEVIATION from published DiT/SiT):
+if the module carries ``norm_q`` / ``norm_k`` (RMSNorm over head_dim),
+the processor applies them per-head AFTER the [B, N, H*D] -> [B, H, N, D]
+reshape and BEFORE flex_attention -- entirely upstream of the score_mod,
+so the swappable-score dispatch path is untouched. The fp64 reference
+applies the identical normalization from the same weights, so the
+identity gate certifies both configurations. Rationale recorded in the
+migration commit and README: at ~270-312K steps the un-normalized chain
+developed unbounded QK logits (block 1 reaching 8.6e6), driven by adaLN
+weight growth, producing the gradient-spike instability; RMSNorm on Q and
+K bounds per-head logits by construction. The DMAP chain does NOT use
+qk-norm (see model.py / diffusion_model.py guards): it shows no logit
+pathology, untied norms would break its R == 0 symmetry, and tied norms
+would change the squared-distance kernel's geometry.
+
 Scope: DiT-L/2 self-attention on [B, N, C] tokens. Cross-attention,
-attention masks, 4D inputs, group/spatial norm, qk-norm, in-processor
-residuals, and output rescaling are all rejected loudly rather than
-handled -- in a repo whose premise is that every deviation from the
-baseline is known, a config surprise should fail at the gate, not show up
-later as an uninterpretable training curve.
+attention masks, 4D inputs, group/spatial norm, in-processor residuals,
+and output rescaling are all rejected loudly rather than handled -- in a
+repo whose premise is that every deviation from the baseline is known, a
+config surprise should fail at the gate, not show up later as an
+uninterpretable training curve. qk-norm moved from the rejected list to
+the handled list in the 344K migration, with gate coverage for both the
+with-norm and without-norm configurations.
 
 Performance note: eager flex_attention is the slow-but-correct fallback
 and is what the gates use. The fast path is whole-model torch.compile in
@@ -52,6 +69,8 @@ ScoreMod = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     torch.Tensor,
 ]
+
+QK_NORM_EPS = 1e-6
 
 
 def identity_score_mod(score, b, h, q_idx, kv_idx):
@@ -92,12 +111,18 @@ class FlexSelfAttnProcessor:
             raise ValueError("group_norm is not handled by this processor.")
         if getattr(attn, "spatial_norm", None) is not None:
             raise ValueError("spatial_norm is not handled by this processor.")
-        if getattr(attn, "norm_q", None) is not None or getattr(attn, "norm_k", None) is not None:
-            raise ValueError("qk-norm is not handled by this processor.")
         if getattr(attn, "residual_connection", False):
             raise ValueError("residual_connection is handled by the block, not the processor.")
         if getattr(attn, "rescale_output_factor", 1.0) != 1.0:
             raise ValueError("rescale_output_factor != 1 is not handled.")
+
+        norm_q = getattr(attn, "norm_q", None)
+        norm_k = getattr(attn, "norm_k", None)
+        if (norm_q is None) != (norm_k is None):
+            raise ValueError(
+                "qk-norm must be installed on BOTH norm_q and norm_k or neither; "
+                "a half-installed configuration is a migration bug."
+            )
 
         batch, seq_len, _ = hidden_states.shape
 
@@ -112,6 +137,12 @@ class FlexSelfAttnProcessor:
         query = query.view(batch, seq_len, heads, head_dim).transpose(1, 2)
         key = key.view(batch, seq_len, heads, head_dim).transpose(1, 2)
         value = value.view(batch, seq_len, heads, head_dim).transpose(1, 2)
+
+        # QK-norm: per-head RMSNorm over head_dim, applied before the kernel
+        # and entirely outside the score_mod dispatch path.
+        if norm_q is not None:
+            query = norm_q(query)
+            key = norm_k(key)
 
         out = flex_attention(
             query,
@@ -136,6 +167,21 @@ class IdentityFlexSelfAttnProcessor(FlexSelfAttnProcessor):
         super().__init__(score_mod=identity_score_mod)
 
 
+def _reference_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = QK_NORM_EPS,
+) -> torch.Tensor:
+    """RMSNorm written straight from the math, for the fp64 reference path.
+
+    Matches torch.nn.RMSNorm semantics: x / sqrt(mean(x^2) + eps) * weight,
+    normalized over the last dimension. Written explicitly (no fused op) so
+    the reference depends on nothing but arithmetic.
+    """
+    rms = x.pow(2).mean(dim=-1, keepdim=True).add(eps).sqrt()
+    return x / rms * weight
+
+
 def reference_self_attention(
     attn,
     hidden_states: torch.Tensor,
@@ -145,9 +191,10 @@ def reference_self_attention(
     """Softmax self-attention written straight from the math.
 
     Uses the weights of ``attn`` but none of its forward code and no fused
-    attention kernel of any kind: explicit projections, an explicit
-    ``q @ k^T * scale`` score matrix, an explicit softmax, explicit output
-    projection.
+    attention kernel of any kind: explicit projections, optional explicit
+    per-head RMSNorm on Q/K (when the module carries norm_q/norm_k), an
+    explicit ``q @ k^T * scale`` score matrix, an explicit softmax, explicit
+    output projection.
 
     Args:
         attn: a diffusers Attention module (self-attention config).
@@ -185,6 +232,14 @@ def reference_self_attention(
     query = query.view(batch, seq_len, heads, head_dim).transpose(1, 2)
     key = key.view(batch, seq_len, heads, head_dim).transpose(1, 2)
     value = value.view(batch, seq_len, heads, head_dim).transpose(1, 2)
+
+    norm_q = getattr(attn, "norm_q", None)
+    norm_k = getattr(attn, "norm_k", None)
+    if norm_q is not None:
+        eps_q = float(getattr(norm_q, "eps", QK_NORM_EPS) or QK_NORM_EPS)
+        eps_k = float(getattr(norm_k, "eps", QK_NORM_EPS) or QK_NORM_EPS)
+        query = _reference_rms_norm(query, cast(norm_q.weight), eps_q)
+        key = _reference_rms_norm(key, cast(norm_k.weight), eps_k)
 
     scores = (query @ key.transpose(-2, -1)) * attn.scale
     probs = scores.softmax(dim=-1)

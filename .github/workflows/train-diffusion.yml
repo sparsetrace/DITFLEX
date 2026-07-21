@@ -3,7 +3,19 @@ name: train-diffusion
 # The DMAP-DiT chain: EQ-sector attention (W_K tied to W_Q, R == 0),
 # same recipe and objective as the baseline chain, its OWN checkpoint
 # repo. Manual dispatch only, detached -- monitor in the Modal dashboard
-# (app: ditflex-train-dmap).
+# (app: ditflex-train).
+#
+# This chain now runs through the SAME supervisor as the baseline
+# (run/modal_train.py): transactional retries with LR backoff, stable
+# resume selection, adaptive LR controller, promotion markers, probe
+# diagnostics.  The only chain-defining pins are --qk-mode dmap and the
+# dedicated checkpoint repo; the config-drift guard keeps the two chains
+# from ever cross-resuming.
+#
+# Precision default is tf32 (deliberate mid-chain switch, recorded in
+# run_history.effective).  wd_ada defaults to 0: the DMAP chain has not
+# shown the baseline's adaLN growth; enable it only if the probe shows
+# the same climb.
 
 on:
   workflow_dispatch:
@@ -17,7 +29,7 @@ on:
         required: false
         default: "B300"
       train_seconds:
-        description: "Stepping budget in seconds (14400 = 4 h)"
+        description: "Stepping budget in seconds; Modal timeout adds retry allowance"
         required: false
         default: "14400"
       objective:
@@ -28,34 +40,93 @@ on:
         description: "Checkpoint repo for the DMAP chain (never share with the baseline)"
         required: false
         default: "sparsetrace/ditflex-L2-flow-dmap"
-      lr:
-        description: "LR override for this run (0 = keep recipe 1e-4; gain-compensation: 0.00005)"
+      target_steps:
+        description: "Global stop and cosine horizon"
+        required: false
+        default: "400000"
+      max_steps:
+        description: "Maximum data steps this invocation (0 = time-box only)"
         required: false
         default: "0"
-      wd:
-        description: "Weight-decay override for this run (-1 = keep recipe 0)"
-        required: false
-        default: "-1"
-      clip:
-        description: "Gradient-clip max-norm (46K cliff protocol: 0.25)"
-        required: false
-        default: "1.0"
-      spike_skip:
-        description: "Skip steps with grad norm > this x EMA (0 = off)"
-        required: false
-        default: "4.0"
-      grad_ceiling:
-        description: "Absolute grad-norm skip ceiling (0 = off)"
-        required: false
-        default: "25.0"
       dmap_alpha:
         description: "Coifman-Lafon exponent (0 | 0.5 | 1)"
         required: false
         default: "0.0"
 
+      # Numerics, stabilization, and diagnostics.
+      precision:
+        description: "Training numerics (tf32 | bf16)"
+        required: false
+        default: "tf32"
+      wd_ada:
+        description: "Decoupled adaLN-only weight decay (0 = off, recipe-clean)"
+        required: false
+        default: "0"
+      probe:
+        description: "Enable ditflex.probe diagnostics (rank 0)"
+        required: false
+        default: "true"
+
+      lr_policy:
+        description: "constant | cosine | adaptive (cosine plus loss/spike backoff)"
+        required: false
+        default: "adaptive"
+      lr:
+        description: "Base LR override (0 = recipe 1e-4; gain-compensation: 0.00005)"
+        required: false
+        default: "0"
+      lr_min:
+        description: "Cosine envelope floor at target_steps"
+        required: false
+        default: "0.00001"
+      lr_hard_min:
+        description: "Absolute floor after adaptive backoffs"
+        required: false
+        default: "0.000001"
+      lr_backoff:
+        description: "Adaptive multiplier after sustained instability"
+        required: false
+        default: "0.5"
+      lr_min_scale:
+        description: "Minimum adaptive multiplier"
+        required: false
+        default: "0.125"
+      reset_lr_controller:
+        description: "Discard persisted controller state after intentional policy changes"
+        required: false
+        type: boolean
+        default: false
+
+      wd:
+        description: "Weight decay override (-1 = keep checkpoint/config)"
+        required: false
+        default: "-1"
+      clip:
+        description: "Global gradient-clip max norm"
+        required: false
+        default: "1.0"
+      spike_skip:
+        description: "Skip update above this multiple of the frozen gradient reference (0 = off)"
+        required: false
+        default: "4.0"
+      grad_ceiling:
+        description: "Absolute raw gradient-norm skip ceiling (0 = off; 25.0 was this chain's historical setting)"
+        required: false
+        default: "25.0"
+
+      extra_args:
+        description: >-
+          Extra modal-run flags, passed through verbatim (e.g.
+          "--probe-batch 16 --resume-step 100000 --no-auto-legacy-rollback").
+        required: false
+        default: ""
+
 jobs:
   launch:
-    name: "dmap · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }}"
+    name: >-
+      dmap · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }} ·
+      ${{ inputs.lr_policy }} to ${{ inputs.target_steps }} · ${{ inputs.precision }}
+
     runs-on: ubuntu-latest
 
     steps:
@@ -79,13 +150,27 @@ jobs:
           MODAL_GPUS: ${{ inputs.gpus }}
           MODAL_TRAIN_SECONDS: ${{ inputs.train_seconds }}
         run: |
-          modal run --detach train_diffusion/modal_train_dmap.py \
+          echo "modal token id present: ${MODAL_TOKEN_ID:+yes}"
+          modal run --detach run/modal_train.py \
             --train-seconds "${{ inputs.train_seconds }}" \
             --objective "${{ inputs.objective }}" \
             --hub-repo "${{ inputs.hub_repo }}" \
+            --target-steps "${{ inputs.target_steps }}" \
+            --max-steps "${{ inputs.max_steps }}" \
+            --qk-mode dmap \
             --dmap-alpha "${{ inputs.dmap_alpha }}" \
+            --precision "${{ inputs.precision }}" \
+            --wd-ada "${{ inputs.wd_ada }}" \
+            ${{ inputs.probe == 'true' && '--probe-attn-logits' || '' }} \
+            --lr-policy "${{ inputs.lr_policy }}" \
+            --lr "${{ inputs.lr }}" \
+            --lr-min "${{ inputs.lr_min }}" \
+            --lr-hard-min "${{ inputs.lr_hard_min }}" \
+            --lr-backoff "${{ inputs.lr_backoff }}" \
+            --lr-min-scale "${{ inputs.lr_min_scale }}" \
+            --wd "${{ inputs.wd }}" \
             --clip "${{ inputs.clip }}" \
             --spike-skip "${{ inputs.spike_skip }}" \
             --grad-ceiling "${{ inputs.grad_ceiling }}" \
-            --lr "${{ inputs.lr }}" \
-            --wd "${{ inputs.wd }}"
+            ${{ inputs.reset_lr_controller && '--reset-lr-controller' || '' }} \
+            ${{ inputs.extra_args }}

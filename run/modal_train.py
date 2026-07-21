@@ -119,6 +119,9 @@ def train(
     skip_warn_rate: float = 0.30,
     skip_retry_rate: float = 0.40,
     skip_emergency_rate: float = 0.60,
+    precision: str = "tf32",
+    probe_attn_logits: bool = False,
+    probe_batch: int = 8,
 ) -> int:
     import subprocess
     import sys
@@ -133,6 +136,9 @@ def train(
         return 2
     if train_seconds <= 0:
         print("[modal] train_seconds must be positive")
+        return 2
+    if precision not in {"tf32", "bf16"}:
+        print(f"[modal] unknown precision: {precision!r}")
         return 2
     if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
         print(
@@ -257,7 +263,11 @@ def train(
             f"--skip-warn-rate={skip_warn_rate}",
             f"--skip-retry-rate={skip_retry_rate}",
             f"--skip-emergency-rate={skip_emergency_rate}",
+            f"--precision={precision}",
         ]
+        if probe_attn_logits:
+            command.append("--probe-attn-logits")
+            command.append(f"--probe-batch={probe_batch}")
         if hub_repo:
             command.append(f"--hub-repo={hub_repo}")
         if selected_revision:
@@ -276,7 +286,7 @@ def train(
         print(
             f"\n[modal] attempt {attempt}/{max_retries}: "
             f"lr_factor={attempt_factor:g} seed_offset={attempt_seed_offset} "
-            f"budget={child_budget}s anchor="
+            f"budget={child_budget}s precision={precision} anchor="
             f"{selected_revision[:12] if selected_revision else 'latest'}\n"
             f"[modal] running: {' '.join(command)}\n"
         )
@@ -366,11 +376,16 @@ def main(
     skip_warn_rate: float = 0.30,
     skip_retry_rate: float = 0.40,
     skip_emergency_rate: float = 0.60,
+    precision: str = "tf32",
+    probe_attn_logits: bool = False,
+    probe_batch: int = 8,
 ):
     if objective not in {"ddpm", "flow"}:
         raise SystemExit(f"unknown objective: {objective!r}")
     if lr_policy not in {"constant", "cosine", "adaptive"}:
         raise SystemExit(f"unknown lr_policy: {lr_policy!r}")
+    if precision not in {"tf32", "bf16"}:
+        raise SystemExit(f"unknown precision: {precision!r}")
     if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
         raise SystemExit(
             "skip thresholds must satisfy "
@@ -415,6 +430,9 @@ def main(
         skip_warn_rate=skip_warn_rate,
         skip_retry_rate=skip_retry_rate,
         skip_emergency_rate=skip_emergency_rate,
+        precision=precision,
+        probe_attn_logits=probe_attn_logits,
+        probe_batch=probe_batch,
     )
     if return_code != 0:
         raise SystemExit(return_code)

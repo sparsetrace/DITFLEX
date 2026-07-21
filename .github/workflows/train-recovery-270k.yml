@@ -49,10 +49,6 @@ on:
         description: "Enable ditflex.probe diagnostics (grad families + attn logits, rank 0)"
         required: false
         default: "true"
-      probe_batch:
-        description: "Probe forward batch size"
-        required: false
-        default: "8"
 
       # Keep the checkpoint's current LR/controller by default.
       lr:
@@ -96,10 +92,6 @@ on:
         description: "Absolute pre-clip gradient skip ceiling (0 = disabled)"
         required: false
         default: "500.0"
-      grad_reference:
-        description: "Optional frozen gradient reference override (0 = checkpoint reference)"
-        required: false
-        default: "0"
 
       # A high skip rate alone should warn before it rejects a flat-loss run.
       skip_warn_rate:
@@ -115,10 +107,6 @@ on:
         required: false
         default: "0.60"
 
-      seed_offset:
-        description: "Base deterministic stochastic-stream offset"
-        required: false
-        default: "0"
 
 jobs:
   launch:
@@ -164,7 +152,6 @@ jobs:
             --max-retries "${{ inputs.max_retries }}" \
             --precision "${{ inputs.precision }}" \
             ${{ inputs.probe == 'true' && '--probe-attn-logits' || '' }} \
-            --probe-batch "${{ inputs.probe_batch }}" \
             --lr "${{ inputs.lr }}" \
             --lr-policy "${{ inputs.lr_policy }}" \
             --lr-backoff "${{ inputs.lr_backoff }}" \
@@ -174,8 +161,7 @@ jobs:
             --clip "${{ inputs.clip }}" \
             --spike-skip "${{ inputs.spike_skip }}" \
             --grad-ceiling "${{ inputs.grad_ceiling }}" \
-            --grad-reference "${{ inputs.grad_reference }}" \
             --skip-warn-rate "${{ inputs.skip_warn_rate }}" \
             --skip-retry-rate "${{ inputs.skip_retry_rate }}" \
             --skip-emergency-rate "${{ inputs.skip_emergency_rate }}" \
-            --seed-offset "${{ inputs.seed_offset }}"
+            ${{ inputs.extra_args }}

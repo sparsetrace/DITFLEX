@@ -112,6 +112,7 @@ def train(
     reset_lr_controller: bool = False,
     grad_reference: float = 0.0,
     wd: float = -1.0,
+    wd_ada: float = 0.0,
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
@@ -139,6 +140,9 @@ def train(
         return 2
     if precision not in {"tf32", "bf16"}:
         print(f"[modal] unknown precision: {precision!r}")
+        return 2
+    if wd_ada < 0.0:
+        print("[modal] wd_ada must be non-negative")
         return 2
     if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
         print(
@@ -280,6 +284,8 @@ def train(
             command.append(f"--grad-reference={grad_reference}")
         if wd >= 0.0:
             command.append(f"--wd={wd}")
+        if wd_ada > 0.0:
+            command.append(f"--wd-ada={wd_ada}")
         if reset_lr_controller and attempt == 0:
             command.append("--reset-lr-controller")
 
@@ -369,6 +375,7 @@ def main(
     reset_lr_controller: bool = False,
     grad_reference: float = 0.0,
     wd: float = -1.0,
+    wd_ada: float = 0.0,
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
@@ -386,6 +393,8 @@ def main(
         raise SystemExit(f"unknown lr_policy: {lr_policy!r}")
     if precision not in {"tf32", "bf16"}:
         raise SystemExit(f"unknown precision: {precision!r}")
+    if wd_ada < 0.0:
+        raise SystemExit("wd_ada must be non-negative")
     if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
         raise SystemExit(
             "skip thresholds must satisfy "
@@ -423,6 +432,7 @@ def main(
         reset_lr_controller=reset_lr_controller,
         grad_reference=grad_reference,
         wd=wd,
+        wd_ada=wd_ada,
         clip=clip,
         spike_skip=spike_skip,
         seed_offset=seed_offset,

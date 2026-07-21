@@ -2,6 +2,16 @@ name: train
 
 # Manual dispatch only.  Each run is detached: GitHub exits after launch while
 # Modal pulls the latest healthy checkpoint, trains, saves, and pushes.
+#
+# Resume behavior: no pinned anchor.  The supervisor's stable-resume selection
+# runs; once latest is a v3 transactional checkpoint it is trusted as-is, so
+# this workflow simply picks up wherever the chain left off and continues
+# toward target_steps.  Use train-recovery-270k.yml when you need to pin an
+# exact historical step instead.
+#
+# GitHub caps workflow_dispatch at 25 inputs.  The deprecated v2 loss-ratio
+# inputs and seed_offset were removed to make room for precision / probe /
+# wd_ada; anything without a dedicated field goes through extra_args.
 
 on:
   workflow_dispatch:
@@ -15,7 +25,7 @@ on:
         required: false
         default: "B200"
       train_seconds:
-        description: "Stepping budget in seconds; Modal timeout adds one hour"
+        description: "Stepping budget in seconds; Modal timeout adds retry allowance"
         required: false
         default: "14400"
       objective:
@@ -34,6 +44,20 @@ on:
         description: "Maximum data steps this invocation (0 = time-box only)"
         required: false
         default: "0"
+
+      # Numerics, stabilization, and diagnostics.
+      precision:
+        description: "Training numerics (tf32 = published recipe | bf16 = legacy)"
+        required: false
+        default: "tf32"
+      wd_ada:
+        description: "Decoupled weight decay on the adaLN family only (0 = off)"
+        required: false
+        default: "0.01"
+      probe:
+        description: "Enable ditflex.probe diagnostics (grad families + attn logits, rank 0)"
+        required: false
+        default: "true"
 
       lr_policy:
         description: "constant | cosine | adaptive (cosine plus loss/spike backoff)"
@@ -59,14 +83,6 @@ on:
         description: "Minimum adaptive multiplier"
         required: false
         default: "0.125"
-      loss_rise_ratio:
-        description: "Fast-loss EMA / slow-loss EMA warning threshold"
-        required: false
-        default: "1.08"
-      loss_emergency_ratio:
-        description: "Fast-loss EMA / slow-loss EMA emergency threshold"
-        required: false
-        default: "1.35"
       reset_lr_controller:
         description: "Discard persisted controller state after intentional policy changes"
         required: false
@@ -82,23 +98,28 @@ on:
         required: false
         default: "1.0"
       spike_skip:
-        description: "Skip update above this multiple of gradient-norm EMA (0 = off)"
+        description: "Skip update above this multiple of the frozen gradient reference (0 = off)"
         required: false
         default: "4.0"
       grad_ceiling:
-        description: "Absolute raw gradient-norm skip ceiling (0 = off; recommended)"
+        description: "Absolute raw gradient-norm skip ceiling (0 = off)"
         required: false
         default: "0"
-      seed_offset:
-        description: "Runtime-only data-order seed offset"
+
+      extra_args:
+        description: >-
+          Extra modal-run flags, passed through verbatim (e.g.
+          "--probe-batch 16 --seed-offset 7 --resume-step 275000").
+          Anything without a dedicated field above goes here.
         required: false
-        default: "0"
+        default: ""
 
 jobs:
   launch:
     name: >-
       launch · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }} ·
-      ${{ inputs.lr_policy }} to ${{ inputs.target_steps }}
+      ${{ inputs.lr_policy }} to ${{ inputs.target_steps }} · ${{ inputs.precision }} ·
+      wd_ada=${{ inputs.wd_ada }}${{ inputs.probe == 'true' && ' · probe' || '' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -129,17 +150,18 @@ jobs:
             --hub-repo "${{ inputs.hub_repo }}" \
             --target-steps "${{ inputs.target_steps }}" \
             --max-steps "${{ inputs.max_steps }}" \
+            --precision "${{ inputs.precision }}" \
+            --wd-ada "${{ inputs.wd_ada }}" \
+            ${{ inputs.probe == 'true' && '--probe-attn-logits' || '' }} \
             --lr-policy "${{ inputs.lr_policy }}" \
             --lr "${{ inputs.lr }}" \
             --lr-min "${{ inputs.lr_min }}" \
             --lr-hard-min "${{ inputs.lr_hard_min }}" \
             --lr-backoff "${{ inputs.lr_backoff }}" \
             --lr-min-scale "${{ inputs.lr_min_scale }}" \
-            --loss-rise-ratio "${{ inputs.loss_rise_ratio }}" \
-            --loss-emergency-ratio "${{ inputs.loss_emergency_ratio }}" \
             --wd "${{ inputs.wd }}" \
             --clip "${{ inputs.clip }}" \
             --spike-skip "${{ inputs.spike_skip }}" \
             --grad-ceiling "${{ inputs.grad_ceiling }}" \
-            --seed-offset "${{ inputs.seed_offset }}" \
-            ${{ inputs.reset_lr_controller && '--reset-lr-controller' || '' }}
+            ${{ inputs.reset_lr_controller && '--reset-lr-controller' || '' }} \
+            ${{ inputs.extra_args }}

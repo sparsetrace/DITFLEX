@@ -53,7 +53,7 @@ on:
       wd_ada:
         description: "Decoupled weight decay on the adaLN family only (0 = off)"
         required: false
-        default: "0.01"
+        default: "0.05"
       probe:
         description: "Enable ditflex.probe diagnostics (grad families + attn logits, rank 0)"
         required: false

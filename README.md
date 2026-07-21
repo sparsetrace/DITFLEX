@@ -4,243 +4,221 @@ DiT-L/2 on ImageNet-256 latents, with self-attention routed through PyTorch
 FlexAttention so the attention score function is a swappable component.
 
 Baselines: **DiT** (Peebles & Xie, 2023) for the DDPM objective, **SiT**
-(Ma et al., 2024) for flow matching — SiT is the same architecture with the
-objective swapped, so both are directly comparable at the DiT-L/2 config.
+(Ma et al., 2024) for flow matching — same architecture, objective swapped,
+directly comparable at DiT-L/2.
 
-Training runs are **time-boxed and chained**: each job trains for a fixed wall
-clock, pushes a checkpoint to the HF Hub, and exits. The next job resumes from
-it. Long training is many short runs, not one long one.
+Two chains train in parallel, each with its own Hub checkpoint repo:
+
+| chain | attention | repo | status |
+|---|---|---|---|
+| **amap** (baseline) | directed QK, R learned freely | `sparsetrace/ditflex-L2-flow` | ~344K / 400K; qk-norm migration at 344K |
+| **dmap** (experiment) | W_K ≡ W_Q, symmetric scores, R ≡ 0 | `sparsetrace/ditflex-L2-flow-dmap` | ~117K / 400K; stable, no interventions |
+
+Training is **time-boxed, transactional, and chained**: each job pulls the
+last *committed healthy* checkpoint from the Hub, trains a candidate, and
+promotes it only after consecutive stability windows pass loss and
+gradient-distribution gates. A bad candidate exits with code 75 and is never
+uploaded; the Modal supervisor retries from committed latest with a lower LR
+factor and a fresh deterministic seed stream. Long training is many short
+runs, not one long one.
 
 ---
 
-## Status / TODO
+## Stability findings (the 240K–344K arc)
 
-Ordered. Do not skip ahead — each step makes the next one interpretable.
+This section records what actually happened, because the interventions in
+this repo exist as responses to it.
 
-### Phase 0 — correctness gates
-- [x] Encode ImageNet-256 → SD-VAE latents, upload to HF
-- [x] Verify latent reconstruction (decode → image looks right)
-- [ ] `scripts/verify_identity.py` — identity FlexAttention vs default Diffusers
-      processor, assert max abs diff < 1e-4 in bf16. **Blocks everything.**
-- [ ] `scripts/verify_latents.py` — load from Hub, assert shape `[N, 4096]`,
-      `std ≈ 1.0` (scaling factor already applied — see Data Notes), labels in
-      `[0, 999]`, N matches manifest
-- [ ] `scripts/overfit_smoke.py` — 128 samples, loss → ~0 in a few hundred steps
+**The failure.** From ~240K the amap chain developed a gradient-spike
+instability with a distinctive signature: *loss perfectly flat* (~0.77)
+while pre-clip gradient norms drifted up in slow motion — median 8 → 68 →
+102 → 250 → 1000+ across ~60K steps — punctuated by spike storms that
+tripped skip-guards and, at 273K, a transactional retry cascade.
 
-### Phase 1 — plumbing
-- [ ] `config.py` dataclasses, JSON round-trip test
-- [ ] `latents.py` — GPU-resident store, rank-offset deterministic sampling
-- [ ] `objective.py` — DDPM eps and flow matching behind one interface
-- [ ] `checkpoint.py` — save/load/resume, HF Hub push/pull
-- [ ] `train.py` — DDP, `torch.compile`, time-boxed loop
-- [ ] `modal_app.py` — the only Modal-aware file
+**The diagnosis** (via `src/ditflex/probe.py`, opt-in rank-0 diagnostics):
 
-### Phase 2 — CI and launch
-- [ ] `.github/workflows/test.yml` — CPU unit tests on push
-- [ ] `.github/workflows/smoke.yml` — manual, 2 GPU / 10 min, full path
-      (download → train → checkpoint → upload) end to end
-- [ ] `.github/workflows/run.yml` — manual, 8 GPU / 5 h, detached
+1. **adaLN modulation weights grow without bound** under the published
+   recipe (wd = 0). The `ada` family reached |w| ≈ 4900 of |w|_total ≈ 4930
+   — an order of magnitude heavier than every other family combined — and
+   carried **~99% of every gradient spike** (per-family attribution on each
+   skipped step names it every time).
+2. **Downstream, block-1's QK logits explode.** The probe measured them at
+   3.4e6 → 8.6e6 → 16.2e6 over 270K → 334K. A softmax at that magnitude is
+   an exactly one-hot, discontinuous switch: near-zero gradient almost
+   everywhere, enormous gradient at flip boundaries — which is precisely
+   the flat-loss-plus-spikes signature.
+3. The two compose: adaLN's scale modulations amplify the tokens feeding
+   attention; attention logits inherit the growth; spikes route back
+   through adaLN.
 
-### Phase 3 — first real run
-- [ ] 2×B300 smoke: 1000 steps, confirm loss decreasing and checkpoint round-trips
-- [ ] 8×B300 × 5 h, DDPM objective, batch 256 — matches published DiT-L/2 recipe
-- [ ] Chain runs to 400K steps
-- [ ] `eval.py` + cached ImageNet reference stats → FID vs published DiT-L/2
+**What helped, in order of leverage:**
 
-### Phase 4 — the actual experiment
-- [ ] Flow matching objective, same config → compare against SiT-L/2
-- [ ] The score_mod modification
-- [ ] Horizontal-flip latents (see Data Notes) if chasing published numbers
+* **QK-norm** (per-head `RMSNorm(head_dim, eps=1e-6)` on Q and K) — the
+  structural fix, adopted at the 344K migration. Bounds per-head logits by
+  construction; the saturated head's function survives (a logit gap of ~30
+  is already functionally one-hot) while the flip-boundary cliffs do not.
+* **tf32 precision** (fp32 activations, TF32 tensor-core matmuls — the
+  published DiT/SiT numerics) — `--precision tf32`, now the default.
+  Observed calmer gradient behavior than the previous bf16-autocast
+  configuration at the same LR, at ~2× activation memory and lower
+  throughput (~2.3 vs ~4 steps/s at batch 256). Not sufficient alone: the
+  logit growth continued under tf32, confirming the pathology is
+  architectural, not numerical.
+* **adaLN-only decoupled weight decay** (`--wd-ada`, default 0.01 on the
+  amap chain) — a targeted restoring force, `p *= 1 − lr·wd_ada` on the
+  adaLN family only, applied outside the optimizer so checkpoints stay
+  compatible. Measurably shrinks |w|_ada, but at safe doses it loses the
+  race against episode-timescale logit growth — background hygiene, not
+  the cure. Kept at 0.01 post-migration.
+* **Adaptive LR backoff** (the v4 stability controller) — kept the chain
+  alive and learning throughout (samples improved 270K → 344K), at the
+  cost of running at ~28% of the scheduled LR. The controller's
+  bounded-growth health reference also *normalized* the drift over many
+  promotions (reference 38.5 → 320); treat a slowly ratcheting reference
+  as a red flag, not adaptation.
+
+**What the dmap chain shows.** Under the identical recipe, the R ≡ 0 chain
+exhibits none of this: grad p90/median ≈ 1.1, zero skips, flat probe
+logits (effective logits are bounded above by construction:
+`−|q_i−q_j|² + const`). Its adaLN family is just as heavy — so adaLN
+growth alone is not sufficient; the directed-attention chain's use of it
+is part of the mechanism. This is itself a datapoint for the R-ratio
+experiment. The dmap chain is deliberately **not** given qk-norm: untied
+norms would break R ≡ 0, and a tied norm flattens the destination
+potential `g_j` that defines the DMAP kernel. Pre-committed trigger: if
+its probe shows logit growth or grad-median ratcheting in the 200–280K
+range, a DMAP-appropriate intervention gets designed then, as its own arm.
+
+**Comparability note for any writeup.** The chains are no longer
+recipe-identical: amap carries {tf32 from ~275K, wd_ada = 0.01, qk-norm
+from 344K}; dmap carries {tf32 from ~117K}. The honest framing is "each
+arm run under the minimal stabilization it required, deviations tabulated
+per arm"; per-run settings are recorded in every checkpoint's
+`run_history[*].effective`.
+
+---
+
+## Known deviations from the published DiT/SiT recipe
+
+* `out_channels = 4` (no learned-sigma channels; MSE-only objectives).
+* Latents are posterior **mode**, not sampled; no horizontal-flip pass;
+  torchvision Resize+CenterCrop rather than ADM `center_crop_arr`.
+* **qk-norm** on the amap chain from step 344K (see above). Pre-migration
+  checkpoints (≤ 344K, first revision) are the pure-recipe artifact.
+* **wd_ada = 0.01** on the amap chain (adaLN-only decoupled decay).
+* LR followed the adaptive controller, not constant 1e-4, from ~250K on
+  the amap chain (retry backoffs; exact trajectory in `run_history`).
+* dmap chain: W_K ≡ W_Q (~25M fewer params), DMAP logit modification —
+  these ARE the experiment, not incidental deviations.
 
 ---
 
 ## Repo structure
 
 ```
-dit-flex/
-├── README.md
-├── pyproject.toml
+DITFLEX/
 ├── .github/workflows/
-│   ├── test.yml                 # CPU unit tests, on push
-│   ├── smoke.yml                # manual: 2 GPU, ~10 min, full path
-│   └── run.yml                  # manual: 8 GPU, ~5 h, --detach
-├── modal_app.py                 # the ONLY Modal-aware file
+│   ├── tests.yml                # CPU+GPU gates on push (Modal CI)
+│   ├── quick-train.yml          # 2-GPU dress rehearsal of the full chain
+│   ├── train.yml                # amap chain: pulls latest, transactional
+│   ├── train-diffusion.yml      # dmap chain: same supervisor, qk-mode pinned
+│   ├── train-recovery-270k.yml  # pinned-step bounded recovery segments
+│   ├── recover-checkpoint.yml   # restore a healthy step as Hub latest
+│   └── sampling.yml             # fixed-seed grids from both chains
+├── run/
+│   ├── modal_train.py           # THE transactional supervisor (both chains)
+│   ├── migrate_qknorm.py        # one-shot 344K qk-norm migration CLI
+│   └── recover_checkpoint.py
 ├── src/ditflex/
-│   ├── config.py                # dataclasses -> JSON -> checkpoint
-│   ├── distributed.py           # rank/world/init, rank0-only helpers
-│   ├── attention.py             # IdentityFlexSelfAttnProcessor + score_mods
-│   ├── model.py                 # build DiT-L/2, swap processors
-│   ├── latents.py               # GPU-resident store; NO DataLoader
-│   ├── objective.py             # DDPM eps | flow matching
-│   ├── ema.py
-│   ├── train.py                 # loop, compile, DDP, time-box
-│   ├── checkpoint.py            # save/load/resume + HF Hub
-│   ├── sample.py                # DDIM / ODE sampling + CFG
-│   └── eval.py                  # FID vs cached reference stats
-├── scripts/
-│   ├── prepare_latents.py       # cleaned from imagenet-processing.ipynb
-│   ├── verify_identity.py
-│   ├── verify_latents.py
-│   └── overfit_smoke.py
-└── tests/
-    ├── test_attention_identity.py
-    ├── test_latents_shapes.py
-    └── test_config_roundtrip.py
+│   ├── attention.py             # Flex processor; qk-norm applied pre-kernel
+│   ├── model.py                 # baseline builder (+ install_qk_norms)
+│   ├── diffusion.py             # DMAP operators & score_mods (the paper)
+│   ├── diffusion_model.py       # dmap builder (refuses qk_norm)
+│   ├── migrate.py               # name-keyed checkpoint migration core
+│   ├── probe.py                 # opt-in diagnostics: grad families, logits
+│   ├── stability.py             # v4 controller: windows, references, retry
+│   ├── train.py                 # transactional loop; --precision, --wd-ada,
+│   │                            #   --qk-norm, --probe-attn-logits
+│   ├── checkpoint.py / ema.py / latents.py / objective.py / sample.py
+│   └── config.py / distributed.py
+└── tests/                       # incl. verify_identity (both attention
+                                 #   configs), test_migrate_qknorm, test_probe
 ```
-
-`torch.compile` lives in `train.py`, not `model.py` — tests and
-`verify_identity.py` need the uncompiled model.
 
 ---
 
-## Secrets
+## Operational runbook
 
-The important thing is **where** each lives. GitHub only launches; Modal does
-the work and needs the data credentials.
+**Routine links.** Dispatch `train` (amap) or `train-diffusion` (dmap) with
+defaults. Both route through `run/modal_train.py`: stable resume selection,
+bounded transactional retries, adaptive LR, promotion markers. amap
+defaults: tf32, wd_ada 0.01, probe on, qk_norm **false until the 344K
+migration is pushed, true after**. dmap defaults: tf32, wd_ada 0, probe on.
 
-### GitHub repository secrets
-Used by the workflow launcher only.
-
-| Secret | Purpose |
-|---|---|
-| `MODAL_TOKEN_ID` | authenticate `modal run` from CI |
-| `MODAL_TOKEN_SECRET` | same |
-
-`GITHUB_TOKEN` is injected automatically and does not need to be created.
-The repo being private does not require an extra token: `actions/checkout`
-uses the automatic token, and `modal run` uploads the checked-out source
-into the container, so Modal never clones from GitHub.
-
-### Modal secrets
-Created with `modal secret create <name> KEY=value`. Referenced by name in
-`modal_app.py`.
-
-| Modal secret | Keys | Purpose |
-|---|---|---|
-| `huggingface` | `HF_TOKEN` | pull latents dataset, push checkpoints — **needs write scope** |
-| `wandb` *(optional)* | `WANDB_API_KEY` | run logging |
-
-One token with write access is simplest. If you want least privilege, split
-into a read token for `sparsetrace/dlatentzz` and a write token scoped to the
-checkpoint repo, as `HF_TOKEN_READ` / `HF_TOKEN_WRITE`.
-
-### Local development
-`.env` (gitignored), or just export:
+**The 344K qk-norm migration** (one-time, amap only):
 
 ```bash
-export HF_TOKEN=hf_...
-modal token new          # writes ~/.modal.toml, no env var needed
+# full local rehearsal, uploads nothing:
+python run/migrate_qknorm.py --repo sparsetrace/ditflex-L2-flow --step 344000 --dry-run
+# then for real:
+python run/migrate_qknorm.py --repo sparsetrace/ditflex-L2-flow --step 344000 --push
 ```
 
-**Never** commit tokens. The source notebook had `HF_TOKEN` read from env —
-keep that pattern in `scripts/prepare_latents.py`.
+The migration remaps the index-keyed AdamW state **by parameter name**
+(inserting norm params shifts `named_parameters()` order — an
+index-preserving load would attach moments to the wrong tensors), extends
+the EMA shadow, embeds `qk_norm: true` in the config, resets the stability
+reference (the pre-norm reference was contaminated by the divergence), and
+pushes under an unmistakable commit message. Then:
+
+1. **Warmup** — `train-recovery-270k`: `resume_step=344000`,
+   `qk_norm=true`, `reset_lr_controller=true`, `lr=0.00001`,
+   `max_steps=5000`. Expect a loss bump at step one (ones-init RMSNorms
+   rescale Q/K), recovery within a few hundred steps, and the probe's
+   blk1 logit line reading double digits instead of 1.6e7.
+2. **Final stretch** — `train`: `qk_norm=true`, `reset_lr_controller=true`
+   (the warmup's base LR differs; the controller refuses silent LR
+   changes), `lr=0`, defaults otherwise → full cosine to 400K.
+
+**Reading the probe.** `[probe] attn logits` healthy range is ~5–30 per
+head; three-digit values are worth watching, sustained growth is the
+alarm. `[probe] ... (SPIKE)` lines print raw pre-clip per-family norms —
+the dominant family IS the spike's address. Turn the probe off
+(`probe=false`) for routine links once trends are boring.
+
+**Recovery.** Every promotion is a Hub commit; `recover-checkpoint.yml`
+(dry-run by default) restores any historical step as latest. The
+`stability window` log lines plus `run_history` in `state.json` are the
+forensic record.
 
 ---
 
 ## Data notes
 
-Latents: `sparsetrace/dlatentzz` — 32 safetensors files, ~10.5 GB total,
-1.28 M ImageNet train images.
+Latents: `sparsetrace/dlatentzz` — 32 safetensors shards, ~10.5 GB, 1.28M
+ImageNet-1k train images, `[N, 4096]` bf16, **scaling factor 0.18215
+already applied** (std ≈ 1.0 asserted on every load; ≈ 5.5 means unscaled,
+≈ 0.18 means double-scaled). Encoded with `posterior.mode()`, no flips.
+The full tensor lives on every GPU; batches are fancy-indexed with seeds
+that are pure functions of `(base_seed, step, rank)` — resume is exact and
+survives world-size changes. No DataLoader anywhere.
 
-Four properties of the encoding that the training code must respect:
-
-1. **Flat storage.** Shape is `[N, 4096]`, not `[N, 4, 32, 32]`.
-   `latents.py` must `.view(-1, 4, 32, 32)`.
-2. **Scaling factor already applied.** `z = z * 0.18215` happened at encode
-   time. **Do not apply it again.** Assert `std ≈ 1.0` on load — if you see
-   `≈ 5.5`, something is double-scaling.
-3. **Deterministic latents.** Encoded with `posterior.mode()`, not
-   `.sample()`. DiT samples the posterior each epoch; we froze the mean.
-   Deviation from the published recipe — acceptable, but state it in any writeup.
-4. **No horizontal flips.** DiT trains with random h-flip before the VAE.
-   Latents cannot be flipped directly (the conv VAE is not exactly
-   equivariant), so matching the reference recipe requires encoding a second
-   flipped pass (+10.5 GB, trivial at 96 GB/GPU).
-
-`dtype` is bf16 on disk, cast to fp32 or bf16 at load depending on the
-training precision.
-
----
-
-## Design decisions
-
-**No DataLoader, no DistributedSampler.** The full 10.5 GB tensor lives on
-each GPU. Each rank draws indices from a generator seeded by
-`(global_step, rank)` — stateless, so resume is exact and survives a change
-of world size.
-
-**DDP, not FSDP.** DiT-L is 458 M params; weights + EMA + AdamW states are
-~7.3 GB in fp32. Sharding buys nothing at this scale and costs complexity.
-
-**Fixed shapes everywhere.** Fixed batch, fixed 256-token sequence,
-`drop_last=True` → one `torch.compile`, no recompiles.
-
-**Compile inner, then DDP-wrap.** Test the other order once; this interaction
-has been version-sensitive.
-
-**Save uncompiled, unwrapped state dicts.** Strip `_orig_mod.` and `module.`
-prefixes before writing, or checkpoints will not load into a bare model for
-sampling.
-
----
-
-## Checkpointing
-
-Runs are time-boxed. The loop checks a deadline every 500 steps (rank 0
-decides, broadcast to all — avoids clock drift), stops cleanly, saves, uploads.
-
-Budget: ~7.3 GB per checkpoint, ~12 min up and ~12 min down at 100 MB/s.
-A 5 h job is ~4.5 h of training. `torch.compile` costs another 2–5 min on a
-cold container.
-
-Hub layout (`sparsetrace/dit-flex-L2`, model repo):
-
-```
-state.json              # step, wall-clock, config, git sha, run_history
-model.safetensors       # fp32 weights
-ema.safetensors         # fp32 EMA (0.9999)
-optim.safetensors       # AdamW m, v
-archive/step_0200000/   # periodic, EMA + state only, kept forever
-```
-
-Top level is always "latest" and is overwritten each run; HF repos are git,
-so prior revisions remain recoverable. `run_history` in `state.json` records
-each run's step range and duration — worth having when a loss discontinuity
-turns out to align with a run boundary.
-
----
-
-## Quickstart
-
-```bash
-# gates
-python scripts/verify_identity.py
-python scripts/verify_latents.py
-python scripts/overfit_smoke.py
-
-# short run on Modal
-modal run modal_app.py::train --gpus 2 --train-seconds 600 --objective ddpm
-
-# real run, detached (survives the CI job exiting)
-modal run --detach modal_app.py::train \
-    --gpus 8 --train-seconds 18000 --objective flow
-```
-
----
-
-## Recipe
-
-Held at the published DiT-L/2 settings so the baseline is comparable:
+## Recipe (amap chain, as originally launched)
 
 | | |
 |---|---|
-| model | DiT-L/2, 458 M params, patch 2, 24 layers, width 1024, 16 heads |
+| model | DiT-L/2, 458M params, patch 2, 24 layers, width 1024, 16 heads |
 | latents | 32×32×4 → 256 tokens |
 | batch | 256 global |
-| optimizer | AdamW, lr 1e-4 constant, no warmup, no weight decay |
+| optimizer | AdamW, lr 1e-4, no warmup, wd 0 |
 | EMA | 0.9999 |
-| precision | bf16 autocast, fp32 master weights |
-| label dropout | 10% (for classifier-free guidance) |
+| precision | bf16 autocast originally; **tf32 from ~275K** |
+| label dropout | 10% (CFG) |
+| stabilization | see "Stability findings" — wd_ada 0.01, qk-norm from 344K |
 
-Do not scale the batch on the first run — if batch and objective change
-together, the comparison to published numbers means nothing.
+## Secrets
+
+GitHub repo secrets: `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` (launch only).
+Modal secret `huggingface` → `HF_TOKEN` with write scope (latents pull,
+checkpoint push). `modal run` uploads the checkout, so Modal never clones
+from GitHub. Never commit tokens.

@@ -40,6 +40,20 @@ on:
         required: false
         default: "5000"
 
+      # Numerics and diagnostics.
+      precision:
+        description: "Training numerics (tf32 = published recipe | bf16 = previous default)"
+        required: false
+        default: "tf32"
+      probe:
+        description: "Enable ditflex.probe diagnostics (grad families + attn logits, rank 0)"
+        required: false
+        default: "true"
+      probe_batch:
+        description: "Probe forward batch size"
+        required: false
+        default: "8"
+
       # Keep the checkpoint's current LR/controller by default.
       lr:
         description: "LR override (0 = restore checkpoint LR)"
@@ -106,7 +120,8 @@ jobs:
   launch:
     name: >-
       recovery · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} ·
-      step=${{ inputs.resume_step }} · max=${{ inputs.max_steps }}
+      step=${{ inputs.resume_step }} · max=${{ inputs.max_steps }} ·
+      ${{ inputs.precision }}${{ inputs.probe == 'true' && ' · probe' || '' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -143,6 +158,9 @@ jobs:
             --target-steps "${{ inputs.target_steps }}" \
             --max-steps "${{ inputs.max_steps }}" \
             --max-retries "${{ inputs.max_retries }}" \
+            --precision "${{ inputs.precision }}" \
+            ${{ inputs.probe == 'true' && '--probe-attn-logits' || '' }} \
+            --probe-batch "${{ inputs.probe_batch }}" \
             --lr "${{ inputs.lr }}" \
             --lr-policy "${{ inputs.lr_policy }}" \
             --lr-backoff "${{ inputs.lr_backoff }}" \

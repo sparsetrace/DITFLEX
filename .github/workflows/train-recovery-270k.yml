@@ -80,6 +80,10 @@ on:
         description: "Weight decay override (-1 = restore recipe/checkpoint value)"
         required: false
         default: "-1"
+      wd_ada:
+        description: "Decoupled weight decay on the adaLN family only (0 = off)"
+        required: false
+        default: "0.01"
       clip:
         description: "Global gradient clipping max norm"
         required: false
@@ -166,6 +170,7 @@ jobs:
             --lr-backoff "${{ inputs.lr_backoff }}" \
             --lr-min-scale "${{ inputs.lr_min_scale }}" \
             --wd "${{ inputs.wd }}" \
+            --wd-ada "${{ inputs.wd_ada }}" \
             --clip "${{ inputs.clip }}" \
             --spike-skip "${{ inputs.spike_skip }}" \
             --grad-ceiling "${{ inputs.grad_ceiling }}" \

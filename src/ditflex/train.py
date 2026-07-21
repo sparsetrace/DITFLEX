@@ -20,6 +20,19 @@ and checkpoints are fp32 in both modes; the choice is recorded in each
 run_history entry, not in the config, so the config-drift guard never
 refuses a resume across a precision change.
 
+ADALN WEIGHT DECAY: ``--wd-ada`` applies decoupled (AdamW-style) weight
+decay to the adaLN modulation family only (norm1 / norm_out / *adaln*),
+implemented as a manual per-step shrink immediately before
+``optimizer.step``.  Diagnosis behind it: the adaLN weights grow unbounded
+under the published wd=0 recipe (|w|_ada ~4.9k of |w|_total ~4.9k at 274K
+steps), their scale modulations amplify the tokens feeding attention, and
+block-1 QK logits explode (3.4e6 observed) -- the gradient-spike source.
+Implemented OUTSIDE the optimizer on purpose: the single AdamW param group
+is untouched, so index-keyed optimizer checkpoints load unchanged in both
+directions and 0.0 (default) is byte-for-byte the previous behavior.
+Skipped (spiked) steps do not decay -- decay accompanies real updates only,
+so effective decay per accepted step is exactly lr*wd_ada.
+
 DIAGNOSTICS (opt-in, off by default): ``--probe-attn-logits`` enables
 ``ditflex.probe`` -- per-family gradient norms at LOG_EVERY cadence and on
 every skipped (spike) step, plus an explicit fp32 max-attention-logit probe at
@@ -140,6 +153,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(auto_infer_grad_reference=True)
     parser.add_argument("--wd", type=float, default=-1.0)
+    parser.add_argument(
+        "--wd-ada",
+        type=float,
+        default=0.0,
+        help=(
+            "decoupled weight decay applied ONLY to the adaLN modulation "
+            "family (norm1/norm_out/adaln), as a manual shrink before "
+            "optimizer.step. 0 = off (previous behavior). The optimizer's "
+            "param group is untouched, so checkpoints remain compatible."
+        ),
+    )
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--spike-skip", type=float, default=4.0)
     parser.add_argument("--grad-ceiling", type=float, default=0.0)
@@ -224,6 +248,8 @@ def main() -> int:
         raise ValueError("--attempt-lr-factor must lie in (0, 1]")
     if args.probe_batch <= 0:
         raise ValueError("--probe-batch must be positive")
+    if args.wd_ada < 0.0:
+        raise ValueError("--wd-ada must be non-negative")
 
     ctx = setup()
 
@@ -423,6 +449,38 @@ def main() -> int:
         if ctx.is_rank0:
             print(f"[train] WD OVERRIDE for this run: {args.wd:g}")
 
+    # adaLN-only decoupled decay: same family classification as the logging
+    # blocks and ditflex.probe.  Collected once from the RAW model; DDP and
+    # torch.compile wrappers share these Parameter objects, so shrinking them
+    # here shrinks the training weights.  Deduplicated by identity for the
+    # dmap chain's tied modules (adaLN is never tied today, but cheap safety).
+    ada_params: list[torch.nn.Parameter] = []
+    if args.wd_ada > 0.0:
+        seen_ids: set[int] = set()
+        for _name, _param in model.named_parameters():
+            if (
+                ("norm1" in _name or "norm_out" in _name or "adaln" in _name.lower())
+                and id(_param) not in seen_ids
+            ):
+                seen_ids.add(id(_param))
+                ada_params.append(_param)
+        if not ada_params:
+            raise RuntimeError(
+                "--wd-ada > 0 but no adaLN parameters matched norm1/norm_out/"
+                "adaln -- the architecture naming has drifted; refusing to "
+                "silently no-op."
+            )
+        if ctx.is_rank0:
+            ada_sq = sum(
+                p.detach().float().pow(2).sum().item() for p in ada_params
+            )
+            print(
+                f"[train] ADA WEIGHT DECAY enabled: wd_ada={args.wd_ada:g} on "
+                f"{len(ada_params)} tensors, |w|_ada={ada_sq**0.5:.1f} at start; "
+                f"decay is decoupled (p *= 1 - lr*wd_ada) and applied only on "
+                f"accepted (non-skipped) steps"
+            )
+
     start_lr = controller.apply(optimizer, start_step)
     if ctx.is_rank0:
         reference = None if controller.reference is None else controller.reference.state_dict()
@@ -553,6 +611,7 @@ def main() -> int:
                     "lr_hard_min": stability_spec.hard_min_lr,
                     "lr_scale": controller.scale,
                     "weight_decay": optimizer.param_groups[0]["weight_decay"],
+                    "wd_ada": args.wd_ada,
                     "clip": args.clip,
                     "spike_skip": args.spike_skip,
                     "grad_ceiling": args.grad_ceiling,
@@ -699,6 +758,18 @@ def main() -> int:
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+
+        # PROBE (pre-clip): capture RAW per-family gradient norms before
+        # clip_grad_norm_ rescales grads in place.  Cheap (one reduction over
+        # params, rank 0 only) and only when the flag is on; printed later
+        # once the spike decision is known so the line can carry the tag.
+        raw_families: dict[str, float] | None = None
+        if args.probe_attn_logits and ctx.is_rank0:
+            try:
+                raw_families = grad_family_norms(model)
+            except Exception as exc:  # noqa: BLE001 - diagnostics never kill training
+                print(f"[probe] grad-family probe failed (non-fatal): {exc!r}")
+
         grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
             max_norm=args.clip,
@@ -732,24 +803,16 @@ def main() -> int:
         spike_decision = (relative_spike or absolute_spike) if ctx.is_rank0 else False
         spiked = broadcast_flag(ctx, spike_decision)
 
-        # PROBE: per-family gradient norms.  Gradients are still present here
-        # for BOTH branches below (the skip branch zeroes them a few lines
-        # down), so this sees exactly the gradient the spike guard judged.
-        # Rank 0 only, read-only, no collectives.  The spike-step prints are
-        # the money data: they name the family responsible for each rejected
-        # gradient rather than only the steady-state tail.
-        if args.probe_attn_logits and ctx.is_rank0 and (
-            spiked or step % LOG_EVERY == 0
-        ):
-            try:
-                families = grad_family_norms(model)
-                tag = "SPIKE" if spiked else "cadence"
-                print(
-                    f"[probe] step {step:,} ({tag})  |g|={grad_norm:9.2f}  "
-                    f"{format_families(families)}"
-                )
-            except Exception as exc:  # noqa: BLE001 - diagnostics never kill training
-                print(f"[probe] grad-family probe failed (non-fatal): {exc!r}")
+        # PROBE: print the RAW (pre-clip) per-family norms captured above,
+        # now that the spike decision is known.  These compose to the raw
+        # |g| (sum of squares), so on a spike line the dominant family's
+        # value IS the spike magnitude, not a clipped fraction of 1.0.
+        if raw_families is not None and (spiked or step % LOG_EVERY == 0):
+            tag = "SPIKE" if spiked else "cadence"
+            print(
+                f"[probe] step {step:,} ({tag})  |g|raw={grad_norm:9.2f}  "
+                f"{format_families(raw_families)}"
+            )
 
         if spiked:
             optimizer.zero_grad(set_to_none=True)
@@ -773,6 +836,12 @@ def main() -> int:
                     f"(total skipped: {spikes_total})"
                 )
         else:
+            if ada_params:
+                # Decoupled decay at the CURRENT scheduled LR, so the decay
+                # strength tracks the controller exactly like the update does.
+                decay = 1.0 - float(optimizer.param_groups[0]["lr"]) * args.wd_ada
+                with torch.no_grad():
+                    torch._foreach_mul_(ada_params, decay)
             optimizer.step()
             ema.update(model)
 

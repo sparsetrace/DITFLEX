@@ -11,6 +11,20 @@ This is intentionally not a broad ``try/except`` recovery loop.  The observed
 failure stayed finite while the pre-clip gradient median moved by orders of
 magnitude, so recovery must be driven by explicit health metrics rather than by
 exceptions alone.
+
+PRECISION: ``--precision`` selects the training numerics.  ``tf32``
+(default) runs the published DiT/SiT recipe -- fp32 activations with TF32
+tensor-core matmuls, no autocast.  ``bf16`` restores the previous behavior
+(bf16 autocast over fp32 master weights).  Latents, EMA, optimizer state,
+and checkpoints are fp32 in both modes; the choice is recorded in each
+run_history entry, not in the config, so the config-drift guard never
+refuses a resume across a precision change.
+
+DIAGNOSTICS (opt-in, off by default): ``--probe-attn-logits`` enables
+``ditflex.probe`` -- per-family gradient norms at LOG_EVERY cadence and on
+every skipped (spike) step, plus an explicit fp32 max-attention-logit probe at
+every stability window.  Rank 0 only, no collectives, read-only.  With the
+flag off this file's behavior is identical to before the probe existed.
 """
 
 from __future__ import annotations
@@ -18,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from contextlib import nullcontext
 import os
 import shutil
 import statistics
@@ -52,6 +67,7 @@ from ditflex.ema import EMA
 from ditflex.latents import LatentStore
 from ditflex.model import build_model
 from ditflex.objective import build_objective, make_step_generator
+from ditflex.probe import attention_logit_probe, format_families, grad_family_norms
 from ditflex.stability import AdaptiveLrController, StabilitySpec, WindowMetrics
 
 CKPT_DIR = "/tmp/ditflex_ckpt"  # committed checkpoint pulled from Hub
@@ -129,6 +145,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-ceiling", type=float, default=0.0)
     parser.add_argument("--seed-offset", type=int, default=0)
 
+    parser.add_argument(
+        "--precision",
+        choices=["tf32", "bf16"],
+        default="tf32",
+        help=(
+            "tf32: fp32 activations + TF32 matmuls (published DiT/SiT recipe, "
+            "~2x activation memory, lower throughput). bf16: bf16 autocast "
+            "over fp32 master weights (previous default)."
+        ),
+    )
+
+    # Opt-in diagnostics (ditflex.probe).  Off by default: with the flag off,
+    # nothing in this file calls into the probe module and the production
+    # chain's behavior is unchanged.
+    parser.add_argument(
+        "--probe-attn-logits",
+        action="store_true",
+        help=(
+            "rank-0 diagnostics: per-family grad norms at LOG_EVERY cadence "
+            "and on every skipped spike step; explicit fp32 max-attention-"
+            "logit probe at every stability window"
+        ),
+    )
+    parser.add_argument(
+        "--probe-batch",
+        type=int,
+        default=8,
+        help="probe forward batch size (slice of the current training batch)",
+    )
+
     parser.add_argument("--qk-mode", choices=["amap", "dmap"], default="amap")
     parser.add_argument("--dmap-alpha", type=float, default=0.0)
     parser.add_argument("--sample-count", type=int, default=16)
@@ -176,8 +222,19 @@ def main() -> int:
         raise ValueError("use only one of --resume-step or --resume-revision")
     if not (0.0 < args.attempt_lr_factor <= 1.0):
         raise ValueError("--attempt-lr-factor must lie in (0, 1]")
+    if args.probe_batch <= 0:
+        raise ValueError("--probe-batch must be positive")
 
     ctx = setup()
+
+    # Precision backends.  TF32 mode follows the published DiT/SiT recipe:
+    # fp32 activations, tensor-core TF32 matmuls.  In bf16 mode TF32 flags
+    # are irrelevant (autocast matmuls run in bf16) but harmless.
+    if args.precision == "tf32":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+
     cfg = Config()
     cfg.train.objective = args.objective
     cfg.model.qk_mode = args.qk_mode
@@ -191,7 +248,21 @@ def main() -> int:
 
     if ctx.is_rank0:
         print(f"[train] world={ctx.world}  per_rank_batch={per_rank_batch}")
+        print(
+            f"[train] precision={args.precision}"
+            + (
+                " (fp32 activations, TF32 matmuls -- published recipe)"
+                if args.precision == "tf32"
+                else " (bf16 autocast, fp32 master weights)"
+            )
+        )
         print(cfg.to_json())
+        if args.probe_attn_logits:
+            print(
+                f"[train] PROBE ENABLED: grad families @ every {LOG_EVERY} steps "
+                f"and on spikes; attn logits @ every {LOSS_WINDOW}-step window "
+                f"(probe_batch={args.probe_batch}, rank 0 only)"
+            )
         Path(RETRY_MARKER).unlink(missing_ok=True)
         shutil.rmtree(CANDIDATE_DIR, ignore_errors=True)
 
@@ -473,6 +544,7 @@ def main() -> int:
                 "promotion_reason": reason,
                 "effective": {
                     "attempt": args.attempt,
+                    "precision": args.precision,
                     "lr_policy": stability_spec.policy,
                     "lr_base": stability_spec.base_lr,
                     "lr_start": start_lr if segment_start == start_step else None,
@@ -603,7 +675,12 @@ def main() -> int:
             rank=ctx.rank,
             seed_offset=args.seed_offset,
         )
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        autocast_ctx = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if args.precision == "bf16"
+            else nullcontext()
+        )
+        with autocast_ctx:
             loss = objective.loss(
                 wrapped,
                 x0,
@@ -654,6 +731,25 @@ def main() -> int:
         absolute_spike = args.grad_ceiling > 0.0 and grad_norm > args.grad_ceiling
         spike_decision = (relative_spike or absolute_spike) if ctx.is_rank0 else False
         spiked = broadcast_flag(ctx, spike_decision)
+
+        # PROBE: per-family gradient norms.  Gradients are still present here
+        # for BOTH branches below (the skip branch zeroes them a few lines
+        # down), so this sees exactly the gradient the spike guard judged.
+        # Rank 0 only, read-only, no collectives.  The spike-step prints are
+        # the money data: they name the family responsible for each rejected
+        # gradient rather than only the steady-state tail.
+        if args.probe_attn_logits and ctx.is_rank0 and (
+            spiked or step % LOG_EVERY == 0
+        ):
+            try:
+                families = grad_family_norms(model)
+                tag = "SPIKE" if spiked else "cadence"
+                print(
+                    f"[probe] step {step:,} ({tag})  |g|={grad_norm:9.2f}  "
+                    f"{format_families(families)}"
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics never kill training
+                print(f"[probe] grad-family probe failed (non-fatal): {exc!r}")
 
         if spiked:
             optimizer.zero_grad(set_to_none=True)
@@ -714,6 +810,32 @@ def main() -> int:
                     f"ratios(loss={event.loss_ratio:.3f}, grad={event.grad_ratio:.2f}, "
                     f"p90={event.grad_p90_ratio:.2f})  {event.reason}"
                 )
+
+            # PROBE: explicit fp32 max attention logits, once per window, on a
+            # small slice of the batch this step just trained on.  Runs on the
+            # RAW module in eager mode (the compiled/DDP wrapper is untouched);
+            # a probe failure is logged and never affects the training loop or
+            # the retry decision below.
+            if args.probe_attn_logits and ctx.is_rank0:
+                try:
+                    n_probe = min(args.probe_batch, x0.shape[0])
+                    stats = attention_logit_probe(
+                        model,
+                        x0[:n_probe],
+                        labels[:n_probe],
+                        autocast_dtype=(
+                            torch.bfloat16
+                            if args.precision == "bf16"
+                            else torch.float32
+                        ),
+                    )
+                    print(
+                        f"[probe] attn logits @ {step:,}: max={stats['max']:.2f} "
+                        f"at {stats['argmax']}  top={stats['top']}"
+                    )
+                except Exception as exc:  # noqa: BLE001 - diagnostics never kill training
+                    print(f"[probe] attn-logit probe failed (non-fatal): {exc!r}")
+
             retry_decision = broadcast_flag(
                 ctx,
                 event.should_retry if ctx.is_rank0 else False,

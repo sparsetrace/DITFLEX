@@ -1,6 +1,6 @@
 # ditflex -- repo snapshot
 
-Generated 2026-07-20 19:19 UTC by context/context.py. 38 files.
+Generated 2026-07-21 00:08 UTC by context/context.py. 45 files.
 
 ## Tree
 
@@ -11,8 +11,10 @@ DITFLEX/
         ├── context.yml
         ├── quick-train.yml
         ├── recover-checkpoint.yml
+        ├── sampling.yml
         ├── tests.yml
         ├── train-diffusion.yml
+        ├── train-recovery-270k.yml
         ├── train.yml
 ├── README.md
 ├── pyproject.toml
@@ -21,6 +23,8 @@ DITFLEX/
 ├── run/
     ├── modal_train.py
     ├── recover_checkpoint.py
+├── sampling/
+    ├── modal_sample.py
 ├── src/
     ├── ditflex/
         ├── __init__.py
@@ -35,12 +39,14 @@ DITFLEX/
         ├── model.py
         ├── objective.py
         ├── sample.py
+        ├── stability.py
         ├── train.py
 ├── tests/
     ├── modal_ci.py
     ├── overfit_smoke.py
     ├── test_attention_identity.py
     ├── test_checkpoint_roundtrip.py
+    ├── test_checkpoint_selection.py
     ├── test_config_roundtrip.py
     ├── test_diffusion_math.py
     ├── test_dmap_gradients.py
@@ -48,6 +54,8 @@ DITFLEX/
     ├── test_ema.py
     ├── test_latents_shapes.py
     ├── test_objective_math.py
+    ├── test_objective_rng.py
+    ├── test_stability.py
     ├── verify_identity.py
     ├── verify_latents.py
 ├── train_diffusion/
@@ -248,6 +256,84 @@ jobs:
           fi
 ```
 
+### `.github/workflows/sampling.yml`
+
+```yaml
+name: sampling
+
+# Manual dispatch: render the fixed-seed grids from BOTH chains' latest
+# checkpoints and COMMIT the PNGs into /sampling/ in this repo.
+# Non-detached (the job needs the results back to commit them).
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Comma-separated checkpoint repos"
+        required: false
+        default: "sparsetrace/ditflex-L2-flow,sparsetrace/ditflex-L2-flow-dmap"
+      gpu:
+        description: "GPU kind (L4 is plenty: 100 fwd passes @ batch 16, eager flex, no backward; ~5-10 cents/dispatch. Bump to A10G/B200 only if L4 is unavailable)"
+        required: false
+        default: "L4"
+      sample_steps:
+        description: "Euler steps"
+        required: false
+        default: "50"
+      cfg_scale:
+        description: "CFG scale"
+        required: false
+        default: "4.0"
+
+permissions:
+  contents: write   # required to push the PNGs back
+
+jobs:
+  sample:
+    name: "sample · ${{ inputs.repos }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: |
+          pip install 'modal<1.5'
+          modal --version
+
+      - name: Authenticate Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          modal token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
+
+      - name: Render grids on Modal
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODAL_GPU: ${{ inputs.gpu }}
+        run: |
+          modal run sampling/modal_sample.py \
+            --repos "${{ inputs.repos }}" \
+            --sample-steps "${{ inputs.sample_steps }}" \
+            --cfg-scale "${{ inputs.cfg_scale }}"
+
+      - name: Commit grids
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sampling/*.png
+          git diff --cached --quiet && echo "no new grids" && exit 0
+          git commit -m "sampling: grids from latest checkpoints [skip ci]"
+          git push
+```
+
 ### `.github/workflows/tests.yml`
 
 ```yaml
@@ -439,79 +525,118 @@ jobs:
             --wd "${{ inputs.wd }}"
 ```
 
-### `.github/workflows/train.yml`
+### `.github/workflows/train-recovery-270k.yml`
 
 ```yaml
-name: train
+name: train-recovery-270k
 
-# Manual dispatch ONLY. This spends real GPU-hours -- it must never
-# trigger from a push.
-#
-# Chain economics ($/1K steps = hourly price / (3.6 * steps/s), measured):
-#   2xB300: 9.3-9.5 steps/s  ~$11.75/h  ~$0.35/1K
-#   2xB200: 8.4     steps/s  ~$12.5/h   ~$0.41/1K
-#   1xB200: 5.52    steps/s  ~$6.25/h   ~$0.31/1K
-#   1xRTX-PRO-6000: unmeasured -- the current default is a price probe;
-#     read its steady-state steps/s from the first link and fill this row.
-# Links are detached, so wall-clock per link is irrelevant; only $/step
-# matters. Single-GPU also deletes DDP entirely (no allreduce, no rank
-# desync in the guards).
-
+# Manual only: resumes a known-good checkpoint and runs a bounded,
+# transactional recovery segment on Modal.
 on:
   workflow_dispatch:
     inputs:
       gpus:
-        description: "GPU count (1 = full batch 256 on one die, no DDP; 2 if a single card OOMs)"
+        description: "GPU count"
         required: false
         default: "1"
       gpu_kind:
-        description: "GPU kind (RTX-PRO-6000 | B200 | B300). If Modal rejects the RTX string, its error lists the valid names -- fix and re-dispatch."
+        description: "Modal GPU kind"
         required: false
-        default: "RTX-PRO-6000"
+        default: "B200"
       train_seconds:
-        description: "Stepping budget in seconds (14400 = 4 h; Modal timeout = this + 3600. GitHub's 6h limit does NOT apply -- the job detaches in minutes)"
+        description: "Total Modal supervisor budget in seconds"
         required: false
-        default: "14400"
+        default: "7200"
       objective:
         description: "Objective (ddpm | flow)"
         required: false
         default: "flow"
-      lr:
-        description: "LR override for this run (0 = keep recipe 1e-4). Post-250K instability protocol: 0.00003"
-        required: false
-        default: "0"
-      wd:
-        description: "Weight-decay override for this run (-1 = keep recipe 0). Post-250K instability protocol: 0.1"
-        required: false
-        default: "-1"
-      clip:
-        description: "Gradient-clip max-norm (default 1.0; DMAP cliff protocol: 0.25)"
-        required: false
-        default: "1.0"
-      spike_skip:
-        description: "Skip steps with grad norm > this x EMA (0 = off)"
-        required: false
-        default: "4.0"
-      seed_offset:
-        description: "Data-order seed offset for this run (0 = recipe order)"
-        required: false
-        default: "0"
-      grad_ceiling:
-        description: "Absolute grad-norm skip ceiling (0 = off)"
-        required: false
-        default: "25.0"
-      max_steps:
-        description: "Stop at this many steps THIS RUN (0 = time-boxed only). For a global target: target minus current step in state.json"
-        required: false
-        default: "0"
       hub_repo:
-        description: "Checkpoint repo. ONE PER OBJECTIVE/VARIANT: config-drift refusal (correctly) blocks cross-resume"
+        description: "Hugging Face checkpoint repository"
         required: false
         default: "sparsetrace/ditflex-L2-flow"
 
+      # Recovery anchor and bounded diagnostic.
+      resume_step:
+        description: "Exact committed Hub step to resume"
+        required: false
+        default: "270000"
+      target_steps:
+        description: "Global training target used by the LR policy"
+        required: false
+        default: "400000"
+      max_steps:
+        description: "Maximum optimizer steps in this invocation (0 = time only)"
+        required: false
+        default: "5000"
+
+      # Keep the checkpoint's current LR/controller by default.
+      lr:
+        description: "LR override (0 = restore checkpoint LR)"
+        required: false
+        default: "0"
+      lr_policy:
+        description: "LR policy (constant | cosine | adaptive)"
+        required: false
+        default: "adaptive"
+      lr_backoff:
+        description: "Fresh-process retry LR multiplier"
+        required: false
+        default: "0.5"
+      lr_min_scale:
+        description: "Minimum adaptive scale"
+        required: false
+        default: "0.125"
+      max_retries:
+        description: "Maximum transactional retries"
+        required: false
+        default: "2"
+
+      wd:
+        description: "Weight decay override (-1 = restore recipe/checkpoint value)"
+        required: false
+        default: "-1"
+      clip:
+        description: "Global gradient clipping max norm"
+        required: false
+        default: "1.0"
+      spike_skip:
+        description: "Frozen-reference relative gradient skip multiplier"
+        required: false
+        default: "10.0"
+      grad_ceiling:
+        description: "Absolute pre-clip gradient skip ceiling (0 = disabled)"
+        required: false
+        default: "500.0"
+      grad_reference:
+        description: "Optional frozen gradient reference override (0 = checkpoint reference)"
+        required: false
+        default: "0"
+
+      # A high skip rate alone should warn before it rejects a flat-loss run.
+      skip_warn_rate:
+        description: "Window skip-rate warning threshold"
+        required: false
+        default: "0.30"
+      skip_retry_rate:
+        description: "Window skip-rate retry threshold"
+        required: false
+        default: "0.40"
+      skip_emergency_rate:
+        description: "Window skip-rate emergency threshold"
+        required: false
+        default: "0.60"
+
+      seed_offset:
+        description: "Base deterministic stochastic-stream offset"
+        required: false
+        default: "0"
+
 jobs:
   launch:
-    name: "launch · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }} · lr=${{ inputs.lr }} wd=${{ inputs.wd }}"
+    name: >-
+      recovery · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} ·
+      step=${{ inputs.resume_step }} · max=${{ inputs.max_steps }}
     runs-on: ubuntu-latest
 
     steps:
@@ -526,9 +651,161 @@ jobs:
       - name: Install Modal
         run: pip install 'modal<1.5'
 
-      # --detach: the Modal app outlives this job. The Actions job ends in
-      # minutes; training continues on Modal for the full budget. Monitor
-      # via the Modal dashboard, not the Actions log.
+      - name: Launch detached transactional recovery
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODAL_GPU: ${{ inputs.gpu_kind }}
+          MODAL_GPUS: ${{ inputs.gpus }}
+          MODAL_TRAIN_SECONDS: ${{ inputs.train_seconds }}
+        run: |
+          set -euo pipefail
+          echo "Launching recovery from global step ${{ inputs.resume_step }}"
+          echo "Modal token id present: ${MODAL_TOKEN_ID:+yes}"
+
+          modal run --detach run/modal_train.py \
+            --train-seconds "${{ inputs.train_seconds }}" \
+            --objective "${{ inputs.objective }}" \
+            --hub-repo "${{ inputs.hub_repo }}" \
+            --resume-step "${{ inputs.resume_step }}" \
+            --no-auto-legacy-rollback \
+            --target-steps "${{ inputs.target_steps }}" \
+            --max-steps "${{ inputs.max_steps }}" \
+            --max-retries "${{ inputs.max_retries }}" \
+            --lr "${{ inputs.lr }}" \
+            --lr-policy "${{ inputs.lr_policy }}" \
+            --lr-backoff "${{ inputs.lr_backoff }}" \
+            --lr-min-scale "${{ inputs.lr_min_scale }}" \
+            --wd "${{ inputs.wd }}" \
+            --clip "${{ inputs.clip }}" \
+            --spike-skip "${{ inputs.spike_skip }}" \
+            --grad-ceiling "${{ inputs.grad_ceiling }}" \
+            --grad-reference "${{ inputs.grad_reference }}" \
+            --skip-warn-rate "${{ inputs.skip_warn_rate }}" \
+            --skip-retry-rate "${{ inputs.skip_retry_rate }}" \
+            --skip-emergency-rate "${{ inputs.skip_emergency_rate }}" \
+            --seed-offset "${{ inputs.seed_offset }}"
+```
+
+### `.github/workflows/train.yml`
+
+```yaml
+name: train
+
+# Manual dispatch only.  Each run is detached: GitHub exits after launch while
+# Modal pulls the latest healthy checkpoint, trains, saves, and pushes.
+
+on:
+  workflow_dispatch:
+    inputs:
+      gpus:
+        description: "GPU count (1 = full global batch 256 on one GPU)"
+        required: false
+        default: "1"
+      gpu_kind:
+        description: "Modal GPU kind (B200 | B300 | RTX-PRO-6000)"
+        required: false
+        default: "B200"
+      train_seconds:
+        description: "Stepping budget in seconds; Modal timeout adds one hour"
+        required: false
+        default: "14400"
+      objective:
+        description: "Objective (ddpm | flow)"
+        required: false
+        default: "flow"
+      hub_repo:
+        description: "Checkpoint repo; keep one repo per objective/variant"
+        required: false
+        default: "sparsetrace/ditflex-L2-flow"
+      target_steps:
+        description: "Global stop and cosine horizon"
+        required: false
+        default: "400000"
+      max_steps:
+        description: "Maximum data steps this invocation (0 = time-box only)"
+        required: false
+        default: "0"
+
+      lr_policy:
+        description: "constant | cosine | adaptive (cosine plus loss/spike backoff)"
+        required: false
+        default: "adaptive"
+      lr:
+        description: "Base LR before scheduling (0 = recipe 1e-4). Leave 0 for adaptive migration."
+        required: false
+        default: "0"
+      lr_min:
+        description: "Cosine envelope floor at target_steps"
+        required: false
+        default: "0.00001"
+      lr_hard_min:
+        description: "Absolute floor after adaptive backoffs"
+        required: false
+        default: "0.000001"
+      lr_backoff:
+        description: "Adaptive multiplier after sustained instability"
+        required: false
+        default: "0.5"
+      lr_min_scale:
+        description: "Minimum adaptive multiplier"
+        required: false
+        default: "0.125"
+      loss_rise_ratio:
+        description: "Fast-loss EMA / slow-loss EMA warning threshold"
+        required: false
+        default: "1.08"
+      loss_emergency_ratio:
+        description: "Fast-loss EMA / slow-loss EMA emergency threshold"
+        required: false
+        default: "1.35"
+      reset_lr_controller:
+        description: "Discard persisted controller state after intentional policy changes"
+        required: false
+        type: boolean
+        default: false
+
+      wd:
+        description: "Weight decay override (-1 = keep checkpoint/config; recommended for this chain)"
+        required: false
+        default: "-1"
+      clip:
+        description: "Global gradient-clip max norm"
+        required: false
+        default: "1.0"
+      spike_skip:
+        description: "Skip update above this multiple of gradient-norm EMA (0 = off)"
+        required: false
+        default: "4.0"
+      grad_ceiling:
+        description: "Absolute raw gradient-norm skip ceiling (0 = off; recommended)"
+        required: false
+        default: "0"
+      seed_offset:
+        description: "Runtime-only data-order seed offset"
+        required: false
+        default: "0"
+
+jobs:
+  launch:
+    name: >-
+      launch · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }} ·
+      ${{ inputs.lr_policy }} to ${{ inputs.target_steps }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: pip install 'modal<1.5'
+
       - name: Launch detached training run
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
@@ -543,13 +820,22 @@ jobs:
             --train-seconds "${{ inputs.train_seconds }}" \
             --objective "${{ inputs.objective }}" \
             --hub-repo "${{ inputs.hub_repo }}" \
+            --target-steps "${{ inputs.target_steps }}" \
             --max-steps "${{ inputs.max_steps }}" \
+            --lr-policy "${{ inputs.lr_policy }}" \
             --lr "${{ inputs.lr }}" \
+            --lr-min "${{ inputs.lr_min }}" \
+            --lr-hard-min "${{ inputs.lr_hard_min }}" \
+            --lr-backoff "${{ inputs.lr_backoff }}" \
+            --lr-min-scale "${{ inputs.lr_min_scale }}" \
+            --loss-rise-ratio "${{ inputs.loss_rise_ratio }}" \
+            --loss-emergency-ratio "${{ inputs.loss_emergency_ratio }}" \
             --wd "${{ inputs.wd }}" \
             --clip "${{ inputs.clip }}" \
             --spike-skip "${{ inputs.spike_skip }}" \
             --grad-ceiling "${{ inputs.grad_ceiling }}" \
-            --seed-offset "${{ inputs.seed_offset }}"
+            --seed-offset "${{ inputs.seed_offset }}" \
+            ${{ inputs.reset_lr_controller && '--reset-lr-controller' || '' }}
 ```
 
 ### `README.md`
@@ -1057,58 +1343,44 @@ def main(
 ### `run/modal_train.py`
 
 ```python
-"""run/modal_train.py -- time-boxed DiT-L/2 training on Modal.
+"""Detached Modal supervisor for transactional DiT/SiT training.
 
-The training counterpart to tests/modal_ci.py. Launched detached so the
-GitHub Actions job that starts it can exit after minutes while the run
-continues:
+One Modal container may launch several *fresh* torchrun processes.  Exit code
+75 means the child detected retryable numerical instability and deliberately
+discarded its candidate.  The supervisor then reloads the last promoted Hub
+checkpoint with:
 
-    MODAL_GPUS=8 modal run --detach run/modal_train.py --train-seconds 7200 --objective ddpm
+* a lower retry LR multiplier;
+* a deterministic new data/objective seed offset;
+* the same model, EMA, AdamW moments, and global step from the committed state.
 
-Long training is many short runs, not one long one: each invocation pulls
-the latest checkpoint from the HF Hub (if any), trains until the wall-clock
-budget is spent, saves, uploads, and exits. Chain invocations to accumulate
-steps. Resume is exact because data sampling is stateless -- indices are
-drawn from a generator seeded by (global_step, rank).
-
-GPU kind and count are fixed when the Modal function is built, so they are
-env vars (set by the workflow), not CLI flags:
-
-    MODAL_GPU    B300 (default) | B200 | ...
-    MODAL_GPUS   8 (default) | 2 for smoke
-
-HF_TOKEN (write scope: pulls latents AND pushes checkpoints) comes from
-the launching environment -- a GitHub repo secret exported by train.yml,
-or `export HF_TOKEN=...` locally -- and is forwarded into the container
-via Secret.from_dict. No Modal-side secret needed.
-
-NOTE: this launcher is ready; the entrypoint it launches (ditflex.train)
-is Phase 1 and does not exist yet. Until it does, this file is
-scaffolding -- do not wire train.yml to real GPU hours before
-tests/modal_ci.py is green and the overfit smoke passes.
+The retry count is bounded.  Code errors and unrelated subprocess failures are
+not hidden by a broad exception handler.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import time
 from pathlib import Path
 
 import modal
 
 REPO_ROOT = Path(__file__).parent.parent
-
 GPU_KIND = os.environ.get("MODAL_GPU", "B300")
 GPU_COUNT = int(os.environ.get("MODAL_GPUS", "8"))
 TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
 
-# The Modal function timeout must cover train_seconds PLUS checkpoint
-# download (~12 min), upload (~12 min), and cold compile (~3 min) -- but
-# NOT much more: a hung run bills until the timeout kills it. So the
-# ceiling derives from the requested budget: the workflow exports
-# MODAL_TRAIN_SECONDS and we add a 1-hour overhead allowance. A 2-hour
-# dispatch can never bill more than ~3 hours, even if everything hangs.
 _BUDGET = int(os.environ.get("MODAL_TRAIN_SECONDS", "7200"))
-TIMEOUT_CEILING = _BUDGET + 3600
+_MAX_RETRIES_ENV = int(os.environ.get("MODAL_MAX_RETRIES", "2"))
+# Per attempt: checkpoint pull + compile + upload allowance.  The stepping
+# budget itself is shared across retries by reading the child's retry marker.
+TIMEOUT_CEILING = _BUDGET + 3600 * (_MAX_RETRIES_ENV + 1)
+
+RETRY_EXIT_CODE = 75
+RETRY_MARKER = Path("/tmp/ditflex_retry.json")
+PROMOTION_MARKER = Path("/tmp/ditflex_promotion.json")
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -1121,42 +1393,98 @@ image = (
         "huggingface_hub>=0.26",
         "numpy>=1.26",
         "tqdm",
-        "pillow",          # sample-grid PNG at end of each link
+        "pillow",
     )
     .add_local_dir(
         REPO_ROOT,
         remote_path="/repo",
-        ignore=[".git", "**/__pycache__", "*.egg-info", ".venv", ".ruff_cache", ".pytest_cache"],
+        ignore=[
+            ".git",
+            "**/__pycache__",
+            "*.egg-info",
+            ".venv",
+            ".ruff_cache",
+            ".pytest_cache",
+        ],
     )
 )
 
 app = modal.App("ditflex-train", image=image)
 
 
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 @app.function(
     gpu=f"{GPU_KIND}:{GPU_COUNT}",
     timeout=TIMEOUT_CEILING,
-    secrets=[
-        modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")}),
-        # add WANDB_API_KEY here the same way when logging lands
-    ],
+    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
 def train(
     train_seconds: int = 7200,
     objective: str = "flow",
     hub_repo: str = "",
     max_steps: int = 0,
+    target_steps: int = 400_000,
+    resume_revision: str = "",
+    resume_step: int = 0,
+    auto_legacy_rollback: bool = True,
+    legacy_suspect_ratio: float = 8.0,
+    max_retries: int = 2,
+    retry_seed_stride: int = 1_000_003,
     lr: float = 0.0,
+    lr_policy: str = "adaptive",
+    lr_min: float = 1e-5,
+    lr_hard_min: float = 1e-6,
+    lr_backoff: float = 0.5,
+    lr_min_scale: float = 0.125,
+    # Kept only so the existing v2 GitHub workflow remains callable.  V3 uses
+    # committed-reference thresholds below rather than fast/slow EMA ratios.
+    loss_rise_ratio: float = 1.08,
+    loss_emergency_ratio: float = 1.35,
+    health_loss_warn_ratio: float = 1.015,
+    health_loss_retry_ratio: float = 1.025,
+    health_loss_emergency_ratio: float = 1.05,
+    health_grad_warn_ratio: float = 2.0,
+    health_grad_retry_ratio: float = 4.0,
+    health_grad_emergency_ratio: float = 8.0,
+    commit_windows: int = 2,
+    warning_patience: int = 2,
+    reset_lr_controller: bool = False,
+    grad_reference: float = 0.0,
     wd: float = -1.0,
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
-    grad_ceiling: float = 25.0,
+    grad_ceiling: float = 0.0,
+    skip_warn_rate: float = 0.30,
+    skip_retry_rate: float = 0.40,
+    skip_emergency_rate: float = 0.60,
 ) -> int:
     import subprocess
     import sys
 
     import torch
+
+    if max_retries < 0:
+        print("[modal] max_retries must be non-negative")
+        return 2
+    if not (0.0 < lr_backoff < 1.0):
+        print("[modal] lr_backoff must lie in (0, 1)")
+        return 2
+    if train_seconds <= 0:
+        print("[modal] train_seconds must be positive")
+        return 2
+    if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
+        print(
+            "[modal] skip thresholds must satisfy "
+            "0 <= warn <= retry <= emergency <= 1"
+        )
+        return 2
 
     n_gpu = torch.cuda.device_count()
     result = subprocess.run(
@@ -1165,40 +1493,183 @@ def train(
         text=True,
     )
     print(f"[modal] {n_gpu} GPUs:\n{result.stdout.strip()}")
+    if n_gpu <= 0:
+        print("[modal] no CUDA devices visible")
+        return 2
 
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"], check=True
+        [sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"],
+        check=True,
     )
 
-    # torchrun handles per-rank process spawn + env for single-node DDP.
-    # nproc comes from what the container actually has, so the launcher
-    # cannot disagree with the reservation.
-    cmd = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        f"--nproc-per-node={n_gpu}",
-        "--standalone",
-        "-m",
-        "ditflex.train",
-        f"--train-seconds={train_seconds}",
-        f"--objective={objective}",
-    ]
-    if hub_repo:
-        cmd.append(f"--hub-repo={hub_repo}")
-    if max_steps > 0:
-        cmd.append(f"--max-steps={max_steps}")
-    if lr > 0.0:
-        cmd.append(f"--lr={lr}")
-    if wd >= 0.0:
-        cmd.append(f"--wd={wd}")
-    cmd.append(f"--clip={clip}")
-    cmd.append(f"--spike-skip={spike_skip}")
-    if seed_offset != 0:
-        cmd.append(f"--seed-offset={seed_offset}")
-    cmd.append(f"--grad-ceiling={grad_ceiling}")
-    print(f"\n[modal] running: {' '.join(cmd)}\n")
-    return subprocess.run(cmd, cwd="/repo").returncode
+    # The editable install above happens after this Modal worker interpreter
+    # has already started.  pip writes a .pth/editable-finder file, but the
+    # running interpreter does not automatically re-process newly created
+    # .pth files.  Add the src-layout directory explicitly for imports in this
+    # supervisor process and export it for every fresh torchrun child.
+    repo_src = Path("/repo/src")
+    if not repo_src.is_dir():
+        raise RuntimeError(f"expected source directory is missing: {repo_src}")
+    repo_src_str = str(repo_src)
+    if repo_src_str not in sys.path:
+        sys.path.insert(0, repo_src_str)
+    inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+    pythonpath_parts = [part for part in inherited_pythonpath.split(os.pathsep) if part]
+    if repo_src_str not in pythonpath_parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([repo_src_str, *pythonpath_parts])
+
+    from ditflex.checkpoint import (
+        resolve_revision_for_step,
+        select_stable_resume_revision,
+    )
+
+    selected_revision = resume_revision.strip()
+    selected_step: int | None = resume_step if resume_step > 0 else None
+    if selected_revision and selected_step is not None:
+        print("[modal] use only one of resume_revision or resume_step")
+        return 2
+    if selected_step is not None:
+        if not hub_repo:
+            print("[modal] resume_step requires hub_repo")
+            return 2
+        selected_revision = resolve_revision_for_step(hub_repo, selected_step)
+        print(
+            f"[modal] explicit anchor step {selected_step:,} -> "
+            f"revision {selected_revision[:12]}"
+        )
+    elif not selected_revision and auto_legacy_rollback and hub_repo:
+        selection = select_stable_resume_revision(
+            hub_repo,
+            suspect_ratio=legacy_suspect_ratio,
+        )
+        selected_revision = selection.revision or ""
+        selected_step = selection.step
+        print(f"[modal] resume selection: {selection.reason}")
+        if selected_revision:
+            print(
+                f"[modal] using migration anchor step {selected_step:,} "
+                f"revision {selected_revision[:12]}"
+            )
+
+    if loss_rise_ratio != 1.08 or loss_emergency_ratio != 1.35:
+        print(
+            "[modal] NOTE: v2 loss_rise_ratio/loss_emergency_ratio are deprecated; "
+            "v3 uses health_loss_* committed-reference thresholds"
+        )
+
+    remaining_train_seconds = float(train_seconds)
+    for attempt in range(max_retries + 1):
+        if remaining_train_seconds < 1.0:
+            print("[modal] retry budget exhausted before another attempt")
+            return RETRY_EXIT_CODE
+
+        RETRY_MARKER.unlink(missing_ok=True)
+        PROMOTION_MARKER.unlink(missing_ok=True)
+
+        attempt_factor = lr_backoff**attempt
+        attempt_seed_offset = seed_offset + attempt * retry_seed_stride
+        child_budget = max(1, int(remaining_train_seconds))
+
+        command = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            f"--nproc-per-node={n_gpu}",
+            "--standalone",
+            "-m",
+            "ditflex.train",
+            f"--train-seconds={child_budget}",
+            f"--objective={objective}",
+            f"--target-steps={target_steps}",
+            f"--attempt={attempt}",
+            f"--attempt-lr-factor={attempt_factor}",
+            f"--seed-offset={attempt_seed_offset}",
+            f"--lr-policy={lr_policy}",
+            f"--lr-min={lr_min}",
+            f"--lr-hard-min={lr_hard_min}",
+            f"--lr-min-scale={lr_min_scale}",
+            f"--commit-windows={commit_windows}",
+            f"--warning-patience={warning_patience}",
+            f"--loss-warn-ratio={health_loss_warn_ratio}",
+            f"--loss-retry-ratio={health_loss_retry_ratio}",
+            f"--loss-emergency-ratio={health_loss_emergency_ratio}",
+            f"--grad-warn-ratio={health_grad_warn_ratio}",
+            f"--grad-retry-ratio={health_grad_retry_ratio}",
+            f"--grad-emergency-ratio={health_grad_emergency_ratio}",
+            f"--clip={clip}",
+            f"--spike-skip={spike_skip}",
+            f"--grad-ceiling={grad_ceiling}",
+            f"--skip-warn-rate={skip_warn_rate}",
+            f"--skip-retry-rate={skip_retry_rate}",
+            f"--skip-emergency-rate={skip_emergency_rate}",
+        ]
+        if hub_repo:
+            command.append(f"--hub-repo={hub_repo}")
+        if selected_revision:
+            command.append(f"--resume-revision={selected_revision}")
+        if max_steps > 0:
+            command.append(f"--max-steps={max_steps}")
+        if lr > 0.0:
+            command.append(f"--lr={lr}")
+        if grad_reference > 0.0:
+            command.append(f"--grad-reference={grad_reference}")
+        if wd >= 0.0:
+            command.append(f"--wd={wd}")
+        if reset_lr_controller and attempt == 0:
+            command.append("--reset-lr-controller")
+
+        print(
+            f"\n[modal] attempt {attempt}/{max_retries}: "
+            f"lr_factor={attempt_factor:g} seed_offset={attempt_seed_offset} "
+            f"budget={child_budget}s anchor="
+            f"{selected_revision[:12] if selected_revision else 'latest'}\n"
+            f"[modal] running: {' '.join(command)}\n"
+        )
+        started = time.time()
+        result = subprocess.run(command, cwd="/repo")
+        child_wall = time.time() - started
+        if result.returncode == 0:
+            print(f"[modal] attempt {attempt} completed successfully")
+            return 0
+
+        # torchrun commonly wraps a worker's exit code in ChildFailedError and
+        # returns 1 itself.  The rank-0 atomic marker is therefore the source of
+        # truth for a deliberate transactional retry.
+        retry = _read_json(RETRY_MARKER)
+        retry_requested = int(retry.get("exit_code", 0) or 0) == RETRY_EXIT_CODE
+        if not retry_requested:
+            print(
+                f"[modal] child failed with non-retryable exit code "
+                f"{result.returncode}; not masking the failure"
+            )
+            return result.returncode
+
+        consumed = float(retry.get("elapsed_training_seconds", child_wall))
+        remaining_train_seconds = max(0.0, remaining_train_seconds - consumed)
+        print(
+            f"[modal] retry requested: {retry.get('reason', 'no marker reason')}\n"
+            f"[modal] stepping budget consumed={consumed:.1f}s, "
+            f"remaining={remaining_train_seconds:.1f}s"
+        )
+
+        # If this attempt promoted healthy progress before a later failure,
+        # retry from ordinary latest.  Otherwise preserve the explicit legacy
+        # migration anchor instead of falling back to a suspect old latest.
+        promotion = _read_json(PROMOTION_MARKER)
+        promoted_step = int(promotion.get("step", 0) or 0)
+        if promoted_step > 0 and (selected_step is None or promoted_step > selected_step):
+            selected_revision = ""
+            selected_step = promoted_step
+            print(
+                f"[modal] attempt promoted healthy step {promoted_step:,}; "
+                "next retry will pull Hub latest"
+            )
+
+        if attempt >= max_retries:
+            print("[modal] retry limit reached; last committed checkpoint remains untouched")
+            return RETRY_EXIT_CODE
+
+    return RETRY_EXIT_CODE
 
 
 @app.local_entrypoint()
@@ -1207,32 +1678,91 @@ def main(
     objective: str = "flow",
     hub_repo: str = "",
     max_steps: int = 0,
+    target_steps: int = 400_000,
+    resume_revision: str = "",
+    resume_step: int = 0,
+    auto_legacy_rollback: bool = True,
+    legacy_suspect_ratio: float = 8.0,
+    max_retries: int = 2,
+    retry_seed_stride: int = 1_000_003,
     lr: float = 0.0,
+    lr_policy: str = "adaptive",
+    lr_min: float = 1e-5,
+    lr_hard_min: float = 1e-6,
+    lr_backoff: float = 0.5,
+    lr_min_scale: float = 0.125,
+    loss_rise_ratio: float = 1.08,
+    loss_emergency_ratio: float = 1.35,
+    health_loss_warn_ratio: float = 1.015,
+    health_loss_retry_ratio: float = 1.025,
+    health_loss_emergency_ratio: float = 1.05,
+    health_grad_warn_ratio: float = 2.0,
+    health_grad_retry_ratio: float = 4.0,
+    health_grad_emergency_ratio: float = 8.0,
+    commit_windows: int = 2,
+    warning_patience: int = 2,
+    reset_lr_controller: bool = False,
+    grad_reference: float = 0.0,
     wd: float = -1.0,
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
-    grad_ceiling: float = 25.0,
+    grad_ceiling: float = 0.0,
+    skip_warn_rate: float = 0.30,
+    skip_retry_rate: float = 0.40,
+    skip_emergency_rate: float = 0.60,
 ):
-    """
-    Args:
-        train_seconds: stepping budget (checkpoint I/O and compile are on top)
-        objective:     ddpm | flow
-        hub_repo:      checkpoint repo override. SMOKES MUST SET THIS to a
-                       scratch repo -- a smoke that pushes to the real repo
-                       would be silently resumed by the real run.
-    """
-    if objective not in ("ddpm", "flow"):
+    if objective not in {"ddpm", "flow"}:
         raise SystemExit(f"unknown objective: {objective!r}")
+    if lr_policy not in {"constant", "cosine", "adaptive"}:
+        raise SystemExit(f"unknown lr_policy: {lr_policy!r}")
+    if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
+        raise SystemExit(
+            "skip thresholds must satisfy "
+            "0 <= warn <= retry <= emergency <= 1"
+        )
 
-    rc = train.remote(
-        train_seconds=train_seconds, objective=objective,
-        hub_repo=hub_repo, max_steps=max_steps, lr=lr, wd=wd,
-        clip=clip, spike_skip=spike_skip, seed_offset=seed_offset,
+    return_code = train.remote(
+        train_seconds=train_seconds,
+        objective=objective,
+        hub_repo=hub_repo,
+        max_steps=max_steps,
+        target_steps=target_steps,
+        resume_revision=resume_revision,
+        resume_step=resume_step,
+        auto_legacy_rollback=auto_legacy_rollback,
+        legacy_suspect_ratio=legacy_suspect_ratio,
+        max_retries=max_retries,
+        retry_seed_stride=retry_seed_stride,
+        lr=lr,
+        lr_policy=lr_policy,
+        lr_min=lr_min,
+        lr_hard_min=lr_hard_min,
+        lr_backoff=lr_backoff,
+        lr_min_scale=lr_min_scale,
+        loss_rise_ratio=loss_rise_ratio,
+        loss_emergency_ratio=loss_emergency_ratio,
+        health_loss_warn_ratio=health_loss_warn_ratio,
+        health_loss_retry_ratio=health_loss_retry_ratio,
+        health_loss_emergency_ratio=health_loss_emergency_ratio,
+        health_grad_warn_ratio=health_grad_warn_ratio,
+        health_grad_retry_ratio=health_grad_retry_ratio,
+        health_grad_emergency_ratio=health_grad_emergency_ratio,
+        commit_windows=commit_windows,
+        warning_patience=warning_patience,
+        reset_lr_controller=reset_lr_controller,
+        grad_reference=grad_reference,
+        wd=wd,
+        clip=clip,
+        spike_skip=spike_skip,
+        seed_offset=seed_offset,
         grad_ceiling=grad_ceiling,
+        skip_warn_rate=skip_warn_rate,
+        skip_retry_rate=skip_retry_rate,
+        skip_emergency_rate=skip_emergency_rate,
     )
-    if rc != 0:
-        raise SystemExit(rc)
+    if return_code != 0:
+        raise SystemExit(return_code)
 ```
 
 ### `run/recover_checkpoint.py`
@@ -1308,6 +1838,155 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+```
+
+### `sampling/modal_sample.py`
+
+```python
+"""sampling/modal_sample.py -- on-demand sample grids from BOTH chains.
+
+Pulls the latest checkpoint of each requested Hub repo, builds the
+correct model variant from the checkpoint's own embedded config
+(qk_mode decides builder), loads the EMA weights, renders the standard
+fixed-seed 4x4 grid (same classes, same noise as the training-time
+time-lapse), and returns PNG bytes. The workflow commits the PNGs into
+/sampling/ in the GitHub repo.
+
+    modal run sampling/modal_sample.py
+    modal run sampling/modal_sample.py --repos sparsetrace/ditflex-L2-flow
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import modal
+
+REPO_ROOT = Path(__file__).parent.parent
+GPU_KIND = os.environ.get("MODAL_GPU", "B200")
+TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu129")
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git")
+    .pip_install("torch", extra_options=f"--index-url {TORCH_INDEX}")
+    .pip_install(
+        "diffusers>=0.31", "transformers>=4.44", "safetensors>=0.4.5",
+        "huggingface_hub>=0.26", "numpy>=1.26", "pillow", "accelerate",
+    )
+    .add_local_dir(
+        REPO_ROOT, remote_path="/repo",
+        ignore=[".git", "**/__pycache__", "*.egg-info", ".venv", ".ruff_cache", ".pytest_cache"],
+    )
+)
+
+app = modal.App("ditflex-sampling", image=image)
+
+
+@app.function(
+    gpu=GPU_KIND,
+    timeout=1800,
+    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
+)
+def sample_repo(repo: str, sample_steps: int = 50, cfg_scale: float = 4.0) -> tuple[int, bytes]:
+    import io
+    import json
+    import subprocess
+    import sys
+
+    subprocess.run([sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"], check=True)
+
+    import numpy as np
+    import torch
+    from huggingface_hub import hf_hub_download
+    from PIL import Image
+    from safetensors.torch import load_file
+
+    from ditflex.config import Config
+    from ditflex.model import build_model
+
+    state = json.load(open(hf_hub_download(repo, "state.json")))
+    step = int(state["step"])
+    cfg_dict = state.get("config") or state.get("cfg")
+    assert cfg_dict, "state.json lacks an embedded config"
+    cfg = Config.from_dict(cfg_dict)
+    print(f"[sample] {repo}: step {step:,}  qk_mode={cfg.model.qk_mode}")
+
+    if cfg.model.qk_mode == "dmap":
+        from ditflex.diffusion_model import build_dmap_model
+
+        model = build_dmap_model(cfg.model)
+    else:
+        model = build_model(cfg.model)
+
+    ema_sd = load_file(hf_hub_download(repo, "ema.safetensors"))
+    missing, unexpected = model.load_state_dict(ema_sd, strict=False)
+    n_params = sum(1 for _ in model.parameters())
+    print(f"[sample] EMA loaded: {len(ema_sd)} tensors "
+          f"(missing={len(missing)} buffers, unexpected={len(unexpected)})")
+    assert len(unexpected) == 0, f"unexpected EMA keys: {unexpected[:5]}"
+    assert len(ema_sd) >= n_params * 0.9, "EMA state dict suspiciously small"
+
+    model = model.to(device="cuda", dtype=torch.float32).eval()
+
+    # Fixed classes/seed: identical to the training-time time-lapse.
+    try:
+        from ditflex.sample import FIXED_CLASSES, FIXED_SEED
+    except ImportError:
+        FIXED_CLASSES = [207, 360, 387, 974, 88, 979, 417, 279,
+                         972, 483, 21, 562, 933, 724, 985, 812]
+        FIXED_SEED = 1234
+
+    n = len(FIXED_CLASSES)
+    g = torch.Generator(device="cpu").manual_seed(FIXED_SEED)
+    x = torch.randn(n, cfg.model.in_channels, cfg.model.sample_size,
+                    cfg.model.sample_size, generator=g).cuda()
+    y = torch.tensor(FIXED_CLASSES, device="cuda")
+    y_null = torch.full_like(y, cfg.model.num_classes)
+
+    dt = 1.0 / sample_steps
+    with torch.no_grad():
+        for i in range(sample_steps):
+            t = 1.0 - i * dt
+            tt = torch.full((n,), t * 1000.0, device="cuda")
+            v_c = model(hidden_states=x, timestep=tt, class_labels=y).sample[:, :4]
+            v_u = model(hidden_states=x, timestep=tt, class_labels=y_null).sample[:, :4]
+            v = v_u + cfg_scale * (v_c - v_u)
+            x = x - dt * v
+
+        from diffusers import AutoencoderKL
+
+        vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema").cuda().eval()
+        imgs = vae.decode(x / 0.18215).sample
+
+    imgs = ((imgs.clamp(-1, 1) + 1) * 127.5).byte().cpu().permute(0, 2, 3, 1).numpy()
+    side = int(n ** 0.5)
+    px = imgs.shape[1]
+    grid = np.zeros((side * px, side * px, 3), dtype=np.uint8)
+    for k in range(n):
+        r, c = divmod(k, side)
+        grid[r * px:(r + 1) * px, c * px:(c + 1) * px] = imgs[k]
+
+    buf = io.BytesIO()
+    Image.fromarray(grid).save(buf, format="PNG")
+    print(f"[sample] {repo}: grid rendered at step {step:,}")
+    return step, buf.getvalue()
+
+
+@app.local_entrypoint()
+def main(
+    repos: str = "sparsetrace/ditflex-L2-flow,sparsetrace/ditflex-L2-flow-dmap",
+    sample_steps: int = 50,
+    cfg_scale: float = 4.0,
+):
+    out_dir = Path(__file__).parent
+    for repo in [r.strip() for r in repos.split(",") if r.strip()]:
+        step, png = sample_repo.remote(repo, sample_steps=sample_steps, cfg_scale=cfg_scale)
+        tag = repo.split("/")[-1].replace("ditflex-L2-", "")
+        path = out_dir / f"{tag}_step_{step:07d}.png"
+        path.write_bytes(png)
+        print(f"[sample] wrote {path}")
 ```
 
 ### `src/ditflex/__init__.py`
@@ -1567,34 +2246,26 @@ def reference_self_attention(
 ### `src/ditflex/checkpoint.py`
 
 ```python
-"""src/ditflex/checkpoint.py -- save/load/resume, HF Hub push/pull.
+"""Checkpoint storage, validation, Hub revisions, and transactional promotion.
 
-Hub layout (README "Checkpointing"):
-    state.json              step, config, run_history, environment
-    model.safetensors       fp32 weights, clean names
-    ema.safetensors         fp32 EMA shadow
-    optim.safetensors       AdamW state, flattened to {param_idx}.{key}
-    archive/step_XXXXXXX/   periodic EMA+state snapshots, kept forever
-
-Everything tensor-shaped lives in safetensors (no pickle); AdamW's
-param_groups (plain python) ride inside state.json. State dicts are
-passed through clean_state_dict defensively -- EMA and the raw-module
-save path never produce `_orig_mod.` / `module.` prefixes, but a
-checkpoint that cannot load into a bare model for sampling is the
-failure mode the README warns about, so we strip anyway.
-
-Resume refuses config drift: state.json embeds the full Config, and
-load_checkpoint hard-errors if it differs from the current one. A
-resumed run must be the same experiment.
+Hub top-level files always represent the last *committed healthy* checkpoint.
+Training writes a complete candidate directory first, validates its structure,
+and only then promotes it with :func:`push_to_hub`.  A failed candidate is never
+uploaded, so a fresh retry process can safely pull Hub latest and roll back the
+model, EMA, optimizer moments, step, and stability reference together.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+import shutil
+import statistics
+from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
+from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from ditflex.config import Config
@@ -1603,13 +2274,31 @@ _PREFIXES = ("_orig_mod.", "module.")
 FILES = ("state.json", "model.safetensors", "ema.safetensors", "optim.safetensors")
 
 
+@dataclass(frozen=True)
+class CheckpointRevision:
+    revision: str
+    step: int
+    grad_reference: float | None
+    state: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ResumeSelection:
+    """A selected Hub revision; ``revision=None`` means ordinary latest."""
+
+    revision: str | None
+    step: int | None
+    reason: str
+
+
 def clean_state_dict(sd: dict) -> dict:
     out = {}
-    for k, v in sd.items():
-        for p in _PREFIXES:
-            while k.startswith(p):
-                k = k[len(p):]
-        out[k] = v
+    for key, value in sd.items():
+        clean_key = key
+        for prefix in _PREFIXES:
+            while clean_key.startswith(prefix):
+                clean_key = clean_key[len(prefix) :]
+        out[clean_key] = value
     return out
 
 
@@ -1618,43 +2307,39 @@ def clean_state_dict(sd: dict) -> dict:
 
 def _flatten_optim(osd: dict) -> tuple[dict[str, torch.Tensor], list]:
     tensors: dict[str, torch.Tensor] = {}
-    for idx, st in osd["state"].items():
-        for key, v in st.items():
-            if not torch.is_tensor(v):
-                v = torch.tensor(v)
-            if v.ndim == 0:                      # safetensors-safe scalars
-                v = v.reshape(1)
+    for idx, state in osd["state"].items():
+        for key, value in state.items():
+            if not torch.is_tensor(value):
+                value = torch.tensor(value)
+            if value.ndim == 0:
+                value = value.reshape(1)
                 key = f"{key}__scalar"
-            tensors[f"{idx}.{key}"] = v.contiguous().cpu()
+            tensors[f"{idx}.{key}"] = value.contiguous().cpu()
     return tensors, osd["param_groups"]
 
 
 def _unflatten_optim(tensors: dict[str, torch.Tensor], param_groups: list) -> dict:
     state: dict[int, dict] = {}
-    for flat_key, v in tensors.items():
-        idx_s, key = flat_key.split(".", 1)
+    for flat_key, value in tensors.items():
+        idx_text, key = flat_key.split(".", 1)
         if key.endswith("__scalar"):
             key = key[: -len("__scalar")]
-            v = v.reshape(())
-        state.setdefault(int(idx_s), {})[key] = v
+            value = value.reshape(())
+        state.setdefault(int(idx_text), {})[key] = value
     return {"state": state, "param_groups": param_groups}
 
 
 def _restore_group_types(loaded_groups: list, reference_groups: list) -> list:
-    """JSON has no tuples: AdamW's betas=(0.9, 0.999) comes back as a list.
-    Coerce loaded values back to tuple wherever the live optimizer's
-    param_groups hold a tuple, so state_dict round-trips exactly -- same
-    move as DataConfig.__post_init__ for latent_shape."""
     if len(loaded_groups) != len(reference_groups):
-        return loaded_groups  # let load_state_dict raise its own error
-    for lg, rg in zip(loaded_groups, reference_groups, strict=True):
-        for k, v in lg.items():
-            if isinstance(v, list) and isinstance(rg.get(k), tuple):
-                lg[k] = tuple(v)
+        return loaded_groups
+    for loaded, reference in zip(loaded_groups, reference_groups, strict=True):
+        for key, value in loaded.items():
+            if isinstance(value, list) and isinstance(reference.get(key), tuple):
+                loaded[key] = tuple(value)
     return loaded_groups
 
 
-# -- save / load ----------------------------------------------------------
+# -- local save / load / validation --------------------------------------
 
 
 def save_checkpoint(
@@ -1665,13 +2350,18 @@ def save_checkpoint(
     config: Config,
     state: dict,
 ) -> Path:
-    """Write the four checkpoint files atomically-ish (tmp then rename)."""
+    """Write a complete candidate checkpoint using temporary files + rename."""
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
 
-    model_sd = clean_state_dict(model.state_dict())
-    model_sd = {k: v.detach().float().contiguous().cpu() for k, v in model_sd.items()}
-    ema_sd = {k: v.contiguous().cpu() for k, v in clean_state_dict(ema.state_dict()).items()}
+    model_state = clean_state_dict(model.state_dict())
+    model_state = {
+        key: value.detach().float().contiguous().cpu() for key, value in model_state.items()
+    }
+    ema_state = {
+        key: value.contiguous().cpu()
+        for key, value in clean_state_dict(ema.state_dict()).items()
+    }
     optim_tensors, param_groups = _flatten_optim(optimizer.state_dict())
 
     full_state = dict(state)
@@ -1680,18 +2370,58 @@ def save_checkpoint(
     full_state["torch_version"] = torch.__version__
 
     for name, payload in (
-        ("model.safetensors", model_sd),
-        ("ema.safetensors", ema_sd),
+        ("model.safetensors", model_state),
+        ("ema.safetensors", ema_state),
         ("optim.safetensors", optim_tensors),
     ):
-        tmp = directory / (name + ".tmp")
-        save_file(payload, str(tmp))
-        tmp.replace(directory / name)
+        temporary = directory / f"{name}.tmp"
+        save_file(payload, str(temporary))
+        temporary.replace(directory / name)
 
-    tmp = directory / "state.json.tmp"
-    tmp.write_text(json.dumps(full_state, indent=2))
-    tmp.replace(directory / "state.json")
+    temporary_state = directory / "state.json.tmp"
+    temporary_state.write_text(json.dumps(full_state, indent=2))
+    temporary_state.replace(directory / "state.json")
     return directory
+
+
+def validate_checkpoint(
+    directory: str | Path,
+    *,
+    expected_step: int | None = None,
+) -> dict[str, Any]:
+    """Validate candidate structure without reloading multi-GB tensor payloads.
+
+    Safetensors headers are opened and key sets are checked.  Tensor checksums
+    and file truncation are handled by the safetensors format itself when the
+    header is opened; this deliberately avoids a second 7+ GB device/CPU scan.
+    """
+    directory = Path(directory)
+    missing = [name for name in FILES if not (directory / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"checkpoint missing files: {missing}")
+
+    state = json.loads((directory / "state.json").read_text())
+    if "step" not in state or "config" not in state or "optim_param_groups" not in state:
+        raise ValueError("state.json lacks step/config/optim_param_groups")
+    step = int(state["step"])
+    if expected_step is not None and step != int(expected_step):
+        raise ValueError(f"candidate step {step} != expected {expected_step}")
+
+    key_sets: dict[str, set[str]] = {}
+    for name in ("model.safetensors", "ema.safetensors", "optim.safetensors"):
+        with safe_open(str(directory / name), framework="pt", device="cpu") as handle:
+            keys = set(handle.keys())
+        if not keys and name != "optim.safetensors":
+            raise ValueError(f"{name} contains no tensors")
+        key_sets[name] = keys
+
+    # EMA intentionally tracks named parameters, while model.state_dict() may
+    # also contain non-trainable buffers.  Therefore EMA keys must be a
+    # non-empty subset of model keys, not necessarily an exact match.
+    extra_ema = sorted(key_sets["ema.safetensors"] - key_sets["model.safetensors"])
+    if extra_ema:
+        raise ValueError(f"EMA contains keys absent from model: {extra_ema[:5]}")
+    return state
 
 
 def load_checkpoint(
@@ -1702,17 +2432,16 @@ def load_checkpoint(
     config: Config,
     allow_config_change: bool = False,
 ) -> dict:
-    """Load into the raw (unwrapped, uncompiled) model. Returns state."""
+    """Load raw model, EMA, and optimizer state from one committed checkpoint."""
     directory = Path(directory)
     state = json.loads((directory / "state.json").read_text())
 
-    stored_cfg = Config.from_dict(state["config"])
-    if stored_cfg != config and not allow_config_change:
+    stored_config = Config.from_dict(state["config"])
+    if stored_config != config and not allow_config_change:
         raise ValueError(
             "checkpoint config differs from current config -- a resumed run "
-            "must be the same experiment. Diff the state.json against "
-            "Config().to_json(), or pass allow_config_change=True if the "
-            "change is deliberate and documented."
+            "must be the same experiment. Diff state.json against Config().to_json(), "
+            "or pass allow_config_change=True only for a documented migration."
         )
 
     model.load_state_dict(load_file(str(directory / "model.safetensors")))
@@ -1726,53 +2455,247 @@ def load_checkpoint(
     return state
 
 
-# -- HF Hub ---------------------------------------------------------------
+def copy_checkpoint(source: str | Path, destination: str | Path) -> Path:
+    """Replace ``destination`` with a local copy of a complete checkpoint."""
+    source = Path(source)
+    destination = Path(destination)
+    validate_checkpoint(source)
+    shutil.rmtree(destination, ignore_errors=True)
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in FILES:
+        shutil.copy2(source / name, destination / name)
+    return destination
 
 
-def push_to_hub(directory: str | Path, repo_id: str, archive_step: int | None = None) -> None:
-    """Upload the checkpoint dir as the repo's 'latest'; optionally also
-    snapshot EMA+state under archive/step_XXXXXXX/ (kept forever -- the
-    top level is overwritten each run, but HF repos are git, so prior
-    revisions stay recoverable regardless)."""
-    from huggingface_hub import HfApi, create_repo
-
-    api = HfApi()
-    create_repo(repo_id, repo_type="model", exist_ok=True)
-    api.upload_folder(
-        folder_path=str(directory),
-        repo_id=repo_id,
-        repo_type="model",
-        commit_message="checkpoint: latest",
-    )
-    if archive_step is not None:
-        prefix = f"archive/step_{archive_step:07d}"
-        for name in ("ema.safetensors", "state.json"):
-            api.upload_file(
-                path_or_fileobj=str(Path(directory) / name),
-                path_in_repo=f"{prefix}/{name}",
-                repo_id=repo_id,
-                repo_type="model",
-                commit_message=f"checkpoint: archive step {archive_step}",
-            )
+# -- Hub pull / promotion -------------------------------------------------
 
 
-def pull_from_hub(repo_id: str, directory: str | Path) -> Path | None:
-    """Download the latest checkpoint files. Returns the local dir, or
-    None if the repo does not exist / has no checkpoint yet (fresh start)."""
+def pull_from_hub(
+    repo_id: str,
+    directory: str | Path,
+    *,
+    revision: str | None = None,
+) -> Path | None:
+    """Download one committed revision into a clean local directory."""
     from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
+    from huggingface_hub.errors import (
+        EntryNotFoundError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
 
     directory = Path(directory)
+    shutil.rmtree(directory, ignore_errors=True)
     directory.mkdir(parents=True, exist_ok=True)
     try:
         for name in FILES:
             hf_hub_download(
-                repo_id, name, repo_type="model",
+                repo_id,
+                name,
+                repo_type="model",
+                revision=revision,
                 local_dir=str(directory),
+                force_download=True,
             )
-    except (RepositoryNotFoundError, EntryNotFoundError):
+    except (RepositoryNotFoundError, EntryNotFoundError, RevisionNotFoundError):
+        shutil.rmtree(directory, ignore_errors=True)
         return None
+    validate_checkpoint(directory)
     return directory
+
+
+def push_to_hub(
+    directory: str | Path,
+    repo_id: str,
+    archive_step: int | None = None,
+    *,
+    commit_message: str = "checkpoint: promote healthy candidate",
+) -> str | None:
+    """Promote a validated candidate as Hub latest and return its commit id."""
+    from huggingface_hub import HfApi, create_repo
+
+    directory = Path(directory)
+    state = validate_checkpoint(directory)
+    step = int(state["step"])
+
+    api = HfApi()
+    create_repo(repo_id, repo_type="model", exist_ok=True)
+    info = api.upload_folder(
+        folder_path=str(directory),
+        repo_id=repo_id,
+        repo_type="model",
+        commit_message=f"{commit_message}: step {step}",
+    )
+    commit_id = getattr(info, "oid", None)
+
+    if archive_step is not None:
+        prefix = f"archive/step_{archive_step:07d}"
+        for name in ("ema.safetensors", "state.json"):
+            api.upload_file(
+                path_or_fileobj=str(directory / name),
+                path_in_repo=f"{prefix}/{name}",
+                repo_id=repo_id,
+                repo_type="model",
+                commit_message=f"checkpoint: archive healthy step {archive_step}",
+            )
+    return commit_id
+
+
+# -- revision inspection / legacy migration ------------------------------
+
+
+def _state_grad_reference(state: dict[str, Any]) -> float | None:
+    guard = state.get("guard_state", {})
+    if not isinstance(guard, dict):
+        return None
+
+    controller = guard.get("stability_controller")
+    if isinstance(controller, dict):
+        reference = controller.get("reference")
+        if isinstance(reference, dict):
+            value = reference.get("grad_median")
+            if value is not None and float(value) > 0.0:
+                return float(value)
+
+    # v1/v2 compatibility.
+    value = guard.get("grad_reference", guard.get("grad_ema"))
+    if value is None:
+        return None
+    value = float(value)
+    return value if value > 0.0 else None
+
+
+def _state_is_transactional(state: dict[str, Any]) -> bool:
+    guard = state.get("guard_state", {})
+    controller = guard.get("stability_controller") if isinstance(guard, dict) else None
+    return (
+        isinstance(controller, dict)
+        and int(controller.get("version", 0)) >= 3
+        and isinstance(controller.get("reference"), dict)
+    )
+
+
+def list_checkpoint_revisions(repo_id: str, *, max_commits: int = 20) -> list[CheckpointRevision]:
+    """Return newest unique checkpoint steps with their lightweight state.json."""
+    from huggingface_hub import HfApi, hf_hub_download
+
+    api = HfApi()
+    commits = list(api.list_repo_commits(repo_id, repo_type="model"))[:max_commits]
+    revisions: list[CheckpointRevision] = []
+    seen_steps: set[int] = set()
+    for commit in commits:
+        try:
+            path = hf_hub_download(
+                repo_id,
+                "state.json",
+                repo_type="model",
+                revision=commit.commit_id,
+                force_download=True,
+            )
+            state = json.loads(Path(path).read_text())
+            step = int(state["step"])
+        except Exception:  # noqa: BLE001 - revision ledgers may contain non-checkpoint commits
+            continue
+        if step in seen_steps:
+            continue
+        seen_steps.add(step)
+        revisions.append(
+            CheckpointRevision(
+                revision=commit.commit_id,
+                step=step,
+                grad_reference=_state_grad_reference(state),
+                state=state,
+            )
+        )
+    return revisions
+
+
+def resolve_revision_for_step(repo_id: str, step: int, *, max_commits: int = 200) -> str:
+    for item in list_checkpoint_revisions(repo_id, max_commits=max_commits):
+        if item.step == int(step):
+            return item.revision
+    raise ValueError(f"no checkpoint revision in {repo_id!r} reports step {step}")
+
+
+def infer_legacy_gradient_reference(
+    repo_id: str,
+    *,
+    before_step: int | None = None,
+    max_commits: int = 12,
+) -> float | None:
+    """Robustly infer a pre-v3 gradient baseline from prior committed states."""
+    values: list[float] = []
+    for item in list_checkpoint_revisions(repo_id, max_commits=max_commits):
+        if before_step is not None and item.step >= before_step:
+            continue
+        if item.grad_reference is not None:
+            values.append(item.grad_reference)
+    if not values:
+        return None
+    return float(statistics.median(values))
+
+
+def select_stable_resume_revision(
+    repo_id: str,
+    *,
+    suspect_ratio: float = 8.0,
+    max_commits: int = 12,
+) -> ResumeSelection:
+    """Auto-avoid a legacy latest checkpoint with a contaminated grad EMA.
+
+    Once v3 has promoted a checkpoint, latest is trusted because it already
+    passed transactional health gates.  This heuristic is only for migration
+    from v1/v2, where the 280K example saved a grad EMA thousands of units above
+    its recent historical scale.
+    """
+    try:
+        revisions = list_checkpoint_revisions(repo_id, max_commits=max_commits)
+    except Exception as exc:  # noqa: BLE001 - selection may legitimately target a fresh repo
+        return ResumeSelection(None, None, f"no readable checkpoint history: {exc!r}")
+    if not revisions:
+        return ResumeSelection(None, None, "no checkpoint found; fresh start")
+
+    latest = revisions[0]
+    if _state_is_transactional(latest.state):
+        return ResumeSelection(None, latest.step, "latest is a v3 transactional checkpoint")
+
+    historical = [
+        item.grad_reference
+        for item in revisions[1:]
+        if item.grad_reference is not None and item.grad_reference > 0.0
+    ]
+    current = latest.grad_reference
+    if current is None or not historical:
+        return ResumeSelection(None, latest.step, "insufficient legacy history; using latest")
+
+    baseline = float(statistics.median(historical))
+    ratio = current / max(baseline, 1e-30)
+    if ratio < suspect_ratio:
+        return ResumeSelection(
+            None,
+            latest.step,
+            f"legacy latest grad ratio {ratio:.2f}x is below {suspect_ratio:.2f}x",
+        )
+
+    acceptable = max(suspect_ratio / 2.0, 2.0)
+    for item in revisions[1:]:
+        if item.grad_reference is None:
+            continue
+        item_ratio = item.grad_reference / max(baseline, 1e-30)
+        if item_ratio <= acceptable:
+            return ResumeSelection(
+                item.revision,
+                item.step,
+                f"legacy latest step {latest.step} has grad reference {current:.2f} "
+                f"({ratio:.1f}x recent median {baseline:.2f}); selected prior step "
+                f"{item.step} with ratio {item_ratio:.2f}x",
+            )
+
+    return ResumeSelection(
+        None,
+        latest.step,
+        f"legacy latest appears suspect ({ratio:.1f}x), but no safer prior revision was found",
+    )
 ```
 
 ### `src/ditflex/config.py`
@@ -2662,30 +3585,19 @@ def build_model(cfg: ModelConfig, score_mod: ScoreMod | None = None) -> DiTTrans
 ### `src/ditflex/objective.py`
 
 ```python
-"""src/ditflex/objective.py -- DDPM eps and flow matching behind one interface.
+"""DDPM epsilon prediction and flow matching behind one deterministic interface.
 
-Both objectives expose  loss(model, x0, y) -> scalar , so train.py swaps
-them by name and nothing else changes -- the same discipline as the
-attention: when the DDPM and flow runs differ, the objective is the only
-difference.
+Both objectives expose ``loss(model, x0, y, generator=None) -> scalar``.  The
+optional generator makes every source of objective randomness deterministic in
+``(global_step, rank, retry_seed_offset)``:
 
-The interpolant/noising math lives in pure functions (add_noise,
-linear_interpolant, apply_label_dropout) so tests can check it exactly,
-without a model.
+* diffusion / flow timestep;
+* Gaussian noise;
+* classifier-free label dropout.
 
-Recipe notes:
-  - DDPM: linear betas 1e-4..0.02, T=1000, eps-prediction MSE.
-    DEVIATION: published DiT adds a VLB term on learned sigma; we train
-    eps-only (see ModelConfig.out_channels).
-  - Flow: linear interpolant x_t = (1-t) x0 + t eps, velocity target
-    v = eps - x0, t ~ Uniform(0,1)  (SiT parity -- NOT the logit-normal
-    used by the overfit smoke, which is a smoke-only shortcut).
-    Continuous timestep is passed as t * 1000.0 (float) through the same
-    embedder the DDPM branch uses; test_objective_math.py proves the
-    diffusers DiT accepts float timesteps, since that is an assumption,
-    not a documented guarantee.
-  - Label dropout to the null class (index num_classes) happens inside
-    loss(), because CFG-readiness is part of the training objective.
+This matters for transactional retries.  Re-running the same attempt reproduces
+the exact stochastic objective, while changing the retry seed offset changes
+all objective randomness together rather than changing only latent indices.
 """
 
 from __future__ import annotations
@@ -2694,6 +3606,51 @@ from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
+
+# -- deterministic RNG ----------------------------------------------------
+
+_MASK64 = (1 << 64) - 1
+_TORCH_SEED_MAX = (1 << 63) - 1
+
+
+def _splitmix64(value: int) -> int:
+    """Small stable 64-bit mixer; independent of Python's randomized hash()."""
+    z = (int(value) + 0x9E3779B97F4A7C15) & _MASK64
+    z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    z = ((z ^ (z >> 27)) * 0x94D049BB133111EB) & _MASK64
+    return (z ^ (z >> 31)) & _MASK64
+
+
+def objective_seed(base_seed: int, global_step: int, rank: int, seed_offset: int = 0) -> int:
+    """Return a deterministic torch seed for one objective batch.
+
+    Constants are namespace separators rather than cryptographic values.  The
+    function intentionally does not depend on world size, so a resumed run is
+    deterministic for each rank even if the number of ranks changes.
+    """
+    value = _splitmix64(base_seed)
+    value ^= _splitmix64(global_step + 0xD17F1E5)
+    value ^= _splitmix64(rank + 0x51A7)
+    value ^= _splitmix64(seed_offset + 0xC0FFEE)
+    seed = value % _TORCH_SEED_MAX
+    return int(seed if seed != 0 else 1)
+
+
+def make_step_generator(
+    device: torch.device | str,
+    *,
+    base_seed: int,
+    global_step: int,
+    rank: int,
+    seed_offset: int = 0,
+) -> torch.Generator:
+    """Create a device-local generator for one training step."""
+    device = torch.device(device)
+    generator_device = device if device.type == "cuda" else torch.device("cpu")
+    generator = torch.Generator(device=generator_device)
+    generator.manual_seed(objective_seed(base_seed, global_step, rank, seed_offset))
+    return generator
+
 
 # -- pure math, exactly testable -----------------------------------------
 
@@ -2707,19 +3664,28 @@ def add_noise(x0: torch.Tensor, eps: torch.Tensor, abar_t: torch.Tensor) -> torc
 def linear_interpolant(
     x0: torch.Tensor, eps: torch.Tensor, t: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """x_t = (1-t) x0 + t eps ; velocity target v = d/dt x_t = eps - x0."""
+    """x_t = (1-t) x0 + t eps; velocity target v = eps - x0."""
     tb = t.view(-1, 1, 1, 1)
     return (1.0 - tb) * x0 + tb * eps, eps - x0
 
 
 def apply_label_dropout(
-    y: torch.Tensor, p: float, null_index: int, generator: torch.Generator | None = None
+    y: torch.Tensor,
+    p: float,
+    null_index: int,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Replace labels with the CFG null class with probability p."""
+    """Replace labels with the classifier-free-guidance null class."""
     if p <= 0.0:
         return y
     drop = torch.rand(y.shape, device=y.device, generator=generator) < p
     return torch.where(drop, torch.full_like(y, null_index), y)
+
+
+def _randn_like(x: torch.Tensor, generator: torch.Generator | None) -> torch.Tensor:
+    # ``torch.randn_like(..., generator=...)`` has varied across torch builds;
+    # the explicit shape form is supported by every build used by this repo.
+    return torch.randn(x.shape, device=x.device, dtype=x.dtype, generator=generator)
 
 
 # -- objectives -----------------------------------------------------------
@@ -2738,18 +3704,39 @@ class DDPMObjective:
         key = str(device)
         if key not in self._abar_cache:
             betas = torch.linspace(
-                self.beta_start, self.beta_end, self.num_train_timesteps,
-                device=device, dtype=torch.float32,
+                self.beta_start,
+                self.beta_end,
+                self.num_train_timesteps,
+                device=device,
+                dtype=torch.float32,
             )
             self._abar_cache[key] = torch.cumprod(1.0 - betas, dim=0)
         return self._abar_cache[key]
 
-    def loss(self, model, x0: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def loss(
+        self,
+        model,
+        x0: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
         abar = self.alphas_cumprod(x0.device)
-        t = torch.randint(0, self.num_train_timesteps, (x0.shape[0],), device=x0.device)
-        eps = torch.randn_like(x0)
+        t = torch.randint(
+            0,
+            self.num_train_timesteps,
+            (x0.shape[0],),
+            device=x0.device,
+            generator=generator,
+        )
+        eps = _randn_like(x0, generator)
         xt = add_noise(x0, eps, abar[t])
-        y = apply_label_dropout(y, self.label_dropout, self.null_class)
+        y = apply_label_dropout(
+            y,
+            self.label_dropout,
+            self.null_class,
+            generator=generator,
+        )
         pred = model(hidden_states=xt, timestep=t, class_labels=y).sample
         return F.mse_loss(pred[:, : x0.shape[1]], eps)
 
@@ -2758,17 +3745,31 @@ class DDPMObjective:
 class FlowMatchingObjective:
     label_dropout: float = 0.1
     null_class: int = 1000
-    timestep_scale: float = 1000.0   # continuous t in [0,1] -> embedder scale
+    timestep_scale: float = 1000.0
 
-    def loss(self, model, x0: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        t = torch.rand(x0.shape[0], device=x0.device)   # Uniform: SiT parity
-        eps = torch.randn_like(x0)
-        xt, v = linear_interpolant(x0, eps, t)
-        y = apply_label_dropout(y, self.label_dropout, self.null_class)
+    def loss(
+        self,
+        model,
+        x0: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        t = torch.rand(x0.shape[0], device=x0.device, generator=generator)
+        eps = _randn_like(x0, generator)
+        xt, velocity = linear_interpolant(x0, eps, t)
+        y = apply_label_dropout(
+            y,
+            self.label_dropout,
+            self.null_class,
+            generator=generator,
+        )
         pred = model(
-            hidden_states=xt, timestep=t * self.timestep_scale, class_labels=y
+            hidden_states=xt,
+            timestep=t * self.timestep_scale,
+            class_labels=y,
         ).sample
-        return F.mse_loss(pred[:, : x0.shape[1]], v)
+        return F.mse_loss(pred[:, : x0.shape[1]], velocity)
 
 
 def build_objective(name: str, label_dropout: float = 0.1, num_classes: int = 1000):
@@ -2937,50 +3938,766 @@ def sample_and_push(
     return png
 ```
 
+### `src/ditflex/stability.py`
+
+```python
+"""Practical stability control for long DiT/SiT training runs.
+
+This module deliberately favors continuing a finite, loss-stable run over
+restarting because one noisy gradient statistic crossed a warning threshold.
+
+Policy summary
+--------------
+* Warning thresholds are diagnostic only.  Repeated warnings never become a
+  retry by themselves.
+* A retry requires a clear loss problem, a severe sustained median-gradient
+  shift, or multiple corroborating retry-level signals.
+* A large p90 or skip rate alone is not enough to roll back; heavy-tailed
+  gradients are expected in diffusion/flow training and are already bounded by
+  the per-step rejection guard and gradient clipping.
+* The reference remains frozen while a candidate is running, then moves slowly
+  after a successful checkpoint promotion.
+
+The public API is compatible with the v3 transactional trainer.  Version 4 can
+load v1/v2/v3 controller state and preserves the committed LR scale and health
+reference while adopting the less-picky decision policy.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import asdict, dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class StabilitySpec:
+    """Runtime-only stability and learning-rate settings."""
+
+    policy: str = "adaptive"  # constant | cosine | adaptive
+    total_steps: int = 400_000
+    base_lr: float = 1e-4
+    min_lr: float = 1e-5
+    hard_min_lr: float = 1e-6
+    min_scale: float = 0.03125
+
+    commit_patience_windows: int = 2
+    warning_patience_windows: int = 2  # logging cadence only in v4
+
+    loss_warn_ratio: float = 1.015
+    loss_retry_ratio: float = 1.025
+    loss_emergency_ratio: float = 1.05
+
+    grad_warn_ratio: float = 2.0
+    grad_retry_ratio: float = 4.0
+    grad_emergency_ratio: float = 8.0
+    grad_p90_warn_ratio: float = 2.5
+    grad_p90_retry_ratio: float = 5.0
+    grad_p90_emergency_ratio: float = 10.0
+
+    skip_warn_rate: float = 0.05
+    skip_retry_rate: float = 0.10
+    skip_emergency_rate: float = 0.20
+
+    # A promoted reference can adapt to a genuinely healthy new regime.
+    reference_decay: float = 0.80
+    loss_reference_max_growth: float = 1.01
+    grad_reference_max_growth: float = 1.50
+
+    def __post_init__(self) -> None:
+        if self.policy not in {"constant", "cosine", "adaptive"}:
+            raise ValueError(f"unknown LR policy: {self.policy!r}")
+        if self.total_steps <= 0:
+            raise ValueError("total_steps must be positive")
+        if self.base_lr <= 0.0:
+            raise ValueError("base_lr must be positive")
+        if not (0.0 <= self.min_lr <= self.base_lr):
+            raise ValueError("min_lr must lie in [0, base_lr]")
+        if not (0.0 < self.hard_min_lr <= self.base_lr):
+            raise ValueError("hard_min_lr must lie in (0, base_lr]")
+        if not (0.0 < self.min_scale <= 1.0):
+            raise ValueError("min_scale must lie in (0, 1]")
+        if self.commit_patience_windows <= 0 or self.warning_patience_windows <= 0:
+            raise ValueError("window patience values must be positive")
+        if not (
+            1.0 < self.loss_warn_ratio < self.loss_retry_ratio < self.loss_emergency_ratio
+        ):
+            raise ValueError("loss ratios must satisfy 1 < warn < retry < emergency")
+        if not (1.0 < self.grad_warn_ratio < self.grad_retry_ratio < self.grad_emergency_ratio):
+            raise ValueError("gradient ratios must satisfy 1 < warn < retry < emergency")
+        if not (
+            1.0
+            < self.grad_p90_warn_ratio
+            < self.grad_p90_retry_ratio
+            < self.grad_p90_emergency_ratio
+        ):
+            raise ValueError("gradient-p90 ratios must satisfy 1 < warn < retry < emergency")
+        if not (
+            0.0 <= self.skip_warn_rate < self.skip_retry_rate < self.skip_emergency_rate <= 1.0
+        ):
+            raise ValueError("skip rates must satisfy 0 <= warn < retry < emergency <= 1")
+        if not (0.0 <= self.reference_decay < 1.0):
+            raise ValueError("reference_decay must lie in [0, 1)")
+        if self.loss_reference_max_growth < 1.0 or self.grad_reference_max_growth < 1.0:
+            raise ValueError("reference growth caps must be at least 1")
+
+
+@dataclass(frozen=True)
+class WindowMetrics:
+    """One non-overlapping, globally synchronized stability window."""
+
+    loss: float
+    grad_median: float
+    grad_p90: float
+    skip_rate: float
+    relative_spike_rate: float = 0.0
+
+    def __post_init__(self) -> None:
+        values = (self.loss, self.grad_median, self.grad_p90, self.skip_rate)
+        if not all(math.isfinite(float(value)) for value in values):
+            raise ValueError(f"non-finite window metrics: {self}")
+        if self.loss < 0.0 or self.grad_median < 0.0 or self.grad_p90 < 0.0:
+            raise ValueError(f"negative window metric: {self}")
+        if not (0.0 <= self.skip_rate <= 1.0):
+            raise ValueError(f"invalid skip rate: {self.skip_rate}")
+        if not (0.0 <= self.relative_spike_rate <= 1.0):
+            raise ValueError(f"invalid relative-spike rate: {self.relative_spike_rate}")
+
+    def state_dict(self) -> dict[str, float]:
+        return asdict(self)
+
+    @classmethod
+    def from_state_dict(cls, state: dict[str, Any]) -> WindowMetrics:
+        return cls(
+            loss=float(state["loss"]),
+            grad_median=float(state["grad_median"]),
+            grad_p90=float(state["grad_p90"]),
+            skip_rate=float(state.get("skip_rate", 0.0)),
+            relative_spike_rate=float(state.get("relative_spike_rate", 0.0)),
+        )
+
+
+@dataclass(frozen=True)
+class HealthReference:
+    """Definition of normality from the last promoted checkpoint."""
+
+    loss: float
+    grad_median: float
+    grad_p90: float
+    step: int
+    promotions: int = 1
+
+    def state_dict(self) -> dict[str, float | int]:
+        return asdict(self)
+
+    @classmethod
+    def from_state_dict(cls, state: dict[str, Any]) -> HealthReference:
+        return cls(
+            loss=float(state["loss"]),
+            grad_median=float(state["grad_median"]),
+            grad_p90=float(state["grad_p90"]),
+            step=int(state.get("step", 0)),
+            promotions=int(state.get("promotions", 1)),
+        )
+
+
+@dataclass(frozen=True)
+class StabilityEvent:
+    """Decision after a candidate window."""
+
+    action: str = "none"  # none | warn | retry | fatal
+    reason: str = ""
+    healthy_windows: int = 0
+    warning_windows: int = 0
+    loss_ratio: float = 1.0
+    grad_ratio: float = 1.0
+    grad_p90_ratio: float = 1.0
+
+    @property
+    def should_retry(self) -> bool:
+        return self.action == "retry"
+
+    @property
+    def should_abort(self) -> bool:
+        return self.action == "fatal"
+
+    @property
+    def promotion_ready(self) -> bool:
+        return self.action in {"none", "warn"} and self.healthy_windows > 0
+
+
+class AdaptiveLrController:
+    """Resume-safe LR controller with deliberately tolerant health decisions."""
+
+    VERSION = 4
+
+    def __init__(
+        self,
+        spec: StabilitySpec,
+        *,
+        start_step: int,
+        checkpoint_lr: float,
+        attempt_factor: float = 1.0,
+        initial_loss: float | None = None,
+        legacy_best_loss: float | None = None,
+    ) -> None:
+        if not (0.0 < attempt_factor <= 1.0):
+            raise ValueError("attempt_factor must lie in (0, 1]")
+        self.spec = spec
+
+        envelope = self.envelope_lr(start_step)
+        if spec.policy == "adaptive":
+            inherited = checkpoint_lr / max(envelope, 1e-30)
+            floor = spec.hard_min_lr / max(envelope, 1e-30)
+            self.committed_scale = min(1.0, max(floor, inherited))
+        else:
+            self.committed_scale = 1.0
+        self.attempt_factor = float(attempt_factor)
+
+        self.reference: HealthReference | None = None
+        self.last_metrics: WindowMetrics | None = None
+        self.last_loss_ratio = 1.0
+        self.last_grad_ratio = 1.0
+        self.last_grad_p90_ratio = 1.0
+        self.healthy_windows = 0
+        self.warning_windows = 0
+        self.retry_windows = 0
+        self.windows_seen = 0
+        self.retry_count = 0
+
+        self.fast_loss = initial_loss
+        self.slow_loss = initial_loss
+        if initial_loss is None:
+            self.best_loss = legacy_best_loss
+        elif legacy_best_loss is None:
+            self.best_loss = initial_loss
+        else:
+            self.best_loss = min(initial_loss, legacy_best_loss)
+
+    # -- learning rate -------------------------------------------------
+
+    @property
+    def scale(self) -> float:
+        if self.spec.policy != "adaptive":
+            return 1.0
+        return max(self.spec.min_scale, self.committed_scale * self.attempt_factor)
+
+    def envelope_lr(self, step: int) -> float:
+        if self.spec.policy == "constant":
+            return self.spec.base_lr
+        progress = min(max(int(step), 0), self.spec.total_steps) / self.spec.total_steps
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self.spec.min_lr + (self.spec.base_lr - self.spec.min_lr) * cosine
+
+    def lr_at(self, step: int) -> float:
+        envelope = self.envelope_lr(step)
+        if self.spec.policy != "adaptive":
+            return envelope
+        return max(self.spec.hard_min_lr, envelope * self.scale)
+
+    def apply(self, optimizer: Any, step: int) -> float:
+        lr = self.lr_at(step)
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+        return lr
+
+    def commit_attempt_scale(self) -> None:
+        if self.spec.policy == "adaptive":
+            self.committed_scale = self.scale
+        self.attempt_factor = 1.0
+
+    # -- reference and per-step guard ----------------------------------
+
+    def bootstrap_reference(
+        self,
+        *,
+        loss: float,
+        grad_median: float,
+        grad_p90: float | None,
+        step: int,
+    ) -> None:
+        if self.reference is not None:
+            return
+        median = max(float(grad_median), 1e-12)
+        p90 = max(float(grad_p90 if grad_p90 is not None else median * 2.0), median)
+        self.reference = HealthReference(
+            loss=max(float(loss), 1e-12),
+            grad_median=median,
+            grad_p90=p90,
+            step=int(step),
+        )
+
+    def grad_limit(self, spike_multiple: float) -> float | None:
+        """Return a frozen pre-clip outlier threshold.
+
+        The threshold is intentionally based on both median and upper-tail
+        history.  It does not chase the live EMA during a candidate run.
+        """
+        if spike_multiple <= 0.0 or self.reference is None:
+            return None
+        return max(
+            float(spike_multiple) * self.reference.grad_median,
+            4.0 * self.reference.grad_p90,
+        )
+
+    # -- decisions -----------------------------------------------------
+
+    def _ratios(self, metrics: WindowMetrics) -> tuple[float, float, float]:
+        assert self.reference is not None
+        eps = 1e-30
+        return (
+            metrics.loss / max(self.reference.loss, eps),
+            metrics.grad_median / max(self.reference.grad_median, eps),
+            metrics.grad_p90 / max(self.reference.grad_p90, eps),
+        )
+
+    def _warning_reasons(
+        self,
+        metrics: WindowMetrics,
+        loss_ratio: float,
+        grad_ratio: float,
+        p90_ratio: float,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if loss_ratio >= self.spec.loss_warn_ratio:
+            reasons.append(f"loss ratio {loss_ratio:.3f} >= {self.spec.loss_warn_ratio:.3f}")
+        if grad_ratio >= self.spec.grad_warn_ratio:
+            reasons.append(
+                f"grad-median ratio {grad_ratio:.2f} >= {self.spec.grad_warn_ratio:.2f}"
+            )
+        if p90_ratio >= self.spec.grad_p90_warn_ratio:
+            reasons.append(
+                f"grad-p90 ratio {p90_ratio:.2f} >= {self.spec.grad_p90_warn_ratio:.2f}"
+            )
+        if metrics.skip_rate >= self.spec.skip_warn_rate:
+            reasons.append(
+                f"skip rate {metrics.skip_rate:.1%} >= {self.spec.skip_warn_rate:.1%}"
+            )
+        return reasons
+
+    def _emergency_reasons(
+        self,
+        metrics: WindowMetrics,
+        loss_ratio: float,
+        grad_ratio: float,
+        p90_ratio: float,
+    ) -> list[str]:
+        reasons: list[str] = []
+
+        # Loss and median-gradient emergencies are independently meaningful.
+        if loss_ratio >= self.spec.loss_emergency_ratio:
+            reasons.append(
+                f"loss ratio {loss_ratio:.3f} >= {self.spec.loss_emergency_ratio:.3f}"
+            )
+        if grad_ratio >= self.spec.grad_emergency_ratio:
+            reasons.append(
+                f"grad-median ratio {grad_ratio:.2f} >= {self.spec.grad_emergency_ratio:.2f}"
+            )
+
+        # A noisy tail or many rejected batches must be corroborated before it
+        # can terminate a run.
+        if (
+            p90_ratio >= self.spec.grad_p90_emergency_ratio
+            and grad_ratio >= self.spec.grad_warn_ratio
+        ):
+            reasons.append(
+                f"grad-p90 ratio {p90_ratio:.2f} >= "
+                f"{self.spec.grad_p90_emergency_ratio:.2f} with elevated median"
+            )
+        if (
+            metrics.skip_rate >= self.spec.skip_emergency_rate
+            and (
+                loss_ratio >= self.spec.loss_warn_ratio
+                or grad_ratio >= self.spec.grad_warn_ratio
+            )
+        ):
+            reasons.append(
+                f"skip rate {metrics.skip_rate:.1%} >= "
+                f"{self.spec.skip_emergency_rate:.1%} with corroborating drift"
+            )
+        return reasons
+
+    def _retry_reasons(
+        self,
+        metrics: WindowMetrics,
+        loss_ratio: float,
+        grad_ratio: float,
+        p90_ratio: float,
+    ) -> list[str]:
+        reasons: list[str] = []
+
+        # Loss drift is the strongest signal and can stand alone.
+        if loss_ratio >= self.spec.loss_retry_ratio:
+            reasons.append(f"loss ratio {loss_ratio:.3f} >= {self.spec.loss_retry_ratio:.3f}")
+
+        # Median-gradient drift can stand alone only at the retry threshold.
+        if grad_ratio >= self.spec.grad_retry_ratio:
+            reasons.append(
+                f"grad-median ratio {grad_ratio:.2f} >= {self.spec.grad_retry_ratio:.2f}"
+            )
+
+        # p90 and skip-rate conditions are too noisy to stand alone.  Require
+        # corroboration from loss or the central gradient distribution.
+        if (
+            p90_ratio >= self.spec.grad_p90_retry_ratio
+            and (
+                loss_ratio >= self.spec.loss_warn_ratio
+                or grad_ratio >= self.spec.grad_warn_ratio
+            )
+        ):
+            reasons.append(
+                f"grad-p90 ratio {p90_ratio:.2f} >= "
+                f"{self.spec.grad_p90_retry_ratio:.2f} with corroborating drift"
+            )
+        if (
+            metrics.skip_rate >= self.spec.skip_retry_rate
+            and (
+                loss_ratio >= self.spec.loss_warn_ratio
+                or grad_ratio >= self.spec.grad_warn_ratio
+            )
+        ):
+            reasons.append(
+                f"skip rate {metrics.skip_rate:.1%} >= "
+                f"{self.spec.skip_retry_rate:.1%} with corroborating drift"
+            )
+        return reasons
+
+    def observe_window(self, metrics: WindowMetrics) -> StabilityEvent:
+        self.windows_seen += 1
+        self.last_metrics = metrics
+
+        if self.fast_loss is None:
+            self.fast_loss = metrics.loss
+            self.slow_loss = metrics.loss
+            self.best_loss = metrics.loss
+        else:
+            assert self.slow_loss is not None
+            self.fast_loss = 0.80 * self.fast_loss + 0.20 * metrics.loss
+            self.slow_loss = 0.98 * self.slow_loss + 0.02 * metrics.loss
+            self.best_loss = min(self.best_loss or self.fast_loss, self.fast_loss)
+
+        if self.reference is None:
+            self.bootstrap_reference(
+                loss=metrics.loss,
+                grad_median=max(metrics.grad_median, 1e-12),
+                grad_p90=max(metrics.grad_p90, metrics.grad_median, 1e-12),
+                step=0,
+            )
+            self.healthy_windows = 1
+            self.warning_windows = 0
+            self.retry_windows = 0
+            return StabilityEvent(
+                action="none",
+                reason="bootstrapped committed health reference",
+                healthy_windows=1,
+            )
+
+        loss_ratio, grad_ratio, p90_ratio = self._ratios(metrics)
+        self.last_loss_ratio = loss_ratio
+        self.last_grad_ratio = grad_ratio
+        self.last_grad_p90_ratio = p90_ratio
+
+        emergency = self._emergency_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+        if emergency:
+            self.healthy_windows = 0
+            self.warning_windows += 1
+            self.retry_windows += 1
+            self.retry_count += 1
+            return StabilityEvent(
+                action="retry",
+                reason="emergency candidate rejection: " + "; ".join(emergency),
+                warning_windows=self.warning_windows,
+                loss_ratio=loss_ratio,
+                grad_ratio=grad_ratio,
+                grad_p90_ratio=p90_ratio,
+            )
+
+        retry_reasons = self._retry_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+        warnings = self._warning_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+
+        if retry_reasons:
+            self.healthy_windows = 0
+            self.warning_windows += 1
+            self.retry_windows += 1
+            if self.retry_windows >= self.spec.warning_patience_windows:
+                self.retry_count += 1
+                return StabilityEvent(
+                    action="retry",
+                    reason="persistent corroborated instability: " + "; ".join(retry_reasons),
+                    warning_windows=self.warning_windows,
+                    loss_ratio=loss_ratio,
+                    grad_ratio=grad_ratio,
+                    grad_p90_ratio=p90_ratio,
+                )
+            return StabilityEvent(
+                action="warn",
+                reason=(
+                    f"retry-level signal {self.retry_windows}/"
+                    f"{self.spec.warning_patience_windows}: " + "; ".join(retry_reasons)
+                ),
+                warning_windows=self.warning_windows,
+                loss_ratio=loss_ratio,
+                grad_ratio=grad_ratio,
+                grad_p90_ratio=p90_ratio,
+            )
+
+        # Any acceptable window clears retry persistence.  Warning-only windows
+        # still count toward checkpoint promotion because they are explicitly
+        # below the retry policy.
+        self.retry_windows = 0
+        self.healthy_windows += 1
+
+        if warnings:
+            self.warning_windows += 1
+            return StabilityEvent(
+                action="warn",
+                reason="diagnostic warning; continuing: " + "; ".join(warnings),
+                healthy_windows=self.healthy_windows,
+                warning_windows=self.warning_windows,
+                loss_ratio=loss_ratio,
+                grad_ratio=grad_ratio,
+                grad_p90_ratio=p90_ratio,
+            )
+
+        self.warning_windows = 0
+        return StabilityEvent(
+            action="none",
+            reason="stable",
+            healthy_windows=self.healthy_windows,
+            loss_ratio=loss_ratio,
+            grad_ratio=grad_ratio,
+            grad_p90_ratio=p90_ratio,
+        )
+
+    def checkpoint_is_healthy(
+        self,
+        metrics: WindowMetrics | None = None,
+        *,
+        required_windows: int | None = None,
+    ) -> tuple[bool, str]:
+        metrics = metrics or self.last_metrics
+        if metrics is None:
+            return False, "no complete stability window yet"
+        if self.reference is None:
+            return False, "no committed health reference"
+
+        required = (
+            self.spec.commit_patience_windows
+            if required_windows is None
+            else max(1, int(required_windows))
+        )
+        if self.healthy_windows < required:
+            return False, f"only {self.healthy_windows}/{required} acceptable windows"
+
+        loss_ratio, grad_ratio, p90_ratio = self._ratios(metrics)
+        emergency = self._emergency_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+        retry = self._retry_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+        if emergency:
+            return False, "emergency metrics: " + "; ".join(emergency)
+        if retry:
+            return False, "retry-level metrics: " + "; ".join(retry)
+
+        warnings = self._warning_reasons(metrics, loss_ratio, grad_ratio, p90_ratio)
+        if warnings:
+            return True, "acceptable candidate with diagnostic warnings"
+        return True, "stable candidate"
+
+    @staticmethod
+    def _bounded_reference_update(
+        old: float,
+        new: float,
+        *,
+        decay: float,
+        max_growth: float,
+    ) -> float:
+        candidate = decay * old + (1.0 - decay) * new
+        return min(candidate, old * max_growth)
+
+    def commit_candidate(self, step: int, metrics: WindowMetrics) -> HealthReference:
+        self.commit_attempt_scale()
+        if self.reference is None:
+            reference = HealthReference(
+                loss=max(metrics.loss, 1e-12),
+                grad_median=max(metrics.grad_median, 1e-12),
+                grad_p90=max(metrics.grad_p90, metrics.grad_median, 1e-12),
+                step=int(step),
+            )
+        else:
+            old = self.reference
+            reference = HealthReference(
+                loss=self._bounded_reference_update(
+                    old.loss,
+                    metrics.loss,
+                    decay=self.spec.reference_decay,
+                    max_growth=self.spec.loss_reference_max_growth,
+                ),
+                grad_median=self._bounded_reference_update(
+                    old.grad_median,
+                    metrics.grad_median,
+                    decay=self.spec.reference_decay,
+                    max_growth=self.spec.grad_reference_max_growth,
+                ),
+                grad_p90=self._bounded_reference_update(
+                    old.grad_p90,
+                    metrics.grad_p90,
+                    decay=self.spec.reference_decay,
+                    max_growth=self.spec.grad_reference_max_growth,
+                ),
+                step=int(step),
+                promotions=old.promotions + 1,
+            )
+        self.reference = reference
+        self.healthy_windows = 0
+        self.warning_windows = 0
+        self.retry_windows = 0
+        return reference
+
+    # -- persistence ---------------------------------------------------
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "scale": self.scale,
+            "committed_scale": self.committed_scale,
+            "attempt_factor": self.attempt_factor,
+            "fast_loss": self.fast_loss,
+            "slow_loss": self.slow_loss,
+            "best_loss": self.best_loss,
+            "loss_ratio": self.last_loss_ratio,
+            "grad_ratio": self.last_grad_ratio,
+            "grad_p90_ratio": self.last_grad_p90_ratio,
+            "healthy_windows": self.healthy_windows,
+            "warning_windows": self.warning_windows,
+            "retry_windows": self.retry_windows,
+            "retry_count": self.retry_count,
+            "reference": None if self.reference is None else self.reference.state_dict(),
+        }
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.VERSION,
+            "spec": asdict(self.spec),
+            "committed_scale": self.committed_scale,
+            "attempt_factor": self.attempt_factor,
+            "fast_loss": self.fast_loss,
+            "slow_loss": self.slow_loss,
+            "best_loss": self.best_loss,
+            "reference": None if self.reference is None else self.reference.state_dict(),
+            "last_metrics": None if self.last_metrics is None else self.last_metrics.state_dict(),
+            "last_loss_ratio": self.last_loss_ratio,
+            "last_grad_ratio": self.last_grad_ratio,
+            "last_grad_p90_ratio": self.last_grad_p90_ratio,
+            "healthy_windows": self.healthy_windows,
+            "warning_windows": self.warning_windows,
+            "retry_windows": self.retry_windows,
+            "windows_seen": self.windows_seen,
+            "retry_count": self.retry_count,
+        }
+
+    def load_state_dict(
+        self,
+        state: dict[str, Any],
+        *,
+        attempt_factor: float | None = None,
+    ) -> None:
+        version = int(state.get("version", 1))
+        if version not in {1, 2, 3, self.VERSION}:
+            raise ValueError(
+                f"unsupported stability state version {version}; "
+                "use --reset-lr-controller only for a deliberate migration"
+            )
+
+        stored_spec_data = dict(state.get("spec", {}))
+
+        # Policy thresholds are intentionally allowed to change across v4
+        # adoption.  Only LR schedule fields must remain resume-compatible.
+        for name in ("policy", "total_steps", "base_lr", "min_lr", "hard_min_lr"):
+            if name in stored_spec_data and stored_spec_data[name] != getattr(self.spec, name):
+                raise ValueError(
+                    f"persisted LR setting {name}={stored_spec_data[name]!r} differs from "
+                    f"requested {getattr(self.spec, name)!r}; use --reset-lr-controller "
+                    "only when that LR change is deliberate"
+                )
+
+        if version < 3:
+            self.committed_scale = float(state.get("scale", self.committed_scale))
+        else:
+            self.committed_scale = float(
+                state.get("committed_scale", state.get("scale", self.committed_scale))
+            )
+            ref_state = state.get("reference")
+            if isinstance(ref_state, dict):
+                self.reference = HealthReference.from_state_dict(ref_state)
+            metrics_state = state.get("last_metrics")
+            if isinstance(metrics_state, dict):
+                self.last_metrics = WindowMetrics.from_state_dict(metrics_state)
+            self.last_loss_ratio = float(state.get("last_loss_ratio", 1.0))
+            self.last_grad_ratio = float(state.get("last_grad_ratio", 1.0))
+            self.last_grad_p90_ratio = float(state.get("last_grad_p90_ratio", 1.0))
+            self.healthy_windows = int(state.get("healthy_windows", 0))
+            self.warning_windows = int(state.get("warning_windows", 0))
+            self.windows_seen = int(state.get("windows_seen", 0))
+            self.retry_count = int(state.get("retry_count", 0))
+
+        # Do not inherit v3's warning-to-retry momentum.
+        self.retry_windows = 0
+        self.fast_loss = _optional_float(state.get("fast_loss", self.fast_loss))
+        self.slow_loss = _optional_float(state.get("slow_loss", self.slow_loss))
+        self.best_loss = _optional_float(state.get("best_loss", self.best_loss))
+
+        if attempt_factor is not None:
+            if not (0.0 < attempt_factor <= 1.0):
+                raise ValueError("attempt_factor must lie in (0, 1]")
+            self.attempt_factor = float(attempt_factor)
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+```
+
 ### `src/ditflex/train.py`
 
 ```python
-"""src/ditflex/train.py -- time-boxed DDP training loop.
+"""Transactional, time-boxed DiT/SiT training.
 
-Launched by run/modal_train.py via torchrun:
+Each torchrun process trains a *candidate* from a committed Hub checkpoint.
+Candidate progress is promoted only after consecutive windows pass both loss
+and robust gradient-distribution gates.  A bad candidate exits with code 75
+without saving; ``run/modal_train.py`` then starts a fresh torchrun process from
+the last promoted checkpoint with a lower LR multiplier and a changed,
+deterministic objective/data seed.
 
-    python -m torch.distributed.run --nproc-per-node=8 --standalone \
-        -m ditflex.train --train-seconds 7200 --objective ddpm
-
-Long training is many short runs: pull latest checkpoint from the Hub
-(if any) -> train until the wall-clock budget is spent -> save -> push ->
-exit. Data sampling is stateless in (global_step, rank), and the numerical
-stability guards are checkpointed so they also survive run boundaries.
-
-Order of operations:
-    build raw model -> load checkpoint into it -> EMA on raw params
-    -> torch.compile(model) -> DDP-wrap the compiled module
-
-Stability deviations from the published DiT/SiT recipes:
-    * global gradient clipping;
-    * relative and absolute raw-gradient spike rejection;
-    * non-finite loss/gradient rejection before optimizer.step();
-    * finite-loss collapse detection;
-    * periodic and final checkpoint health gates;
-    * guard-state persistence across chained runs;
-    * rank-synchronised safety decisions under DDP.
+This is intentionally not a broad ``try/except`` recovery loop.  The observed
+failure stayed finite while the pre-clip gradient median moved by orders of
+magnitude, so recovery must be driven by explicit health metrics rather than by
+exceptions alone.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
+import shutil
+import statistics
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from pathlib import Path
 
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from ditflex.checkpoint import (
+    copy_checkpoint,
+    infer_legacy_gradient_reference,
     load_checkpoint,
     pull_from_hub,
     push_to_hub,
+    resolve_revision_for_step,
     save_checkpoint,
+    validate_checkpoint,
 )
 from ditflex.config import Config
 from ditflex.distributed import (
@@ -2989,123 +4706,96 @@ from ditflex.distributed import (
     barrier,
     broadcast_flag,
     broadcast_float,
-    broadcast_int,
     cleanup,
     setup,
 )
 from ditflex.ema import EMA
 from ditflex.latents import LatentStore
 from ditflex.model import build_model
-from ditflex.objective import build_objective
+from ditflex.objective import build_objective, make_step_generator
+from ditflex.stability import AdaptiveLrController, StabilitySpec, WindowMetrics
 
-CKPT_DIR = "/tmp/ditflex_ckpt"
+CKPT_DIR = "/tmp/ditflex_ckpt"  # committed checkpoint pulled from Hub
+CANDIDATE_DIR = "/tmp/ditflex_candidate"
+RETRY_MARKER = "/tmp/ditflex_retry.json"
+PROMOTION_MARKER = "/tmp/ditflex_promotion.json"
+RETRY_EXIT_CODE = 75
 LOG_EVERY = 50
 LOSS_WINDOW = 200
-DIVERGENCE_MULTIPLIER = 1.60
-CHECKPOINT_HEALTH_MULTIPLIER = 1.10
 GRAD_EMA_DECAY = 0.99
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser()
-    p.add_argument("--train-seconds", type=int, required=True)
-    p.add_argument("--objective", choices=["ddpm", "flow"], required=True)
-    p.add_argument(
-        "--hub-repo",
-        type=str,
-        default=None,
-        help="override cfg.hub.checkpoint_repo",
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train-seconds", type=int, required=True)
+    parser.add_argument("--objective", choices=["ddpm", "flow"], required=True)
+    parser.add_argument("--hub-repo", type=str, default=None)
+    parser.add_argument("--resume-revision", type=str, default="")
+    parser.add_argument("--resume-step", type=int, default=0)
+    parser.add_argument("--no-push", action="store_true")
+    parser.add_argument("--max-latent-files", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--target-steps", type=int, default=400_000)
+
+    # Resume-safe global-step schedule.  Retry LR reductions are supplied by
+    # the parent process as --attempt-lr-factor and become permanent only after
+    # a healthy candidate is promoted.
+    parser.add_argument("--lr", type=float, default=0.0)
+    parser.add_argument(
+        "--lr-policy",
+        choices=["constant", "cosine", "adaptive"],
+        default="adaptive",
     )
-    p.add_argument(
-        "--no-push",
-        action="store_true",
-        help="skip the Hub upload (local smokes)",
-    )
-    p.add_argument(
-        "--max-latent-files",
-        type=int,
-        default=None,
-        help="load only the first N latent shards (smokes)",
-    )
-    p.add_argument(
-        "--max-steps",
-        type=int,
-        default=None,
-        help="hard step cap regardless of wall clock (smokes)",
-    )
-    p.add_argument(
-        "--lr",
+    parser.add_argument("--lr-min", type=float, default=1e-5)
+    parser.add_argument("--lr-hard-min", type=float, default=1e-6)
+    parser.add_argument("--lr-min-scale", type=float, default=0.03125)
+    parser.add_argument("--attempt", type=int, default=0)
+    parser.add_argument("--attempt-lr-factor", type=float, default=1.0)
+    parser.add_argument("--reset-lr-controller", action="store_true")
+
+    # Transactional health thresholds.  The old v2 --loss-rise-ratio is
+    # accepted as a no-op compatibility flag by the Modal wrapper, not here.
+    parser.add_argument("--commit-windows", type=int, default=2)
+    parser.add_argument("--warning-patience", type=int, default=2)
+    parser.add_argument("--loss-warn-ratio", type=float, default=1.015)
+    parser.add_argument("--loss-retry-ratio", type=float, default=1.025)
+    parser.add_argument("--loss-emergency-ratio", type=float, default=1.05)
+    parser.add_argument("--grad-warn-ratio", type=float, default=2.0)
+    parser.add_argument("--grad-retry-ratio", type=float, default=4.0)
+    parser.add_argument("--grad-emergency-ratio", type=float, default=8.0)
+    parser.add_argument("--grad-p90-warn-ratio", type=float, default=2.5)
+    parser.add_argument("--grad-p90-retry-ratio", type=float, default=5.0)
+    parser.add_argument("--grad-p90-emergency-ratio", type=float, default=10.0)
+    parser.add_argument("--skip-warn-rate", type=float, default=0.05)
+    parser.add_argument("--skip-retry-rate", type=float, default=0.10)
+    parser.add_argument("--skip-emergency-rate", type=float, default=0.20)
+
+    # Migration / gradient guards.
+    parser.add_argument(
+        "--grad-reference",
         type=float,
         default=0.0,
-        help=(
-            "override the learning rate for THIS RUN (0 = keep the "
-            "config/checkpoint value). Applied to optimizer param groups only, "
-            "after checkpoint load; cfg.train.lr is not modified."
-        ),
+        help="explicit committed gradient-median reference (0 = checkpoint/history)",
     )
-    p.add_argument(
-        "--wd",
-        type=float,
-        default=-1.0,
-        help=(
-            "override AdamW weight decay for THIS RUN (-1 = keep config/checkpoint "
-            "value). Applied to optimizer param groups only, after checkpoint load."
-        ),
+    parser.add_argument(
+        "--no-auto-infer-grad-reference",
+        action="store_false",
+        dest="auto_infer_grad_reference",
+        help="disable legacy reference inference from earlier Hub revisions",
     )
-    p.add_argument(
-        "--grad-ceiling",
-        type=float,
-        default=25.0,
-        help=(
-            "absolute raw-gradient-norm skip ceiling; refuse any step whose norm "
-            "exceeds this value, regardless of the running EMA (0 = off)"
-        ),
-    )
-    p.add_argument(
-        "--seed-offset",
-        type=int,
-        default=0,
-        help="runtime-only offset added to the data base seed",
-    )
-    p.add_argument(
-        "--clip",
-        type=float,
-        default=1.0,
-        help="gradient-clip max norm for this run",
-    )
-    p.add_argument(
-        "--spike-skip",
-        type=float,
-        default=4.0,
-        help=(
-            "skip the optimizer step when the pre-clip gradient norm exceeds this "
-            "factor times its running EMA (0 = off)"
-        ),
-    )
-    p.add_argument(
-        "--qk-mode",
-        choices=["amap", "dmap"],
-        default="amap",
-        help=(
-            "amap = baseline directed attention; dmap = diffusion-map attention "
-            "(W_K tied to W_Q, R == 0, plus density correction)"
-        ),
-    )
-    p.add_argument(
-        "--dmap-alpha",
-        type=float,
-        default=0.0,
-        help="density-correction exponent for --qk-mode=dmap",
-    )
-    p.add_argument(
-        "--sample-count",
-        type=int,
-        default=16,
-        help="images to sample after a healthy final save (0 disables)",
-    )
-    p.add_argument("--sample-steps", type=int, default=50)
-    p.add_argument("--cfg-scale", type=float, default=4.0)
-    return p.parse_args()
+    parser.set_defaults(auto_infer_grad_reference=True)
+    parser.add_argument("--wd", type=float, default=-1.0)
+    parser.add_argument("--clip", type=float, default=1.0)
+    parser.add_argument("--spike-skip", type=float, default=4.0)
+    parser.add_argument("--grad-ceiling", type=float, default=0.0)
+    parser.add_argument("--seed-offset", type=int, default=0)
+
+    parser.add_argument("--qk-mode", choices=["amap", "dmap"], default="amap")
+    parser.add_argument("--dmap-alpha", type=float, default=0.0)
+    parser.add_argument("--sample-count", type=int, default=16)
+    parser.add_argument("--sample-steps", type=int, default=50)
+    parser.add_argument("--cfg-scale", type=float, default=4.0)
+    return parser.parse_args()
 
 
 def _optional_float(value: object) -> float | None:
@@ -3114,10 +4804,41 @@ def _optional_float(value: object) -> float | None:
     return float(value)
 
 
+def _percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        raise ValueError("cannot compute percentile of an empty list")
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * quantile
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _write_json_atomic(path: str | Path, payload: dict) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2))
+    temporary.replace(path)
+
+
 def main() -> int:
     args = parse_args()
-    ctx = setup()
+    if args.target_steps <= 0:
+        raise ValueError("--target-steps must be positive")
+    if args.train_seconds <= 0:
+        raise ValueError("--train-seconds must be positive")
+    if args.resume_step > 0 and args.resume_revision:
+        raise ValueError("use only one of --resume-step or --resume-revision")
+    if not (0.0 < args.attempt_lr_factor <= 1.0):
+        raise ValueError("--attempt-lr-factor must lie in (0, 1]")
 
+    ctx = setup()
     cfg = Config()
     cfg.train.objective = args.objective
     cfg.model.qk_mode = args.qk_mode
@@ -3132,80 +4853,186 @@ def main() -> int:
     if ctx.is_rank0:
         print(f"[train] world={ctx.world}  per_rank_batch={per_rank_batch}")
         print(cfg.to_json())
+        Path(RETRY_MARKER).unlink(missing_ok=True)
+        shutil.rmtree(CANDIDATE_DIR, ignore_errors=True)
 
-    # -- checkpoint pull (rank 0 downloads, shared FS on one node) -------
+    # -- pull one committed anchor ------------------------------------------
+    resume_revision = args.resume_revision or None
+    if ctx.is_rank0 and args.resume_step > 0:
+        resume_revision = resolve_revision_for_step(cfg.hub.checkpoint_repo, args.resume_step)
+        print(
+            f"[train] resolved resume step {args.resume_step:,} to revision "
+            f"{resume_revision[:12]}"
+        )
+
     resume_dir = None
     if ctx.is_rank0:
-        resume_dir = pull_from_hub(cfg.hub.checkpoint_repo, CKPT_DIR)
-        print(f"[train] resume checkpoint: {resume_dir or 'none (fresh start)'}")
+        resume_dir = pull_from_hub(
+            cfg.hub.checkpoint_repo,
+            CKPT_DIR,
+            revision=resume_revision,
+        )
+        source = "latest" if resume_revision is None else resume_revision[:12]
+        print(f"[train] resume checkpoint ({source}): {resume_dir or 'none (fresh start)'}")
     barrier(ctx)
     if not ctx.is_rank0 and os.path.exists(os.path.join(CKPT_DIR, "state.json")):
         resume_dir = CKPT_DIR
 
-    # -- model / ema / optimizer, load BEFORE compile/wrap ---------------
+    # -- raw model / EMA / optimizer, loaded before compile + DDP -----------
     if cfg.model.qk_mode == "amap":
         model = build_model(cfg.model).to(ctx.device)
     elif cfg.model.qk_mode == "dmap":
         from ditflex.diffusion_model import build_dmap_model
 
         model = build_dmap_model(cfg.model).to(ctx.device)
-    else:
+    else:  # pragma: no cover
         raise ValueError(f"unknown qk_mode: {cfg.model.qk_mode!r}")
 
     ema = EMA(model, cfg.train.ema_decay).to(ctx.device)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay
+        model.parameters(),
+        lr=cfg.train.lr,
+        weight_decay=cfg.train.weight_decay,
     )
 
     start_step = 0
-    run_history: list = []
+    run_history: list[dict] = []
     guard_state: dict = {}
     if resume_dir is not None:
         state = load_checkpoint(resume_dir, model, ema, optimizer, cfg)
         start_step = int(state["step"])
-        run_history = state.get("run_history", [])
-        guard_state = state.get("guard_state", {})
+        run_history = list(state.get("run_history", []))
+        guard_state = dict(state.get("guard_state", {}))
         if ctx.is_rank0:
             print(f"[train] resumed at step {start_step:,}")
 
-    if args.lr > 0.0:
-        for group in optimizer.param_groups:
-            group["lr"] = args.lr
-        if ctx.is_rank0:
-            print(
-                f"[train] LR OVERRIDE for this run: {args.lr:g} "
-                f"(config value {cfg.train.lr:g} unchanged; drift guard unaffected)"
+    live_grad_ema = _optional_float(guard_state.get("live_grad_ema", guard_state.get("grad_ema")))
+    spikes_total = int(guard_state.get("spikes_total", 0))
+    recent_losses = [float(value) for value in guard_state.get("recent_losses", [])][-LOSS_WINDOW:]
+    initial_loss = (
+        statistics.fmean(recent_losses[-LOSS_WINDOW:])
+        if len(recent_losses) >= LOSS_WINDOW
+        else None
+    )
+
+    checkpoint_lr = float(optimizer.param_groups[0]["lr"])
+    base_lr = args.lr if args.lr > 0.0 else cfg.train.lr
+    stability_spec = StabilitySpec(
+        policy=args.lr_policy,
+        total_steps=args.target_steps,
+        base_lr=base_lr,
+        min_lr=args.lr_min,
+        hard_min_lr=args.lr_hard_min,
+        min_scale=args.lr_min_scale,
+        commit_patience_windows=args.commit_windows,
+        warning_patience_windows=args.warning_patience,
+        loss_warn_ratio=args.loss_warn_ratio,
+        loss_retry_ratio=args.loss_retry_ratio,
+        loss_emergency_ratio=args.loss_emergency_ratio,
+        grad_warn_ratio=args.grad_warn_ratio,
+        grad_retry_ratio=args.grad_retry_ratio,
+        grad_emergency_ratio=args.grad_emergency_ratio,
+        grad_p90_warn_ratio=args.grad_p90_warn_ratio,
+        grad_p90_retry_ratio=args.grad_p90_retry_ratio,
+        grad_p90_emergency_ratio=args.grad_p90_emergency_ratio,
+        skip_warn_rate=args.skip_warn_rate,
+        skip_retry_rate=args.skip_retry_rate,
+        skip_emergency_rate=args.skip_emergency_rate,
+    )
+    legacy_best = _optional_float(guard_state.get("best_window"))
+    seed_lr = base_lr if args.reset_lr_controller else checkpoint_lr
+    controller = AdaptiveLrController(
+        stability_spec,
+        start_step=start_step,
+        checkpoint_lr=seed_lr,
+        attempt_factor=args.attempt_lr_factor,
+        initial_loss=initial_loss,
+        legacy_best_loss=legacy_best,
+    )
+
+    controller_state = guard_state.get("stability_controller", guard_state.get("lr_controller"))
+    if isinstance(controller_state, dict) and not args.reset_lr_controller:
+        controller.load_state_dict(
+            controller_state,
+            attempt_factor=args.attempt_lr_factor,
+        )
+    elif isinstance(controller_state, dict) and ctx.is_rank0:
+        print("[train] RESETTING persisted stability/LR controller by explicit request")
+
+    # v1/v2 migration: derive a frozen gradient baseline from earlier Hub
+    # revisions instead of trusting a potentially contaminated latest grad EMA.
+    if controller.reference is None and initial_loss is not None:
+        inferred_reference: float | None = None
+        if args.grad_reference > 0.0:
+            inferred_reference = args.grad_reference
+            if ctx.is_rank0:
+                print(f"[train] using explicit grad reference {inferred_reference:g}")
+        elif args.auto_infer_grad_reference and resume_dir is not None:
+            if ctx.is_rank0:
+                try:
+                    inferred_reference = infer_legacy_gradient_reference(
+                        cfg.hub.checkpoint_repo,
+                        before_step=start_step,
+                    )
+                except Exception as exc:  # noqa: BLE001 - migration can fall back locally
+                    print(f"[train] legacy grad-reference inference failed: {exc!r}")
+                    inferred_reference = None
+            inferred_value = -1.0 if inferred_reference is None else inferred_reference
+            inferred_value = broadcast_float(ctx, inferred_value if ctx.is_rank0 else 0.0)
+            inferred_reference = None if inferred_value <= 0.0 else inferred_value
+            if ctx.is_rank0 and inferred_reference is not None:
+                print(
+                    f"[train] inferred committed grad reference {inferred_reference:.2f} "
+                    "from earlier Hub revisions"
+                )
+        if inferred_reference is not None and live_grad_ema is not None:
+            # Trust the selected checkpoint's own legacy EMA when it remains
+            # within a bounded multiple of history.  Cap rather than discard a
+            # contaminated value (for example 3,500 vs a recent scale near 60).
+            historical = inferred_reference
+            inferred_reference = min(live_grad_ema, historical * 4.0)
+            if ctx.is_rank0:
+                print(
+                    f"[train] legacy reference migration: live={live_grad_ema:.2f}  "
+                    f"history={historical:.2f}  committed={inferred_reference:.2f}"
+                )
+        elif inferred_reference is None:
+            inferred_reference = live_grad_ema
+        if inferred_reference is not None and inferred_reference > 0.0:
+            legacy_p90 = _optional_float(guard_state.get("grad_p90_reference"))
+            controller.bootstrap_reference(
+                loss=initial_loss,
+                grad_median=inferred_reference,
+                grad_p90=legacy_p90 or inferred_reference * 2.0,
+                step=start_step,
             )
+
     if args.wd >= 0.0:
         for group in optimizer.param_groups:
             group["weight_decay"] = args.wd
         if ctx.is_rank0:
-            print(
-                f"[train] WD OVERRIDE for this run: {args.wd:g} "
-                "(decoupled AdamW decay; drift guard unaffected)"
-            )
+            print(f"[train] WD OVERRIDE for this run: {args.wd:g}")
 
-    # Restore numerical guard history. Old checkpoints simply start with
-    # empty guard state and become fully persistent at the next healthy save.
-    grad_ema = _optional_float(guard_state.get("grad_ema"))
-    best_window = _optional_float(guard_state.get("best_window"))
-    blown_windows = int(guard_state.get("blown_windows", 0))
-    spikes_total = int(guard_state.get("spikes_total", 0))
-    recent_losses = [float(x) for x in guard_state.get("recent_losses", [])]
-    recent_losses = recent_losses[-LOSS_WINDOW:]
-    spikes_at_start = spikes_total
-
+    start_lr = controller.apply(optimizer, start_step)
     if ctx.is_rank0:
+        reference = None if controller.reference is None else controller.reference.state_dict()
         print(
-            "[train] guard state: "
-            f"grad_ema={grad_ema if grad_ema is not None else 'unset'}  "
-            f"best_window={best_window if best_window is not None else 'unset'}  "
-            f"blown_windows={blown_windows}  spikes_total={spikes_total}  "
-            f"recent_losses={len(recent_losses)}"
+            f"[train] attempt={args.attempt}  LR policy={stability_spec.policy}  "
+            f"base={stability_spec.base_lr:g}  cosine_min={stability_spec.min_lr:g}  "
+            f"hard_min={stability_spec.hard_min_lr:g}  target={stability_spec.total_steps:,}  "
+            f"committed_scale={controller.committed_scale:.4f}  "
+            f"attempt_factor={controller.attempt_factor:.4f}  scale={controller.scale:.4f}  "
+            f"effective@{start_step:,}={start_lr:g}  checkpoint_lr={checkpoint_lr:g}"
+        )
+        print(
+            "[train] transactional guard: "
+            f"live_grad_ema={live_grad_ema if live_grad_ema is not None else 'unset'}  "
+            f"spikes_total={spikes_total}  recent_losses={len(recent_losses)}  "
+            f"reference={reference}"
         )
 
-    # -- latents: rank 0 warms the HF cache, then everyone loads ---------
-    store_kw = dict(
+    # -- data and compiled model --------------------------------------------
+    store_kwargs = dict(
         repo_id=cfg.data.hub_repo,
         device=ctx.device,
         max_files=args.max_latent_files,
@@ -3214,10 +5041,10 @@ def main() -> int:
         num_classes=cfg.model.num_classes,
     )
     if ctx.is_rank0:
-        store = LatentStore.from_hub(**store_kw)
+        store = LatentStore.from_hub(**store_kwargs)
     barrier(ctx)
     if not ctx.is_rank0:
-        store = LatentStore.from_hub(**store_kw)
+        store = LatentStore.from_hub(**store_kwargs)
     if ctx.is_rank0:
         print(
             f"[train] latents resident: {len(store):,} "
@@ -3229,92 +5056,193 @@ def main() -> int:
         label_dropout=cfg.train.label_dropout,
         num_classes=cfg.model.num_classes,
     )
-
-    # -- compile inner, then DDP-wrap (README order; version-sensitive) --
     compiled = torch.compile(model)
     wrapped = DDP(compiled, device_ids=[ctx.local_rank]) if ctx.is_distributed else compiled
-
-    # -- the loop --------------------------------------------------------
-    step = start_step
-    t_start = time.time()
-    deadline = t_start + args.train_seconds
-    run_losses: list[float] = []
-    last_archive_bucket = start_step // cfg.hub.archive_every_steps
-    last_log_time = t_start
     wrapped.train()
 
-    def current_window() -> float | None:
+    # -- candidate loop state -----------------------------------------------
+    step = start_step
+    segment_start = start_step
+    t_start = time.time()
+    segment_start_time = t_start
+    deadline = t_start + args.train_seconds
+    run_losses: list[float] = []
+    window_grad_norms: list[float] = []
+    window_skips = 0
+    window_relative_spikes = 0
+    # Candidate health must be established from new steps, never inherited.
+    last_metrics: WindowMetrics | None = None
+    last_log_time = t_start
+    last_archive_bucket = (
+        start_step // cfg.hub.archive_every_steps
+        if cfg.hub.archive_every_steps > 0
+        else 0
+    )
+    promotions_this_run = 0
+    spikes_at_segment_start = spikes_total
+
+    def current_loss_window() -> float | None:
         if len(recent_losses) < LOSS_WINDOW:
             return None
-        return sum(recent_losses[-LOSS_WINDOW:]) / LOSS_WINDOW
+        return statistics.fmean(recent_losses[-LOSS_WINDOW:])
 
-    def checkpoint_is_healthy() -> tuple[bool, float | None]:
-        window = current_window()
-        if best_window is None or window is None:
-            return True, window
-        return window <= CHECKPOINT_HEALTH_MULTIPLIER * best_window, window
+    def required_commit_windows() -> int:
+        # Preserve the repository's 200-step quick-resume smoke while requiring
+        # two windows for production candidates.
+        if args.max_steps is not None and args.max_steps <= LOSS_WINDOW:
+            return 1
+        return stability_spec.commit_patience_windows
+
+    def checkpoint_is_healthy() -> tuple[bool, str]:
+        return controller.checkpoint_is_healthy(
+            last_metrics,
+            required_windows=required_commit_windows(),
+        )
 
     def serialized_guard_state() -> dict:
         return {
-            "version": 1,
-            "grad_ema": grad_ema,
-            "best_window": best_window,
-            "blown_windows": blown_windows,
+            "version": 3,
+            "live_grad_ema": live_grad_ema,
+            # Compatibility name for existing dashboards and recovery tools.
+            "grad_ema": live_grad_ema,
+            "grad_reference": (
+                None if controller.reference is None else controller.reference.grad_median
+            ),
+            "grad_p90_reference": (
+                None if controller.reference is None else controller.reference.grad_p90
+            ),
             "spikes_total": spikes_total,
             "recent_losses": recent_losses[-LOSS_WINDOW:],
             "loss_window": LOSS_WINDOW,
             "grad_ema_decay": GRAD_EMA_DECAY,
-            "divergence_multiplier": DIVERGENCE_MULTIPLIER,
-            "checkpoint_health_multiplier": CHECKPOINT_HEALTH_MULTIPLIER,
+            "stability_controller": controller.state_dict(),
+            "best_window": controller.best_loss,
+            "blown_windows": controller.warning_windows,
         }
 
-    def run_record(end_step: int, completed: bool) -> dict:
-        return {
-            "start_step": start_step,
-            "end_step": end_step,
-            "seconds": round(time.time() - t_start, 1),
-            "world": ctx.world,
-            "objective": cfg.train.objective,
-            "completed": completed,
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "effective": {
-                "lr": optimizer.param_groups[0]["lr"],
-                "weight_decay": optimizer.param_groups[0]["weight_decay"],
-                "clip": args.clip,
-                "spike_skip": args.spike_skip,
-                "steps_skipped_this_run": spikes_total - spikes_at_start,
-                "steps_skipped_total": spikes_total,
-                "seed_offset": args.seed_offset,
-                "grad_ceiling": args.grad_ceiling,
-            },
-        }
+    def append_run_record(end_step: int, completed: bool, reason: str) -> None:
+        nonlocal segment_start, segment_start_time, spikes_at_segment_start
+        run_history.append(
+            {
+                "start_step": segment_start,
+                "end_step": end_step,
+                "seconds": round(time.time() - segment_start_time, 1),
+                "world": ctx.world,
+                "objective": cfg.train.objective,
+                "completed": completed,
+                "finished_at": datetime.now(UTC).isoformat(),
+                "promotion_reason": reason,
+                "effective": {
+                    "attempt": args.attempt,
+                    "lr_policy": stability_spec.policy,
+                    "lr_base": stability_spec.base_lr,
+                    "lr_start": start_lr if segment_start == start_step else None,
+                    "lr_end": float(optimizer.param_groups[0]["lr"]),
+                    "lr_min": stability_spec.min_lr,
+                    "lr_hard_min": stability_spec.hard_min_lr,
+                    "lr_scale": controller.scale,
+                    "weight_decay": optimizer.param_groups[0]["weight_decay"],
+                    "clip": args.clip,
+                    "spike_skip": args.spike_skip,
+                    "grad_ceiling": args.grad_ceiling,
+                    "steps_skipped": spikes_total - spikes_at_segment_start,
+                    "seed_offset": args.seed_offset,
+                    "target_steps": args.target_steps,
+                },
+            }
+        )
+        segment_start = end_step
+        segment_start_time = time.time()
+        spikes_at_segment_start = spikes_total
 
-    def save_and_push(at_step: int, completed: bool) -> None:
-        """Save a checkpoint from rank 0 after the caller's health decision."""
-        nonlocal last_archive_bucket
-        state = {
-            "step": at_step,
-            "run_history": run_history + [run_record(at_step, completed)],
-            "guard_state": serialized_guard_state(),
-        }
-        save_checkpoint(CKPT_DIR, model, ema, optimizer, cfg, state)
-        tag = "final" if completed else "periodic"
-        print(f"[train] saved step {at_step:,} ({tag})")
-        if not args.no_push:
-            bucket = at_step // cfg.hub.archive_every_steps
-            archive = at_step if bucket != last_archive_bucket else None
-            last_archive_bucket = bucket
-            push_to_hub(CKPT_DIR, cfg.hub.checkpoint_repo, archive_step=archive)
-            print(f"[train] pushed to {cfg.hub.checkpoint_repo}")
+    def save_and_promote(at_step: int, completed: bool, reason: str) -> None:
+        nonlocal last_archive_bucket, promotions_this_run
+        assert last_metrics is not None
 
-    def abort_all(message: str, code: int = 1) -> int:
+        # Every rank must advance the frozen reference and retry LR state
+        # identically before training continues.  Only rank 0 performs I/O.
+        reference = controller.commit_candidate(at_step, last_metrics)
+        commit_id = None
         if ctx.is_rank0:
-            print(message)
+            append_run_record(at_step, completed, reason)
+            state = {
+                "step": at_step,
+                "run_history": run_history,
+                "guard_state": serialized_guard_state(),
+                "transaction": {
+                    "status": "committed",
+                    "committed_at": datetime.now(UTC).isoformat(),
+                    "attempt": args.attempt,
+                    "health_reference": reference.state_dict(),
+                },
+            }
+            shutil.rmtree(CANDIDATE_DIR, ignore_errors=True)
+            save_checkpoint(CANDIDATE_DIR, model, ema, optimizer, cfg, state)
+            validate_checkpoint(CANDIDATE_DIR, expected_step=at_step)
+            print(f"[train] validated candidate step {at_step:,} ({reason})")
+
+            if not args.no_push:
+                archive_step = None
+                if cfg.hub.archive_every_steps > 0:
+                    bucket = at_step // cfg.hub.archive_every_steps
+                    archive_step = at_step if bucket != last_archive_bucket else None
+                    last_archive_bucket = bucket
+                commit_id = push_to_hub(
+                    CANDIDATE_DIR,
+                    cfg.hub.checkpoint_repo,
+                    archive_step=archive_step,
+                    commit_message="checkpoint: promote transactional candidate",
+                )
+                print(
+                    f"[train] PROMOTED step {at_step:,} to {cfg.hub.checkpoint_repo}"
+                    + (f" revision={commit_id[:12]}" if commit_id else "")
+                )
+            else:
+                copy_checkpoint(CANDIDATE_DIR, CKPT_DIR)
+                print(f"[train] promoted local no-push candidate step {at_step:,}")
+
+            _write_json_atomic(
+                PROMOTION_MARKER,
+                {
+                    "step": at_step,
+                    "revision": commit_id,
+                    "attempt": args.attempt,
+                    "repo": cfg.hub.checkpoint_repo,
+                },
+            )
+        promotions_this_run += 1
+        barrier(ctx)
+
+    def retry_all(reason: str, metrics: WindowMetrics | None = None) -> int:
+        if ctx.is_rank0:
+            payload = {
+                "exit_code": RETRY_EXIT_CODE,
+                "attempt": args.attempt,
+                "start_step": start_step,
+                "failed_step": step,
+                "reason": reason,
+                "seed_offset": args.seed_offset,
+                "lr": float(optimizer.param_groups[0]["lr"]),
+                "reference": (
+                    None if controller.reference is None else controller.reference.state_dict()
+                ),
+                "metrics": None if metrics is None else metrics.state_dict(),
+                "promotions_this_run": promotions_this_run,
+                "elapsed_training_seconds": round(time.time() - t_start, 3),
+            }
+            _write_json_atomic(RETRY_MARKER, payload)
+            print(
+                f"[train] RETRYABLE INSTABILITY @ {step:,}: {reason}; "
+                "candidate discarded, Hub latest unchanged"
+            )
         barrier(ctx)
         cleanup(ctx)
-        return code
+        return RETRY_EXIT_CODE
 
+    # -- stepping ------------------------------------------------------------
     while True:
+        if step >= args.target_steps:
+            break
         if step % cfg.train.deadline_check_every == 0 and step > start_step:
             stop = ctx.is_rank0 and time.time() >= deadline
             if broadcast_flag(ctx, stop):
@@ -3322,90 +5250,96 @@ def main() -> int:
         if args.max_steps is not None and (step - start_step) >= args.max_steps:
             break
 
-        x0, y = store.batch(
+        controller.apply(optimizer, step)
+        x0, labels = store.batch(
             step,
             ctx.rank,
             per_rank_batch,
             cfg.train.base_seed + args.seed_offset,
         )
+        objective_generator = make_step_generator(
+            ctx.device,
+            base_seed=cfg.train.base_seed,
+            global_step=step,
+            rank=ctx.rank,
+            seed_offset=args.seed_offset,
+        )
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            loss = objective.loss(wrapped, x0, y)
+            loss = objective.loss(
+                wrapped,
+                x0,
+                labels,
+                generator=objective_generator,
+            )
 
-        # Every rank must agree before any rank enters backward. Otherwise a
-        # rank-local NaN exit can strand its peers inside a DDP collective.
         local_loss_finite = bool(torch.isfinite(loss.detach()).all().item())
         loss_finite = all_reduce_bool_and(ctx, local_loss_finite)
         if not loss_finite:
             local_value = float(loss.detach().float().item())
-            return abort_all(
-                f"[train] step {step:,}: non-finite loss detected "
-                f"(rank-0 local loss={local_value}) -- aborting WITHOUT saving."
+            return retry_all(
+                f"non-finite loss (rank-0 local={local_value}) before backward"
             )
-
-        # Use the global batch's mean loss for every guard and log. This keeps
-        # guard history identical on all ranks and makes rank-0 decisions valid.
         global_loss = all_reduce_mean(ctx, loss)
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-
-        # clip_grad_norm_ returns the raw pre-clip global norm. Do not use
-        # error_if_nonfinite=True here: explicit rank-synchronised handling is
-        # safer than allowing one process to raise before its peers.
         grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
             max_norm=args.clip,
             error_if_nonfinite=False,
         )
-        grad_norm = float(grad_norm_tensor.detach().float().item())
-        grads_finite = all_reduce_bool_and(ctx, bool(torch.isfinite(grad_norm_tensor).item()))
+        grads_finite = all_reduce_bool_and(
+            ctx,
+            bool(torch.isfinite(grad_norm_tensor).item()),
+        )
         if not grads_finite:
             optimizer.zero_grad(set_to_none=True)
-            return abort_all(
-                f"[train] step {step:,}: non-finite gradient norm detected "
-                "-- aborting BEFORE optimizer.step and WITHOUT saving."
+            return retry_all("non-finite gradient norm before optimizer.step")
+
+        grad_norm = float(grad_norm_tensor.detach().float().item())
+        grad_norm = broadcast_float(ctx, grad_norm if ctx.is_rank0 else 0.0)
+        window_grad_norms.append(grad_norm)
+
+        # Diagnostic only: update on every finite batch with bounded influence.
+        if live_grad_ema is None:
+            live_grad_ema = grad_norm
+        else:
+            ema_input = min(grad_norm, max(live_grad_ema * 10.0, 1e-12))
+            live_grad_ema = (
+                GRAD_EMA_DECAY * live_grad_ema
+                + (1.0 - GRAD_EMA_DECAY) * ema_input
             )
 
-        # DDP should already make gradients identical. Broadcasting the measured
-        # norm keeps the persisted EMA bit-for-bit aligned even if kernels report
-        # tiny rank-local rounding differences.
-        grad_norm = broadcast_float(ctx, grad_norm if ctx.is_rank0 else 0.0)
-
-        # Rank 0 owns the decision; everybody receives the same answer.
-        relative_spike = (
-            args.spike_skip > 0.0
-            and grad_ema is not None
-            and grad_norm > args.spike_skip * grad_ema
-        )
+        frozen_limit = controller.grad_limit(args.spike_skip)
+        relative_spike = frozen_limit is not None and grad_norm > frozen_limit
         absolute_spike = args.grad_ceiling > 0.0 and grad_norm > args.grad_ceiling
-        spike_decision = relative_spike or absolute_spike if ctx.is_rank0 else False
+        spike_decision = (relative_spike or absolute_spike) if ctx.is_rank0 else False
         spiked = broadcast_flag(ctx, spike_decision)
 
         if spiked:
             optimizer.zero_grad(set_to_none=True)
             spikes_total += 1
+            window_skips += 1
+            if relative_spike:
+                window_relative_spikes += 1
             if ctx.is_rank0:
                 reasons: list[str] = []
                 if relative_spike:
                     reasons.append(
-                        f"relative {grad_norm:.2f} > {args.spike_skip:g}x EMA {grad_ema:.2f}"
+                        f"relative {grad_norm:.2f} > frozen limit {frozen_limit:.2f}"
                     )
                 if absolute_spike:
-                    reasons.append(f"absolute {grad_norm:.2f} > ceiling {args.grad_ceiling:g}")
-                reason = " and ".join(reasons) if reasons else "rank-0 spike decision"
-                ema_text = "unset" if grad_ema is None else f"{grad_ema:.2f}"
+                    reasons.append(
+                        f"absolute {grad_norm:.2f} > ceiling {args.grad_ceiling:g}"
+                    )
                 print(
-                    f"[train] step {step:,}: {reason}; grad EMA={ema_text} "
-                    f"-- SKIPPING optimizer step (total skipped: {spikes_total})"
+                    f"[train] step {step:,}: {' and '.join(reasons)}; "
+                    f"live EMA={live_grad_ema:.2f} -- SKIPPING optimizer step "
+                    f"(total skipped: {spikes_total})"
                 )
         else:
             optimizer.step()
             ema.update(model)
-            grad_ema = (
-                grad_norm
-                if grad_ema is None
-                else GRAD_EMA_DECAY * grad_ema + (1.0 - GRAD_EMA_DECAY) * grad_norm
-            )
 
         run_losses.append(global_loss)
         recent_losses.append(global_loss)
@@ -3413,121 +5347,143 @@ def main() -> int:
             del recent_losses[:-LOSS_WINDOW]
         step += 1
 
-        # Evaluate one non-overlapping global window every LOSS_WINDOW data
-        # steps. The state is persistent, so a warning window at the end of one
-        # Modal invocation remains active at the beginning of the next.
-        if step % LOSS_WINDOW == 0 and len(recent_losses) >= LOSS_WINDOW:
-            window = current_window()
-            assert window is not None
-            diverged = False
-            if ctx.is_rank0:
-                if best_window is None or window < best_window:
-                    best_window = window
-                    blown_windows = 0
-                elif window > DIVERGENCE_MULTIPLIER * best_window:
-                    blown_windows += 1
-                    diverged = blown_windows >= 2
-                else:
-                    blown_windows = 0
-            # Rank 0 has updated the state. Broadcast the small state scalars so
-            # every rank serialises identical guards and evaluates identically.
-            best_value = -1.0 if best_window is None else best_window
-            best_value = broadcast_float(ctx, best_value if ctx.is_rank0 else 0.0)
-            best_window = None if best_value < 0.0 else best_value
-            blown_windows = broadcast_int(
-                ctx, blown_windows if ctx.is_rank0 else 0
+        # Every rank has the same reduced loss and broadcast gradient norm, so
+        # window metrics and controller state remain identical without extra
+        # collectives.
+        if len(window_grad_norms) >= LOSS_WINDOW:
+            window_loss = current_loss_window()
+            assert window_loss is not None
+            last_metrics = WindowMetrics(
+                loss=window_loss,
+                grad_median=float(statistics.median(window_grad_norms[-LOSS_WINDOW:])),
+                grad_p90=_percentile(window_grad_norms[-LOSS_WINDOW:], 0.90),
+                skip_rate=window_skips / LOSS_WINDOW,
+                relative_spike_rate=window_relative_spikes / LOSS_WINDOW,
             )
-            diverged = broadcast_flag(ctx, diverged if ctx.is_rank0 else False)
-            if diverged:
-                return abort_all(
-                    f"[train] step {step:,}: windowed loss {window:.4f} > "
-                    f"{DIVERGENCE_MULTIPLIER:.2f}x best {best_window:.4f} for "
-                    "2 consecutive windows -- DIVERGENCE, aborting WITHOUT saving."
-                )
+            event = controller.observe_window(last_metrics)
+            window_grad_norms.clear()
+            window_skips = 0
+            window_relative_spikes = 0
 
-        # Periodic checkpoint: rank 0 decides health, broadcasts it, then every
-        # rank reaches the same barrier regardless of whether the push occurs.
+            if ctx.is_rank0:
+                print(
+                    f"[train] stability window @ {step:,}: "
+                    f"loss={last_metrics.loss:.6f}  "
+                    f"grad_med={last_metrics.grad_median:.2f}  "
+                    f"grad_p90={last_metrics.grad_p90:.2f}  "
+                    f"skips={last_metrics.skip_rate:.1%}  "
+                    f"ratios(loss={event.loss_ratio:.3f}, grad={event.grad_ratio:.2f}, "
+                    f"p90={event.grad_p90_ratio:.2f})  {event.reason}"
+                )
+            retry_decision = broadcast_flag(
+                ctx,
+                event.should_retry if ctx.is_rank0 else False,
+            )
+            fatal_decision = broadcast_flag(
+                ctx,
+                event.should_abort if ctx.is_rank0 else False,
+            )
+            if retry_decision or fatal_decision:
+                return retry_all(event.reason, last_metrics)
+
         if cfg.hub.save_every_steps > 0 and step % cfg.hub.save_every_steps == 0:
             healthy = False
-            window = current_window()
+            reason = "rank-0 health decision"
             if ctx.is_rank0:
-                healthy, window = checkpoint_is_healthy()
+                healthy, reason = checkpoint_is_healthy()
                 if not healthy:
-                    assert window is not None and best_window is not None
                     print(
-                        f"[train] step {step:,}: windowed loss {window:.4f} > "
-                        f"{CHECKPOINT_HEALTH_MULTIPLIER:.2f}x best "
-                        f"{best_window:.4f} -- WITHHOLDING periodic checkpoint"
+                        f"[train] WITHHOLDING candidate step {step:,}: {reason}; "
+                        "Hub latest remains committed"
                     )
             healthy = broadcast_flag(ctx, healthy)
-            if ctx.is_rank0 and healthy:
-                save_and_push(step, completed=False)
-            barrier(ctx)
+            if healthy:
+                save_and_promote(step, completed=False, reason="periodic healthy candidate")
+            else:
+                barrier(ctx)
 
         if ctx.is_rank0 and step % LOG_EVERY == 0:
             now = time.time()
             rate = LOG_EVERY / max(now - last_log_time, 1e-9)
             last_log_time = now
-            avg = sum(run_losses[-LOG_EVERY:]) / len(run_losses[-LOG_EVERY:])
+            average_loss = statistics.fmean(run_losses[-LOG_EVERY:])
             with torch.no_grad():
-                fams = dict.fromkeys(("qk", "vo", "mlp", "ada", "emb", "oth"), 0.0)
-                for pname, parameter in model.named_parameters():
+                families = dict.fromkeys(("qk", "vo", "mlp", "ada", "emb", "oth"), 0.0)
+                for name, parameter in model.named_parameters():
                     key = (
                         "qk"
-                        if ("to_q" in pname or "to_k" in pname)
+                        if ("to_q" in name or "to_k" in name)
                         else "vo"
-                        if ("to_v" in pname or "to_out" in pname)
+                        if ("to_v" in name or "to_out" in name)
                         else "mlp"
-                        if ".ff." in pname
+                        if ".ff." in name
                         else "ada"
                         if (
-                            "norm1" in pname
-                            or "norm_out" in pname
-                            or "adaln" in pname.lower()
+                            "norm1" in name
+                            or "norm_out" in name
+                            or "adaln" in name.lower()
                         )
                         else "emb"
-                        if ("emb" in pname or "pos_embed" in pname or "proj_out" in pname)
+                        if ("emb" in name or "pos_embed" in name or "proj_out" in name)
                         else "oth"
                     )
-                    fams[key] += parameter.detach().float().pow(2).sum().item()
-                parameter_norm = sum(fams.values()) ** 0.5
-                family_text = " ".join(f"{key}={value**0.5:7.1f}" for key, value in fams.items())
-            grad_ema_text = "unset" if grad_ema is None else f"{grad_ema:.2f}"
+                    families[key] += parameter.detach().float().pow(2).sum().item()
+                parameter_norm = sum(families.values()) ** 0.5
+                family_text = " ".join(
+                    f"{key}={value**0.5:7.1f}" for key, value in families.items()
+                )
+            reference_text = (
+                "unset"
+                if controller.reference is None
+                else f"{controller.reference.grad_median:.1f}"
+            )
+            status = controller.status()
             print(
-                f"  step {step:>8,}  loss {avg:.5f}  {rate:5.2f} steps/s  "
-                f"{rate * cfg.train.global_batch:7.0f} img/s  "
-                f"|g|ema={grad_ema_text:>7}  |w|={parameter_norm:8.2f}  {family_text}"
+                f"  step {step:>8,}  loss {average_loss:.5f}  "
+                f"lr {optimizer.param_groups[0]['lr']:.7g}  scale {controller.scale:.3f}  "
+                f"{rate:5.2f} steps/s  {rate * cfg.train.global_batch:7.0f} img/s  "
+                f"|g|live={live_grad_ema if live_grad_ema is not None else 0.0:8.2f}  "
+                f"|g|ref={reference_text:>7}  lossR={status['loss_ratio']:.3f}  "
+                f"gradR={status['grad_ratio']:.2f}  |w|={parameter_norm:8.2f}  "
+                f"{family_text}"
             )
 
-    # -- final health gate, save and push -------------------------------
+    # -- final candidate decision -------------------------------------------
     elapsed = time.time() - t_start
+    reached_target = step >= args.target_steps
     final_healthy = False
-    final_window = current_window()
+    final_reason = "rank-0 health decision"
     if ctx.is_rank0:
         print(
-            f"[train] run done after {elapsed / 60:.1f} min "
-            f"({step - start_step:,} steps this run)"
+            f"[train] {'target reached' if reached_target else 'run budget reached'} "
+            f"after {elapsed / 60:.1f} min ({step - start_step:,} attempted data steps; "
+            f"global step {step:,})"
         )
-        final_healthy, final_window = checkpoint_is_healthy()
-        if not final_healthy:
-            assert final_window is not None and best_window is not None
-            print(
-                f"[train] FINAL CHECKPOINT WITHHELD: windowed loss "
-                f"{final_window:.4f} > {CHECKPOINT_HEALTH_MULTIPLIER:.2f}x "
-                f"best {best_window:.4f}. Hub latest remains unchanged."
-            )
+        final_healthy, final_reason = checkpoint_is_healthy()
     final_healthy = broadcast_flag(ctx, final_healthy)
 
-    if not final_healthy:
-        barrier(ctx)
-        cleanup(ctx)
-        return 2
+    if final_healthy:
+        save_and_promote(
+            step,
+            completed=reached_target,
+            reason="target final" if reached_target else "run final",
+        )
+    else:
+        # A short tail after an already successful promotion is safe to discard
+        # when the only issue is insufficient windows before the time budget.
+        insufficient_only = final_reason.startswith("only ")
+        if promotions_this_run > 0 and insufficient_only and not reached_target:
+            if ctx.is_rank0:
+                print(
+                    f"[train] discarding uncommitted tail at step {step:,}: {final_reason}; "
+                    "last promoted checkpoint remains healthy"
+                )
+            barrier(ctx)
+            cleanup(ctx)
+            return 0
+        return retry_all(f"final candidate withheld: {final_reason}", last_metrics)
 
-    if ctx.is_rank0:
-        save_and_push(step, completed=True)
-    barrier(ctx)
-
-    # -- fixed-seed sample grid: only after a healthy final save ---------
+    # Sample only after a healthy committed checkpoint exists.
     if ctx.is_rank0 and args.sample_count > 0:
         try:
             from ditflex.sample import sample_and_push
@@ -3543,10 +5499,10 @@ def main() -> int:
                 n=args.sample_count,
                 ode_steps=args.sample_steps,
                 cfg_scale=args.cfg_scale,
-                out_dir=CKPT_DIR,
+                out_dir=CANDIDATE_DIR,
             )
-        except Exception as exc:  # noqa: BLE001 -- deliberately non-fatal
-            print(f"[train] sampling failed (non-fatal; checkpoint already pushed): {exc!r}")
+        except Exception as exc:  # noqa: BLE001 - checkpoint is already committed
+            print(f"[train] sampling failed (non-fatal): {exc!r}")
 
     barrier(ctx)
     cleanup(ctx)
@@ -3560,42 +5516,27 @@ if __name__ == "__main__":
 ### `tests/modal_ci.py`
 
 ```python
-"""tests/modal_ci.py -- Modal runner for the ditflex gates and tests.
+"""Modal CI runner for ditflex correctness, stability, and GPU smoke gates.
 
-The source is NOT cloned from GitHub inside the container. `modal run`
-uploads the local checkout (the Actions checkout, in CI), so there is no
-GH_TOKEN, no clone step, and the code under test is exactly the code in
-the working tree -- including uncommitted changes when run locally.
+The Actions checkout is mounted directly into the container, so the code under
+CI is exactly the working tree being tested.  In addition to the existing
+FlexAttention, latent, pytest, and overfit gates, this runner now verifies the
+transactional training additions before any expensive smoke run:
 
-===============
-Gates, in order (each blocks the next from meaning anything):
-  1. tests/verify_identity.py   Flex path vs fp64 math reference
-  2. tests/verify_latents.py    first latent shard from the Hub
-                                (--latents-all: every shard, ~10.5 GB,
-                                checks N == 1,281,167 and class coverage)
-  3. pytest tests/
-  4. (--smoke) tests/overfit_smoke.py, small model, both objectives
+* Ruff and bytecode compilation;
+* committed-reference stability-controller tests;
+* deterministic objective RNG tests;
+* checkpoint validation/selection tests;
+* importability of the Modal training supervisor.
 
 Usage
 -----
     modal run tests/modal_ci.py
+    modal run tests/modal_ci.py --transactional-only
     modal run tests/modal_ci.py --compile-check
     modal run tests/modal_ci.py --smoke
     modal run tests/modal_ci.py --latents-all
-    modal run tests/modal_ci.py --test-file test_attention_identity.py
-
-Environment
------------
-    MODAL_TOKEN_ID / MODAL_TOKEN_SECRET   auth (or ~/.modal.toml locally)
-    MODAL_GPU     GPU target. Default B300 -- the training hardware, so
-                  the gates certify the kernels that will actually run.
-    TORCH_INDEX   torch wheel index. Default cu129: B300 is SM103 /
-                  compute_103, which requires CUDA >= 12.9.
-
-    HF_TOKEN      HuggingFace token for the latents gate. Set as a
-                  GitHub repo secret; the workflow exports it and this
-                  launcher forwards it into the container via
-                  Secret.from_dict. For local runs: export HF_TOKEN=hf_...
+    modal run tests/modal_ci.py --test-file test_stability.py
 """
 
 from __future__ import annotations
@@ -3605,12 +5546,17 @@ from pathlib import Path
 
 import modal
 
-# This file lives in tests/. The mount MUST be the repo root, or the
-# container is missing src/, run/, and pyproject.toml.
 REPO_ROOT = Path(__file__).parent.parent
 
 GPU_TYPE = os.environ.get("MODAL_GPU", "B300")
 TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu129")
+
+TRANSACTIONAL_TESTS = [
+    "tests/test_stability.py",
+    "tests/test_objective_rng.py",
+    "tests/test_checkpoint_selection.py",
+    "tests/test_checkpoint_roundtrip.py",
+]
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -3624,11 +5570,19 @@ image = (
         "numpy>=1.26",
         "tqdm",
         "pytest>=8.0",
+        "ruff>=0.6",
     )
     .add_local_dir(
         REPO_ROOT,
         remote_path="/repo",
-        ignore=[".git", "**/__pycache__", "*.egg-info", ".venv", ".ruff_cache", ".pytest_cache"],
+        ignore=[
+            ".git",
+            "**/__pycache__",
+            "*.egg-info",
+            ".venv",
+            ".ruff_cache",
+            ".pytest_cache",
+        ],
     )
 )
 
@@ -3637,18 +5591,15 @@ app = modal.App("ditflex-ci", image=image)
 
 @app.function(
     gpu=GPU_TYPE,
-    # Generous: the everything-enabled dispatch (full latents download +
-    # smoke x2 objectives + compile checks) can pass an hour.
     timeout=7200,
-    # Captured from the launching environment (the Actions runner, which
-    # gets it from the GitHub repo secret) -- no Modal-side secret needed.
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
 def run_gates(
-    test_files: list | None = None,
+    test_files: list[str] | None = None,
     compile_check: bool = False,
     smoke: bool = False,
     latents_all: bool = False,
+    transactional_only: bool = False,
 ) -> int:
     import subprocess
     import sys
@@ -3657,19 +5608,47 @@ def run_gates(
         ["nvidia-smi", "--query-gpu=name,compute_cap", "--format=csv,noheader"],
         capture_output=True,
         text=True,
+        check=False,
     )
     print(f"[modal] GPU: {result.stdout.strip()}")
 
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"], check=True
+        [sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"],
+        check=True,
     )
 
-    rc = 0
+    first_failure = 0
 
     def run(cmd: list[str]) -> None:
-        nonlocal rc
-        print(f"\n[modal] running: {' '.join(cmd)}\n")
-        rc = subprocess.run(cmd, cwd="/repo").returncode or rc
+        nonlocal first_failure
+        print(f"\n[modal] running: {' '.join(cmd)}\n", flush=True)
+        result = subprocess.run(cmd, cwd="/repo", check=False)
+        if result.returncode != 0 and first_failure == 0:
+            first_failure = result.returncode
+
+    # Cheap source gates first.  These catch malformed supervisor/train changes
+    # before spending time downloading latents or compiling GPU kernels.
+    run([sys.executable, "-m", "ruff", "check", "src", "run", "tests"])
+    run([sys.executable, "-m", "compileall", "-q", "src", "run", "tests"])
+    run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import run.modal_train as m; "
+                "assert m.RETRY_EXIT_CODE == 75; "
+                "assert m.RETRY_MARKER.name == 'ditflex_retry.json'; "
+                "assert m.PROMOTION_MARKER.name == 'ditflex_promotion.json'"
+            ),
+        ]
+    )
+
+    # Always run the focused transactional tests, even when --test-file selects
+    # another test.  They protect rollback/promotion behavior used in production.
+    run([sys.executable, "-m", "pytest", "-v", "--tb=short", *TRANSACTIONAL_TESTS])
+
+    if transactional_only:
+        return first_failure
 
     gate_cmd = [sys.executable, "tests/verify_identity.py"]
     if compile_check:
@@ -3678,24 +5657,48 @@ def run_gates(
 
     latents_cmd = [sys.executable, "tests/verify_latents.py"]
     if latents_all:
-        latents_cmd.append("--all")  # replaces the fast check; shard 0 is cached
+        latents_cmd.append("--all")
     run(latents_cmd)
 
-    pytest_cmd = [sys.executable, "-m", "pytest", "-v", "--tb=short"]
-    pytest_cmd += test_files or ["tests"]
-    run(pytest_cmd)
+    selected = test_files or ["tests"]
+    run([sys.executable, "-m", "pytest", "-v", "--tb=short", *selected])
 
     if smoke:
         for objective in ("ddpm", "flow"):
-            run([sys.executable, "tests/overfit_smoke.py", "--small", "--objective", objective])
-        # DMAP diagnosis pair: eager vs compiled. Divergent outcomes
-        # localize a compile-path bug; joint failure means modeling.
-        run([sys.executable, "tests/overfit_smoke.py", "--small",
-             "--objective", "flow", "--qk-mode", "dmap"])
-        run([sys.executable, "tests/overfit_smoke.py", "--small",
-             "--objective", "flow", "--qk-mode", "dmap", "--compile"])
+            run(
+                [
+                    sys.executable,
+                    "tests/overfit_smoke.py",
+                    "--small",
+                    "--objective",
+                    objective,
+                ]
+            )
+        run(
+            [
+                sys.executable,
+                "tests/overfit_smoke.py",
+                "--small",
+                "--objective",
+                "flow",
+                "--qk-mode",
+                "dmap",
+            ]
+        )
+        run(
+            [
+                sys.executable,
+                "tests/overfit_smoke.py",
+                "--small",
+                "--objective",
+                "flow",
+                "--qk-mode",
+                "dmap",
+                "--compile",
+            ]
+        )
 
-    return rc
+    return first_failure
 
 
 @app.local_entrypoint()
@@ -3704,13 +5707,16 @@ def main(
     compile_check: bool = False,
     smoke: bool = False,
     latents_all: bool = False,
+    transactional_only: bool = False,
 ):
-    """
+    """Run Modal CI gates.
+
     Args:
-        test_file:     specific pytest file (e.g. test_attention_identity.py), empty = all
-        compile_check: also verify the torch.compile'd Flex path
-        smoke:         also run the small-model overfit smoke, both objectives
-        latents_all:   check every latent shard (10.5 GB download) instead of the first
+        test_file: Specific pytest file, or empty for the full suite.
+        compile_check: Also verify the compiled FlexAttention path.
+        smoke: Also run small-model overfit smoke tests.
+        latents_all: Validate every latent shard instead of only shard zero.
+        transactional_only: Run only static and transactional stability gates.
     """
     files = None
     if test_file:
@@ -3719,7 +5725,11 @@ def main(
         files = [test_file]
 
     rc = run_gates.remote(
-        test_files=files, compile_check=compile_check, smoke=smoke, latents_all=latents_all
+        test_files=files,
+        compile_check=compile_check,
+        smoke=smoke,
+        latents_all=latents_all,
+        transactional_only=transactional_only,
     )
     if rc != 0:
         raise SystemExit(rc)
@@ -4153,6 +6163,94 @@ def test_config_drift_is_refused(tmp_path):
 def test_clean_state_dict_strips_wrapper_prefixes():
     sd = {"_orig_mod.module.blocks.0.w": 1, "module.head.b": 2, "plain": 3}
     assert set(clean_state_dict(sd)) == {"blocks.0.w", "head.b", "plain"}
+
+
+def test_candidate_validation_allows_model_buffers(tmp_path):
+    from ditflex.checkpoint import copy_checkpoint, validate_checkpoint
+
+    class WithBuffer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(3, 3)
+            self.register_buffer("fixed", torch.ones(3))
+
+        def forward(self, x):
+            return self.linear(x) + self.fixed
+
+    source = tmp_path / "candidate"
+    copied = tmp_path / "copied"
+    model = WithBuffer()
+    ema = EMA(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    cfg = Config()
+    save_checkpoint(source, model, ema, optimizer, cfg, {"step": 123})
+
+    state = validate_checkpoint(source, expected_step=123)
+    assert state["step"] == 123
+    copy_checkpoint(source, copied)
+    assert validate_checkpoint(copied)["step"] == 123
+```
+
+### `tests/test_checkpoint_selection.py`
+
+```python
+from __future__ import annotations
+
+from ditflex import checkpoint
+from ditflex.checkpoint import CheckpointRevision
+
+
+def legacy_state(step: int, grad_ema: float) -> dict:
+    return {
+        "step": step,
+        "guard_state": {
+            "version": 2,
+            "grad_ema": grad_ema,
+            "lr_controller": {"version": 2},
+        },
+    }
+
+
+def transactional_state(step: int, grad_median: float) -> dict:
+    return {
+        "step": step,
+        "guard_state": {
+            "version": 3,
+            "stability_controller": {
+                "version": 3,
+                "reference": {
+                    "loss": 0.77,
+                    "grad_median": grad_median,
+                    "grad_p90": grad_median * 2,
+                    "step": step,
+                },
+            },
+        },
+    }
+
+
+def test_legacy_suspect_latest_selects_newest_sane_prior(monkeypatch):
+    revisions = [
+        CheckpointRevision("rev280", 280_000, 3547.0, legacy_state(280_000, 3547.0)),
+        CheckpointRevision("rev270", 270_000, 60.0, legacy_state(270_000, 60.0)),
+        CheckpointRevision("rev260", 260_000, 15.0, legacy_state(260_000, 15.0)),
+        CheckpointRevision("rev250", 250_000, 16.0, legacy_state(250_000, 16.0)),
+    ]
+    monkeypatch.setattr(checkpoint, "list_checkpoint_revisions", lambda *a, **k: revisions)
+    selection = checkpoint.select_stable_resume_revision("owner/repo", suspect_ratio=8.0)
+    assert selection.revision == "rev270"
+    assert selection.step == 270_000
+    assert "selected prior step 270000" in selection.reason
+
+
+def test_transactional_latest_is_trusted(monkeypatch):
+    state = transactional_state(290_000, 75.0)
+    revisions = [CheckpointRevision("rev290", 290_000, 75.0, state)]
+    monkeypatch.setattr(checkpoint, "list_checkpoint_revisions", lambda *a, **k: revisions)
+    selection = checkpoint.select_stable_resume_revision("owner/repo")
+    assert selection.revision is None
+    assert selection.step == 290_000
+    assert "transactional" in selection.reason
 ```
 
 ### `tests/test_config_roundtrip.py`
@@ -5046,6 +7144,235 @@ def test_objectives_run_through_a_real_dit(name):
     loss.backward()
     grad_norms = [p.grad.abs().sum() for p in model.parameters() if p.grad is not None]
     assert len(grad_norms) > 0 and all(torch.isfinite(gn) for gn in grad_norms)
+```
+
+### `tests/test_objective_rng.py`
+
+```python
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import torch
+
+from ditflex.objective import (
+    DDPMObjective,
+    FlowMatchingObjective,
+    make_step_generator,
+    objective_seed,
+)
+
+
+class ZeroModel(torch.nn.Module):
+    def forward(self, hidden_states, timestep, class_labels):
+        return SimpleNamespace(sample=torch.zeros_like(hidden_states))
+
+
+def test_objective_seed_is_stable_and_namespaced():
+    seed = objective_seed(0, 280_000, 0, 1_000_003)
+    assert seed == objective_seed(0, 280_000, 0, 1_000_003)
+    assert seed != objective_seed(0, 280_001, 0, 1_000_003)
+    assert seed != objective_seed(0, 280_000, 1, 1_000_003)
+    assert seed != objective_seed(0, 280_000, 0, 2_000_006)
+
+
+def _loss(objective, seed_offset: int) -> torch.Tensor:
+    x0 = torch.randn(8, 4, 4, 4)
+    labels = torch.arange(8)
+    generator = make_step_generator(
+        "cpu",
+        base_seed=0,
+        global_step=123,
+        rank=0,
+        seed_offset=seed_offset,
+    )
+    return objective.loss(ZeroModel(), x0, labels, generator=generator)
+
+
+def test_flow_objective_replays_exactly_for_same_attempt_seed():
+    objective = FlowMatchingObjective(label_dropout=0.5, null_class=1000)
+    first = _loss(objective, 17)
+    second = _loss(objective, 17)
+    # x0 is generated outside the step generator, so set the global RNG to
+    # reproduce the input as well.
+    torch.manual_seed(42)
+    x0 = torch.randn(8, 4, 4, 4)
+    labels = torch.arange(8)
+    g1 = make_step_generator("cpu", base_seed=0, global_step=123, rank=0, seed_offset=17)
+    g2 = make_step_generator("cpu", base_seed=0, global_step=123, rank=0, seed_offset=17)
+    replay1 = objective.loss(ZeroModel(), x0, labels, generator=g1)
+    replay2 = objective.loss(ZeroModel(), x0, labels, generator=g2)
+    assert replay1.equal(replay2)
+    assert torch.isfinite(first) and torch.isfinite(second)
+
+
+def test_retry_seed_changes_flow_and_ddpm_objective():
+    x0 = torch.zeros(8, 4, 4, 4)
+    labels = torch.arange(8)
+    for objective in (
+        FlowMatchingObjective(label_dropout=0.5, null_class=1000),
+        DDPMObjective(label_dropout=0.5, null_class=1000),
+    ):
+        g1 = make_step_generator("cpu", base_seed=0, global_step=123, rank=0, seed_offset=0)
+        g2 = make_step_generator(
+            "cpu", base_seed=0, global_step=123, rank=0, seed_offset=1_000_003
+        )
+        loss1 = objective.loss(ZeroModel(), x0, labels, generator=g1)
+        loss2 = objective.loss(ZeroModel(), x0, labels, generator=g2)
+        assert not loss1.equal(loss2)
+```
+
+### `tests/test_stability.py`
+
+```python
+from __future__ import annotations
+
+import pytest
+
+from ditflex.stability import AdaptiveLrController, StabilitySpec, WindowMetrics
+
+
+def metrics(
+    loss: float = 1.0,
+    grad_median: float = 60.0,
+    grad_p90: float = 120.0,
+    skip_rate: float = 0.0,
+) -> WindowMetrics:
+    return WindowMetrics(
+        loss=loss,
+        grad_median=grad_median,
+        grad_p90=grad_p90,
+        skip_rate=skip_rate,
+        relative_spike_rate=skip_rate,
+    )
+
+
+def controller(spec: StabilitySpec | None = None, attempt_factor: float = 1.0):
+    ctl = AdaptiveLrController(
+        spec or StabilitySpec(),
+        start_step=260_000,
+        checkpoint_lr=3e-5,
+        attempt_factor=attempt_factor,
+        initial_loss=1.0,
+    )
+    ctl.bootstrap_reference(loss=1.0, grad_median=60.0, grad_p90=120.0, step=260_000)
+    return ctl
+
+
+def test_global_step_cosine_and_no_lr_raise_on_migration():
+    spec = StabilitySpec(policy="adaptive", total_steps=400_000)
+    ctl = AdaptiveLrController(spec, start_step=260_000, checkpoint_lr=9e-6)
+    assert ctl.lr_at(260_000) == pytest.approx(9e-6)
+    assert ctl.lr_at(300_000) < ctl.lr_at(260_000)
+
+
+def test_observed_60_to_4000_regime_requests_immediate_retry():
+    ctl = controller()
+    event = ctl.observe_window(metrics(loss=1.01, grad_median=4000.0, grad_p90=16000.0))
+    assert event.should_retry
+    assert "grad-median ratio" in event.reason
+
+
+def test_persistent_loss_drift_retries_after_patience():
+    spec = StabilitySpec(
+        warning_patience_windows=2,
+        loss_warn_ratio=1.01,
+        loss_retry_ratio=1.02,
+        loss_emergency_ratio=1.10,
+    )
+    ctl = controller(spec)
+    first = ctl.observe_window(metrics(loss=1.03))
+    second = ctl.observe_window(metrics(loss=1.03))
+    assert first.action == "warn"
+    assert second.should_retry
+
+
+def test_flat_loss_high_skip_warning_does_not_change_lr():
+    ctl = controller()
+    before = ctl.scale
+    event = ctl.observe_window(metrics(loss=1.0, skip_rate=0.06))
+    assert event.action == "warn"
+    assert not event.should_retry
+    assert ctl.scale == before
+
+
+def test_frozen_gradient_limit_cannot_chase_bad_live_regime():
+    ctl = controller()
+    limit_before = ctl.grad_limit(4.0)
+    assert limit_before == pytest.approx(max(4.0 * 60.0, 1.25 * 120.0))
+    ctl.observe_window(metrics(loss=1.0, grad_median=1000.0, grad_p90=2000.0))
+    assert ctl.grad_limit(4.0) == pytest.approx(limit_before)
+
+
+def test_candidate_requires_consecutive_healthy_windows():
+    ctl = controller()
+    ctl.observe_window(metrics())
+    healthy, reason = ctl.checkpoint_is_healthy(metrics())
+    assert not healthy
+    assert "1/2" in reason
+    ctl.observe_window(metrics())
+    healthy, reason = ctl.checkpoint_is_healthy(metrics())
+    assert healthy
+    assert reason == "stable candidate"
+
+
+def test_commit_persists_retry_lr_factor_and_caps_reference_growth():
+    spec = StabilitySpec(reference_decay=0.0, grad_reference_max_growth=1.25)
+    ctl = controller(spec, attempt_factor=0.5)
+    effective_before = ctl.scale
+    ctl.observe_window(metrics())
+    ctl.observe_window(metrics())
+    reference = ctl.commit_candidate(
+        270_000,
+        metrics(loss=1.005, grad_median=100.0, grad_p90=200.0),
+    )
+    assert ctl.attempt_factor == 1.0
+    assert ctl.committed_scale == pytest.approx(effective_before)
+    assert reference.grad_median == pytest.approx(75.0)  # 60 * 1.25 cap
+    assert reference.grad_p90 == pytest.approx(150.0)  # 120 * 1.25 cap
+    assert reference.loss == pytest.approx(1.005)
+
+
+def test_v2_state_migrates_scale_but_requires_new_reference():
+    spec = StabilitySpec()
+    ctl = AdaptiveLrController(spec, start_step=260_000, checkpoint_lr=3e-5)
+    v2_state = {
+        "version": 2,
+        "spec": {
+            "policy": "adaptive",
+            "total_steps": 400_000,
+            "base_lr": 1e-4,
+            "min_lr": 1e-5,
+            "hard_min_lr": 1e-6,
+        },
+        "scale": 0.25,
+        "fast_loss": 0.77,
+        "slow_loss": 0.77,
+        "best_loss": 0.76,
+    }
+    ctl.load_state_dict(v2_state, attempt_factor=0.5)
+    assert ctl.committed_scale == pytest.approx(0.25)
+    assert ctl.scale == pytest.approx(0.125)
+    assert ctl.reference is None
+
+
+def test_v3_state_roundtrip_and_spec_drift_guard():
+    spec = StabilitySpec(total_steps=400_000)
+    ctl = controller(spec)
+    ctl.observe_window(metrics())
+    state = ctl.state_dict()
+
+    restored = AdaptiveLrController(spec, start_step=260_000, checkpoint_lr=3e-5)
+    restored.load_state_dict(state)
+    assert restored.state_dict() == state
+
+    changed = AdaptiveLrController(
+        StabilitySpec(total_steps=500_000),
+        start_step=260_000,
+        checkpoint_lr=3e-5,
+    )
+    with pytest.raises(ValueError, match="spec differs"):
+        changed.load_state_dict(state)
 ```
 
 ### `tests/verify_identity.py`

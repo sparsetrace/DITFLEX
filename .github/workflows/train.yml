@@ -53,7 +53,11 @@ on:
       wd_ada:
         description: "Decoupled weight decay on the adaLN family only (0 = off)"
         required: false
-        default: "0.05"
+        default: "0.01"
+      qk_norm:
+        description: "Model has per-head RMSNorm on Q/K (set true after the 344K migration)"
+        required: false
+        default: "false"
       probe:
         description: "Enable ditflex.probe diagnostics (grad families + attn logits, rank 0)"
         required: false
@@ -152,6 +156,7 @@ jobs:
             --max-steps "${{ inputs.max_steps }}" \
             --precision "${{ inputs.precision }}" \
             --wd-ada "${{ inputs.wd_ada }}" \
+            ${{ inputs.qk_norm == 'true' && '--qk-norm' || '' }} \
             ${{ inputs.probe == 'true' && '--probe-attn-logits' || '' }} \
             --lr-policy "${{ inputs.lr_policy }}" \
             --lr "${{ inputs.lr }}" \

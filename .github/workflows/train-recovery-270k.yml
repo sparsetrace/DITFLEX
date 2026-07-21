@@ -80,6 +80,10 @@ on:
         description: "Decoupled weight decay on the adaLN family only (0 = off)"
         required: false
         default: "0.01"
+      qk_norm:
+        description: "Model has per-head RMSNorm on Q/K (set true after the 344K migration)"
+        required: false
+        default: "false"
       clip:
         description: "Global gradient clipping max norm"
         required: false
@@ -158,6 +162,7 @@ jobs:
             --lr-min-scale "${{ inputs.lr_min_scale }}" \
             --wd "${{ inputs.wd }}" \
             --wd-ada "${{ inputs.wd_ada }}" \
+            ${{ inputs.qk_norm == 'true' && '--qk-norm' || '' }} \
             --clip "${{ inputs.clip }}" \
             --spike-skip "${{ inputs.spike_skip }}" \
             --grad-ceiling "${{ inputs.grad_ceiling }}" \

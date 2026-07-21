@@ -123,6 +123,8 @@ def train(
     precision: str = "tf32",
     probe_attn_logits: bool = False,
     probe_batch: int = 8,
+    qk_mode: str = "amap",
+    dmap_alpha: float = 0.0,
 ) -> int:
     import subprocess
     import sys
@@ -143,6 +145,9 @@ def train(
         return 2
     if wd_ada < 0.0:
         print("[modal] wd_ada must be non-negative")
+        return 2
+    if qk_mode not in {"amap", "dmap"}:
+        print(f"[modal] unknown qk_mode: {qk_mode!r}")
         return 2
     if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
         print(
@@ -268,6 +273,8 @@ def train(
             f"--skip-retry-rate={skip_retry_rate}",
             f"--skip-emergency-rate={skip_emergency_rate}",
             f"--precision={precision}",
+            f"--qk-mode={qk_mode}",
+            f"--dmap-alpha={dmap_alpha}",
         ]
         if probe_attn_logits:
             command.append("--probe-attn-logits")
@@ -292,7 +299,7 @@ def train(
         print(
             f"\n[modal] attempt {attempt}/{max_retries}: "
             f"lr_factor={attempt_factor:g} seed_offset={attempt_seed_offset} "
-            f"budget={child_budget}s precision={precision} anchor="
+            f"budget={child_budget}s precision={precision} qk_mode={qk_mode} anchor="
             f"{selected_revision[:12] if selected_revision else 'latest'}\n"
             f"[modal] running: {' '.join(command)}\n"
         )
@@ -386,6 +393,8 @@ def main(
     precision: str = "tf32",
     probe_attn_logits: bool = False,
     probe_batch: int = 8,
+    qk_mode: str = "amap",
+    dmap_alpha: float = 0.0,
 ):
     if objective not in {"ddpm", "flow"}:
         raise SystemExit(f"unknown objective: {objective!r}")
@@ -395,6 +404,8 @@ def main(
         raise SystemExit(f"unknown precision: {precision!r}")
     if wd_ada < 0.0:
         raise SystemExit("wd_ada must be non-negative")
+    if qk_mode not in {"amap", "dmap"}:
+        raise SystemExit(f"unknown qk_mode: {qk_mode!r}")
     if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
         raise SystemExit(
             "skip thresholds must satisfy "
@@ -443,6 +454,8 @@ def main(
         precision=precision,
         probe_attn_logits=probe_attn_logits,
         probe_batch=probe_batch,
+        qk_mode=qk_mode,
+        dmap_alpha=dmap_alpha,
     )
     if return_code != 0:
         raise SystemExit(return_code)

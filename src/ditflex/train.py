@@ -200,6 +200,16 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--qk-mode", choices=["amap", "dmap"], default="amap")
+    parser.add_argument(
+        "--qk-norm",
+        action="store_true",
+        help=(
+            "build the amap model with per-head RMSNorm on Q/K (post-344K "
+            "migration architecture). Must match the checkpoint's embedded "
+            "config or the drift guard refuses the resume. Invalid with "
+            "--qk-mode dmap."
+        ),
+    )
     parser.add_argument("--dmap-alpha", type=float, default=0.0)
     parser.add_argument("--sample-count", type=int, default=16)
     parser.add_argument("--sample-steps", type=int, default=50)
@@ -265,6 +275,7 @@ def main() -> int:
     cfg.train.objective = args.objective
     cfg.model.qk_mode = args.qk_mode
     cfg.model.dmap_alpha = args.dmap_alpha
+    cfg.model.qk_norm = args.qk_norm
     if args.hub_repo:
         cfg.hub.checkpoint_repo = args.hub_repo
 

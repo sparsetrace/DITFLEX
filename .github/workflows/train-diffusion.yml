@@ -16,18 +16,41 @@ name: train-diffusion
 # run_history.effective).  wd_ada defaults to 0: the DMAP chain has not
 # shown the baseline's adaLN growth; enable it only if the probe shows
 # the same climb.
+#
+# HARDWARE NOTE (RTX PRO 6000 Blackwell benchmark):
+#   Defaults now target a SINGLE RTX PRO 6000 for a clean throughput read.
+#   Unlike B200/B300 SXM, the RTX PRO 6000 has NO NVLink -- multi-GPU runs
+#   communicate over PCIe Gen5, so data-parallel scaling is worse than the
+#   B300 fabric and would confound a per-card performance comparison. Keep
+#   gpus=1 to benchmark the card itself; raise it only to study PCIe
+#   scaling. Also note the RTX PRO 6000's 96 GB GDDR7 easily holds the
+#   ~9.77 GB resident latents, so the resident-latents design needs no
+#   change; tf32 (fp32-accumulate) is NOT throttled on the PRO 6000 (the
+#   gaming-card restriction is lifted on workstation Blackwell), so unlike
+#   a 5090 this card runs the tf32 path at full tensor-core rate.
+#
+# LR NOTE (aggressive finish, ready-to-run defaults):
+#   Defaults are pre-set for the hot final stretch discussed for the DMAP
+#   chain: lr_policy=constant, lr=1e-4 (full recipe LR, no cosine decay),
+#   reset_lr_controller=true (discard the parked scale + stale reference and
+#   bootstrap fresh at scale 1.0). A plain dispatch therefore runs the
+#   aggressive config directly. Watch blk0 attn-logit max in the first two
+#   stability windows: it should stay in its bounded ~900-1400 band; the
+#   DMAP kernel is bounded above by construction, so a monotonic climb (not
+#   expected) would be the only reason to fall back to lr=5e-5. Set
+#   lr_policy=cosine / lr=0 to restore the decayed-envelope behavior.
 
 on:
   workflow_dispatch:
     inputs:
       gpus:
-        description: "GPU count (2 is the certified sweet spot)"
+        description: "GPU count (1 = clean per-card benchmark; RTX PRO 6000 has no NVLink, so >1 scales over PCIe only)"
         required: false
-        default: "2"
+        default: "1"
       gpu_kind:
-        description: "GPU kind (B300 | B200)"
+        description: "GPU kind (RTX6000Ada-class Blackwell workstation | B300 | B200). Modal string for RTX PRO 6000 Blackwell."
         required: false
-        default: "B300"
+        default: "RTX-PRO-6000"
       train_seconds:
         description: "Stepping budget in seconds; Modal timeout adds retry allowance"
         required: false
@@ -55,7 +78,7 @@ on:
 
       # Numerics, stabilization, and diagnostics.
       precision:
-        description: "Training numerics (tf32 | bf16)"
+        description: "Training numerics (tf32 | bf16). tf32 is full-rate on RTX PRO 6000 (no gaming throttle)."
         required: false
         default: "tf32"
       wd_ada:
@@ -68,15 +91,15 @@ on:
         default: "true"
 
       lr_policy:
-        description: "constant | cosine | adaptive (cosine plus loss/spike backoff)"
+        description: "constant | cosine | adaptive. Default constant for the aggressive finish; set cosine to restore the decayed envelope."
         required: false
-        default: "adaptive"
+        default: "constant"
       lr:
-        description: "Base LR override (0 = recipe 1e-4; gain-compensation: 0.00005)"
+        description: "Base LR override (0 = recipe 1e-4). Default 0.0001 = full recipe LR, flat."
         required: false
-        default: "0"
+        default: "0.0001"
       lr_min:
-        description: "Cosine envelope floor at target_steps"
+        description: "Cosine envelope floor at target_steps (only used when lr_policy=cosine/adaptive)"
         required: false
         default: "0.00001"
       lr_hard_min:
@@ -92,10 +115,10 @@ on:
         required: false
         default: "0.125"
       reset_lr_controller:
-        description: "Discard persisted controller state after intentional policy changes"
+        description: "Discard persisted controller state (parked scale + stale reference) and bootstrap fresh at scale 1.0. Default TRUE for the hot restart."
         required: false
         type: boolean
-        default: false
+        default: true
 
       wd:
         description: "Weight decay override (-1 = keep checkpoint/config)"
@@ -151,6 +174,7 @@ jobs:
           MODAL_TRAIN_SECONDS: ${{ inputs.train_seconds }}
         run: |
           echo "modal token id present: ${MODAL_TOKEN_ID:+yes}"
+          echo "gpu: ${MODAL_GPUS}x${MODAL_GPU}  lr_policy=${{ inputs.lr_policy }} lr=${{ inputs.lr }} reset=${{ inputs.reset_lr_controller }}"
           modal run --detach run/modal_train.py \
             --train-seconds "${{ inputs.train_seconds }}" \
             --objective "${{ inputs.objective }}" \

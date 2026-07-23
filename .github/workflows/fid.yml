@@ -1,0 +1,126 @@
+name: fid
+
+# Manual dispatch: compute FID for one or more checkpoint repos and COMMIT
+# evaluation/fid_results.json back into this repo. Non-detached (the job
+# needs the result back to commit it).
+#
+# GPU SIZING -- read before dispatching.
+#   The sampling workflow uses L4 because a 4x4 grid is ~1,600 forward
+#   passes. FID at 50k samples x 50 Euler steps x 2 (CFG) is ~5,000,000
+#   forward passes -- roughly 3,000x more work. Extrapolating from this
+#   model's measured training throughput that is order-of-an-hour on a
+#   B200/H100 and order-of-a-DAY on an L4. Do not use L4 here except for a
+#   num_samples=1000 smoke test.
+#
+# WHAT MAKES THE NUMBER MEANINGFUL
+#   * reference stats: ADM's VIRTUAL_imagenet256_labeled.npz for numbers
+#     comparable to published DiT/SiT; ref_mode=latents for a self-consistent
+#     dmap-vs-amap comparison that is NOT comparable to published figures.
+#   * num_samples: FID is biased upward at small N and the bias does not
+#     cancel between models unless N matches. 50k is the convention.
+#   * identical sampler settings across chains, or you measure the sampler.
+#   * EMA weights (see the ADAPTER section of modal_fid.py).
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Comma-separated checkpoint repos (compare arms in ONE dispatch so settings match)"
+        required: false
+        default: "sparsetrace/ditflex-L2-flow,sparsetrace/ditflex-L2-flow-dmap"
+      gpu:
+        description: "GPU kind. H100/B200 for real runs; L4 only for a 1000-sample smoke test."
+        required: false
+        default: "H100"
+      num_samples:
+        description: "Samples per chain (50000 = convention, 10000 = internal comparison, 1000 = smoke test)"
+        required: false
+        default: "50000"
+      batch_size:
+        description: "Sampling batch size (64 fits comfortably on 80GB; drop to 16 on L4)"
+        required: false
+        default: "64"
+      sample_steps:
+        description: "Euler steps (must match across compared chains)"
+        required: false
+        default: "50"
+      cfg_scale:
+        description: "CFG scale. NOTE: published DiT/SiT FID uses 1.5; the 4.0 used for pretty grids inflates FID badly."
+        required: false
+        default: "1.5"
+      ref_stats_url:
+        description: "URL of a precomputed reference .npz (mu/sigma). Leave empty to use ref_mode."
+        required: false
+        default: ""
+      ref_mode:
+        description: "Fallback when ref_stats_url is empty: 'latents' = stats from your own VAE-decoded latents"
+        required: false
+        default: "latents"
+      latents_repo:
+        description: "HF dataset repo holding the SD-VAE latents (used when ref_mode=latents)"
+        required: false
+        default: ""
+      seed:
+        description: "Seed for class assignment and noise (hold fixed across chains)"
+        required: false
+        default: "0"
+      fid_seconds:
+        description: "Modal timeout in seconds (50k samples needs hours)"
+        required: false
+        default: "14400"
+
+permissions:
+  contents: write   # required to push fid_results.json
+
+jobs:
+  fid:
+    name: "fid · ${{ inputs.repos }} · N=${{ inputs.num_samples }} · ${{ inputs.gpu }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: |
+          pip install 'modal<1.5'
+          modal --version
+
+      - name: Authenticate Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          modal token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
+
+      - name: Compute FID on Modal
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODAL_GPU: ${{ inputs.gpu }}
+          MODAL_FID_SECONDS: ${{ inputs.fid_seconds }}
+        run: |
+          echo "gpu=${MODAL_GPU} N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }}"
+          modal run evaluation/modal_fid.py \
+            --repos "${{ inputs.repos }}" \
+            --num-samples "${{ inputs.num_samples }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            --sample-steps "${{ inputs.sample_steps }}" \
+            --cfg-scale "${{ inputs.cfg_scale }}" \
+            --ref-stats-url "${{ inputs.ref_stats_url }}" \
+            --ref-mode "${{ inputs.ref_mode }}" \
+            --latents-repo "${{ inputs.latents_repo }}" \
+            --seed "${{ inputs.seed }}"
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add evaluation/fid_results.json
+          git diff --cached --quiet && echo "no change" && exit 0
+          git commit -m "fid: N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }} [skip ci]"
+          git push

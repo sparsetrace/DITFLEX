@@ -51,7 +51,7 @@ TIMEOUT = int(os.environ.get("MODAL_FID_SECONDS", "14400"))
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .pip_install("torch", extra_options=f"--index-url {TORCH_INDEX}")
+    .pip_install("torch", "torchvision", extra_options=f"--index-url {TORCH_INDEX}")
     .pip_install(
         "diffusers>=0.31",
         "transformers>=4.44",
@@ -164,12 +164,20 @@ def evaluate(
     import numpy as np
     import torch
     from diffusers import AutoencoderKL
-    from pytorch_fid.inception import InceptionV3
+    
     from tqdm import tqdm
-
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
-
+    # --- ABI smoke test: forces torchvision's C++ extension to load ---------
+    # torchvision built against a different torch than the CUDA wheel fails
+    # here with "operator torchvision::nms does not exist" -- cheap to check
+    # now, expensive to discover after an hour of sampling.
+    import torchvision
+    print(f"[fid] torch {torch.__version__} / torchvision {torchvision.__version__}")
+    torchvision.ops.nms(torch.zeros(1, 4), torch.zeros(1), 0.5)
+    print("[fid] torchvision C++ ops OK")
+    from pytorch_fid.inception import InceptionV3
+    
     # ---- Inception (block 3 = 2048-d pool features, the FID standard) ----
     inception = InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[2048]]).to(device).eval()
 

@@ -17,17 +17,40 @@ name: train-diffusion
 # shown the baseline's adaLN growth; enable it only if the probe shows
 # the same climb.
 #
-# HARDWARE NOTE (RTX PRO 6000 Blackwell benchmark):
-#   Defaults now target a SINGLE RTX PRO 6000 for a clean throughput read.
-#   Unlike B200/B300 SXM, the RTX PRO 6000 has NO NVLink -- multi-GPU runs
-#   communicate over PCIe Gen5, so data-parallel scaling is worse than the
-#   B300 fabric and would confound a per-card performance comparison. Keep
-#   gpus=1 to benchmark the card itself; raise it only to study PCIe
-#   scaling. Also note the RTX PRO 6000's 96 GB GDDR7 easily holds the
-#   ~9.77 GB resident latents, so the resident-latents design needs no
-#   change; tf32 (fp32-accumulate) is NOT throttled on the PRO 6000 (the
-#   gaming-card restriction is lifted on workstation Blackwell), so unlike
-#   a 5090 this card runs the tf32 path at full tensor-core rate.
+# HARDWARE NOTE (RTX PRO 6000 Blackwell):
+#   gpus MUST be >= 2 on this card. The global batch (256) is fixed in the
+#   config and split per rank; run/modal_train.py exposes NO batch-size
+#   override (only --probe-batch). So gpus=1 puts the FULL batch of 256 on
+#   one card and OOMs in the compiled forward at
+#     empty_strided_cuda((256, 256, 1024), ..., torch.float32)
+#   -- 256 == the global batch, not a per-card batch. gpus=2 gives per-card
+#   batch 128, identical to the load each B300 carried, and fits in 96 GB
+#   with room to spare.
+#
+#   Single-card alternatives, if you want one: set precision=bf16 (halves
+#   activation bytes and may fit batch 256), or add a real batch/grad-accum
+#   flag to modal_train.py. Do NOT just shrink the batch without matching
+#   accumulation -- effective batch would change and the run stops being
+#   comparable to the existing chains.
+#
+#   Otherwise the card is fine: it compiled the model, loaded the resident
+#   latents and started stepping before the OOM, so FlexAttention +
+#   torch.compile work on Blackwell workstation silicon. 96 GB GDDR7 holds
+#   the ~9.77 GB resident latents easily (no data-path change needed), and
+#   tf32 (fp32-accumulate) is NOT throttled here -- the gaming-card
+#   restriction is lifted on workstation Blackwell -- so unlike a 5090 this
+#   card runs the tf32 path at full tensor-core rate. No NVLink, so the two
+#   cards talk over PCIe Gen5; expect worse-than-B300 scaling efficiency.
+#
+#   gpu_kind is passed straight through to Modal as f"{GPU_KIND}:{GPU_COUNT}"
+#   with no allowlist, and "RTX-PRO-6000" was accepted (the run launched), so
+#   the string is good.
+#
+# TARGET NOTE:
+#   The DMAP chain is already AT 400,000. With target_steps=400000 the
+#   stepping loop breaks immediately (`if step >= args.target_steps: break`).
+#   Raise target_steps (e.g. 500000) to continue the chain, or set a small
+#   max_steps with a higher target_steps for a throughput benchmark.
 #
 # LR NOTE (aggressive finish, ready-to-run defaults):
 #   Defaults are pre-set for the hot final stretch discussed for the DMAP
@@ -44,9 +67,9 @@ on:
   workflow_dispatch:
     inputs:
       gpus:
-        description: "GPU count (1 = clean per-card benchmark; RTX PRO 6000 has no NVLink, so >1 scales over PCIe only)"
+        description: "GPU count. MUST be >= 2: global batch 256 is split per rank and there is no batch override, so gpus=1 OOMs with the full batch on one card."
         required: false
-        default: "1"
+        default: "2"
       gpu_kind:
         description: "GPU kind (RTX6000Ada-class Blackwell workstation | B300 | B200). Modal string for RTX PRO 6000 Blackwell."
         required: false

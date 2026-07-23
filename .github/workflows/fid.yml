@@ -57,7 +57,7 @@ on:
         required: false
         default: "latents"
       latents_repo:
-        description: "HF dataset repo holding the SD-VAE latents (used when ref_mode=latents)"
+        description: "HF dataset repo with the SD-VAE latents. REQUIRED unless ref_stats_url is set. Decoded with the same VAE as the samples, so the comparison isolates the generative model (but is not comparable to published FID)."
         required: false
         default: ""
       seed:
@@ -88,7 +88,10 @@ jobs:
 
       - name: Install Modal
         run: |
-          pip install 'modal<1.5'
+          # huggingface_hub is needed LOCALLY so Modal can deserialize remote
+          # exceptions raised inside HF calls. Without it every such failure
+          # surfaces as an opaque "Could not deserialize remote exception".
+          pip install 'modal<1.5' huggingface_hub
           modal --version
 
       - name: Authenticate Modal
@@ -97,6 +100,18 @@ jobs:
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
         run: |
           modal token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
+
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ inputs.ref_stats_url }}" ] && \
+             [ "${{ inputs.ref_mode }}" = "latents" ] && \
+             [ -z "${{ inputs.latents_repo }}" ]; then
+            echo "::error::ref_mode=latents requires latents_repo (HF dataset repo with the SD-VAE latents)."
+            exit 1
+          fi
+          if [ $(( ${{ inputs.num_samples }} % 1000 )) -ne 0 ]; then
+            echo "::warning::num_samples is not a multiple of 1000; classes cannot be exactly balanced."
+          fi
 
       - name: Compute FID on Modal
         env:

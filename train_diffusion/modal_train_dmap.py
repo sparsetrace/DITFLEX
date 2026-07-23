@@ -29,6 +29,13 @@ GPU_KIND = os.environ.get("MODAL_GPU", "B300")
 GPU_COUNT = int(os.environ.get("MODAL_GPUS", "2"))
 TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu129")
 
+# PCIe-only cards (RTX workstation/consumer) have P2P disabled at the driver
+# level; NCCL can hang probing for it instead of falling back. Disable it
+# there ONLY -- on SXM (B200/B300) these same paths are NVLink, and turning
+# them off forces the all-reduce through host memory.
+_PCIE_ONLY = "RTX" in GPU_KIND.upper() or "PRO-6000" in GPU_KIND.upper()
+_NCCL_ENV = {"NCCL_P2P_DISABLE": "1", "NCCL_IB_DISABLE": "1"} if _PCIE_ONLY else {}
+
 _BUDGET = int(os.environ.get("MODAL_TRAIN_SECONDS", "14400"))
 TIMEOUT_CEILING = _BUDGET + 3600
 
@@ -58,7 +65,7 @@ app = modal.App("ditflex-train-dmap", image=image)
 @app.function(
     gpu=f"{GPU_KIND}:{GPU_COUNT}",
     timeout=TIMEOUT_CEILING,
-    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
+    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", ""), **_NCCL_ENV})],
 )
 def train(
     train_seconds: int = 14400,

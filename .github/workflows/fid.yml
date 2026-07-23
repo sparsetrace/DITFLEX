@@ -59,7 +59,7 @@ on:
       latents_repo:
         description: "HF dataset repo with the SD-VAE latents. REQUIRED unless ref_stats_url is set. Decoded with the same VAE as the samples, so the comparison isolates the generative model (but is not comparable to published FID)."
         required: false
-        default: ""
+        default: "sparsetrace/dlatentzz"
       seed:
         description: "Seed for class assignment and noise (hold fixed across chains)"
         required: false

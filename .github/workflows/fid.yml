@@ -60,8 +60,12 @@ on:
         description: "HF dataset repo with the SD-VAE latents. REQUIRED unless ref_stats_url is set. Decoded with the same VAE as the samples, so the comparison isolates the generative model (but is not comparable to published FID)."
         required: false
         default: "sparsetrace/dlatentzz"
+      objective:
+        description: "flow (SiT / rectified flow) or ddpm (DiT). Must match how the chain was trained."
+        required: false
+        default: "flow"
       seed:
-        description: "Seed for class assignment and noise (hold fixed across chains)"
+        description: "Base seed for class assignment and noise. Varied per batch internally; hold fixed across chains."
         required: false
         default: "0"
       fid_seconds:
@@ -128,6 +132,7 @@ jobs:
             --cfg-scale "${{ inputs.cfg_scale }}" \
             --ref-stats-url "${{ inputs.ref_stats_url }}" \
             --ref-mode "${{ inputs.ref_mode }}" \
+            --objective "${{ inputs.objective }}" \
             --latents-repo "${{ inputs.latents_repo }}" \
             --seed "${{ inputs.seed }}"
 

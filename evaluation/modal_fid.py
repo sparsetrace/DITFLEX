@@ -51,11 +51,17 @@ TIMEOUT = int(os.environ.get("MODAL_FID_SECONDS", "14400"))
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .pip_install("torch", extra_options=f"--index-url {TORCH_INDEX}")
+    # torchvision MUST come from the same index as torch: pytorch-fid pulls it
+    # in, and a PyPI CPU wheel against a CUDA torch fails with
+    # "operator torchvision::nms does not exist".
+    .pip_install("torch", "torchvision", extra_options=f"--index-url {TORCH_INDEX}")
     .pip_install(
         "accelerate>=0.34",     # else diffusers falls back to slow VAE loading
         "diffusers>=0.31",
-        "transformers>=4.44",
+        # NOT transformers: diffusers only needs it for single-file loaders,
+        # and importing it drags in transformers.AutoImageProcessor ->
+        # torchvision.io, which is where the ABI mismatch explodes.
+        # AutoencoderKL loads fine without it.
         "safetensors>=0.4.5",
         "huggingface_hub>=0.26",
         "numpy>=1.26",
@@ -307,8 +313,22 @@ def evaluate(
         print(f"[fid] WARNING: num_samples={num_samples} is not a multiple of 1000, "
               f"so classes cannot be exactly balanced.")
 
-    import numpy as np
+    # --- ABI smoke test FIRST ----------------------------------------------
+    # torchvision built against a different torch than the CUDA wheel fails
+    # with "operator torchvision::nms does not exist". Both diffusers (via
+    # transformers.AutoImageProcessor) and pytorch_fid import torchvision, so
+    # this MUST run before either or the failure surfaces as an opaque
+    # "Could not import module 'AutoImageProcessor'" from inside their lazy
+    # import machinery.
     import torch
+    import torchvision
+
+    print(f"[fid] torch {torch.__version__} / torchvision {torchvision.__version__}")
+    torchvision.ops.nms(torch.zeros(1, 4), torch.zeros(1), 0.5)
+    print("[fid] torchvision C++ ops OK")
+    # -----------------------------------------------------------------------
+
+    import numpy as np
     from diffusers import AutoencoderKL
     from pytorch_fid.inception import InceptionV3
     from tqdm import tqdm
@@ -323,7 +343,14 @@ def evaluate(
 
     @torch.no_grad()
     def features_from_latents(lat):
-        """[B,4,32,32] latents -> [B,2048] Inception pool features."""
+        """latents -> [B,2048] Inception pool features.
+
+        Accepts flat [B,4096] (how the store keeps them) or shaped
+        [B,4,32,32] (what the sampler returns). Layout is channel-major,
+        confirmed by the neighbour-correlation probe below.
+        """
+        if lat.dim() == 2:
+            lat = lat.view(lat.shape[0], 4, 32, 32)
         img = vae.decode(lat / VAE_SCALE).sample          # [-1, 1]
         img = (img.clamp(-1, 1) + 1.0) / 2.0              # [0, 1]
         # InceptionV3(resize_input=True, normalize_input=True) handles the
@@ -343,6 +370,33 @@ def evaluate(
     elif ref_mode == "latents":
         print(f"[fid] computing reference stats from real latents (n={num_samples})")
         all_lat, idx = _load_latent_store(latents_repo, num_samples, 1000, seed)
+
+        # --- layout probe: (C,H,W) vs (H,W,C) is silent if wrong ------------
+        # Images are spatially smooth, channels are not, so the correct
+        # reshape has the higher horizontal-neighbour correlation. A wrong
+        # layout decodes without error and yields meaningless FID.
+        if all_lat.dim() == 2:
+            probe = all_lat[idx[:256]].float()
+
+            def _nbr_corr(x):                          # x: [B,C,H,W]
+                u = x[..., :, :-1].reshape(-1)
+                v = x[..., :, 1:].reshape(-1)
+                u = u - u.mean()
+                v = v - v.mean()
+                return float(u @ v / (u.norm() * v.norm() + 1e-12))
+
+            chw = _nbr_corr(probe.view(-1, 4, 32, 32))
+            hwc = _nbr_corr(probe.view(-1, 32, 32, 4).permute(0, 3, 1, 2))
+            print(f"[fid] layout probe: neighbour corr  CHW={chw:.3f}  HWC={hwc:.3f}")
+            print(f"[fid] -> latents are "
+                  f"{'CHW (correct)' if chw > hwc else 'HWC -- FIX THE RESHAPE'}")
+            shaped = probe.view(-1, 4, 32, 32)
+            print(f"[fid] per-channel mean {shaped.mean((0, 2, 3)).tolist()}")
+            print(f"[fid] per-channel std  {shaped.std((0, 2, 3)).tolist()}")
+            print("[fid] std ~1 => latents are pre-scaled, so dividing by "
+                  f"{VAE_SCALE} before decode is correct")
+        # ---------------------------------------------------------------------
+
         feats = np.empty((num_samples, 2048), dtype=np.float32)
         for i in tqdm(range(0, num_samples, batch_size), desc="ref"):
             sl = idx[i : i + batch_size]

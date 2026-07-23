@@ -61,11 +61,15 @@ image = (
 
 app = modal.App("ditflex-train-dmap", image=image)
 
-
 @app.function(
     gpu=f"{GPU_KIND}:{GPU_COUNT}",
+    cpu=8.0,
     timeout=TIMEOUT_CEILING,
-    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", ""), **_NCCL_ENV})],
+    secrets=[modal.Secret.from_dict({
+        "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
+        "NCCL_DEBUG": "INFO",
+        **_NCCL_ENV,
+    })],
 )
 def train(
     train_seconds: int = 14400,

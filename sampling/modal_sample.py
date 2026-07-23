@@ -58,6 +58,10 @@ def sample_repo(repo: str, sample_steps: int = 50, cfg_scale: float = 4.0) -> tu
     from PIL import Image
     from safetensors.torch import load_file
 
+    import sys
+    sys.path.insert(0, "/repo/src")
+    from ditflex.config import Config
+    
     from ditflex.config import Config
     from ditflex.model import build_model
 

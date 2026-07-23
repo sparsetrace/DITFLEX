@@ -286,6 +286,25 @@ def evaluate(
     elif ref_mode == "latents":
         print(f"[fid] computing reference stats from real latents (n={num_samples})")
         all_lat, idx = _load_latent_store(latents_repo, num_samples, 1000, seed)
+
+        # --- layout check: (C,H,W) vs (H,W,C) is silent if wrong ------------
+        if all_lat.dim() == 2:
+            probe = all_lat[idx[:256]].float()
+
+            def _nbr_corr(x):                      # x: [B,C,H,W]
+                u = x[..., :, :-1].reshape(-1)
+                v = x[..., :, 1:].reshape(-1)
+                u = u - u.mean(); v = v - v.mean()
+                return float(u @ v / (u.norm() * v.norm() + 1e-12))
+
+            chw = _nbr_corr(probe.view(-1, 4, 32, 32))
+            hwc = _nbr_corr(probe.view(-1, 32, 32, 4).permute(0, 3, 1, 2))
+            print(f"[fid] layout probe: neighbour corr  CHW={chw:.3f}  HWC={hwc:.3f}")
+            print(f"[fid] -> latents are {'CHW (correct)' if chw > hwc else 'HWC -- FIX THE RESHAPE'}")
+            print(f"[fid] per-channel mean {probe.view(-1,4,32,32).mean((0,2,3)).tolist()}")
+            print(f"[fid] per-channel std  {probe.view(-1,4,32,32).std((0,2,3)).tolist()}")
+        # ---------------------------------------------------------------------
+
         feats = np.empty((num_samples, 2048), dtype=np.float32)
         for i in tqdm(range(0, num_samples, batch_size), desc="ref"):
             sl = idx[i : i + batch_size]

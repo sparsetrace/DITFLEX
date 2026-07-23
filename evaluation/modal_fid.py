@@ -266,13 +266,11 @@ def evaluate(
 
     @torch.no_grad()
     def features_from_latents(lat):
-        """[B,4,32,32] latents -> [B,2048] Inception pool features."""
+        """[B,4,32,32] or flat [B,4096] latents -> [B,2048] Inception features."""
+        if lat.dim() == 2:
+            lat = lat.view(lat.shape[0], 4, 32, 32)     # store keeps them flat
         img = vae.decode(lat / VAE_SCALE).sample          # [-1, 1]
         img = (img.clamp(-1, 1) + 1.0) / 2.0              # [0, 1]
-        # InceptionV3(resize_input=True, normalize_input=True) handles the
-        # 299x299 bilinear resize and the [-1,1] rescale internally. Do NOT
-        # pre-resize -- resize implementation is a known source of FID drift
-        # between codebases (cf. clean-fid).
         return inception(img)[0].squeeze(-1).squeeze(-1).cpu().numpy()
 
     # ---- reference statistics -------------------------------------------

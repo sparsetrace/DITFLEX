@@ -53,6 +53,7 @@ image = (
     .apt_install("git")
     .pip_install("torch", "torchvision", extra_options=f"--index-url {TORCH_INDEX}")
     .pip_install(
+        "accelerate>=0.34",     # else diffusers falls back to slow VAE loading
         "diffusers>=0.31",
         "transformers>=4.44",
         "safetensors>=0.4.5",
@@ -120,6 +121,66 @@ def sample_latents(model, labels, *, steps: int, cfg_scale: float, cfg, device):
 # =============================================================================
 
 
+
+def _load_latent_store(latents_repo: str, n: int, num_classes: int, seed: int):
+    """Sample n latents (class-balanced when labels are present) from an HF store.
+
+    Handles sharded stores: the previous version grabbed the FIRST shard via
+    rglob(), which silently sampled a fraction of the dataset.
+    """
+    import torch
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
+
+    path = Path(snapshot_download(repo_id=latents_repo, repo_type="dataset"))
+    shards = sorted(path.rglob("*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(
+            f"no .safetensors under {path} -- check latents_repo and repo_type "
+            f"(this branch assumes repo_type='dataset')"
+        )
+    print(f"[fid] latent store: {len(shards)} shard(s)")
+
+    lat_parts, lab_parts = [], []
+    for s in shards:
+        d = load_file(str(s))
+        lk = next((k for k in ("latents", "latent", "x", "data") if k in d), None)
+        if lk is None:
+            raise KeyError(f"{s.name}: no latent tensor found; keys = {list(d)}")
+        lat_parts.append(d[lk])
+        bk = next((k for k in ("labels", "label", "y", "classes") if k in d), None)
+        if bk is not None:
+            lab_parts.append(d[bk])
+
+    lat = torch.cat(lat_parts) if len(lat_parts) > 1 else lat_parts[0]
+    lab = None
+    if lab_parts:
+        lab = torch.cat(lab_parts) if len(lab_parts) > 1 else lab_parts[0]
+    print(f"[fid] {lat.shape[0]:,} latents, labels={'yes' if lab is not None else 'no'}")
+
+    if lat.shape[0] < n:
+        raise ValueError(f"store has {lat.shape[0]} latents, need {n}")
+
+    g = torch.Generator().manual_seed(seed)
+    if lab is not None:
+        # Class-balanced, matching the generation side exactly.
+        per = n // num_classes
+        idx = []
+        for c in range(num_classes):
+            pool = (lab == c).nonzero(as_tuple=True)[0]
+            if len(pool) < per:
+                raise ValueError(f"class {c}: {len(pool)} available, need {per}")
+            idx.append(pool[torch.randperm(len(pool), generator=g)[:per]])
+        idx = torch.cat(idx)
+        idx = idx[torch.randperm(len(idx), generator=g)]
+        print(f"[fid] reference: class-balanced, {per}/class")
+    else:
+        idx = torch.randperm(lat.shape[0], generator=g)[:n]
+        print("[fid] reference: uniform random (no labels found -- NOT class-balanced, "
+              "which biases FID against the class-balanced generation side)")
+    return lat, idx
+
+
 def frechet_distance(mu1, sigma1, mu2, sigma2, eps: float = 1e-6) -> float:
     """Standard FID formula (Heusel et al. 2017)."""
     import numpy as np
@@ -147,6 +208,7 @@ def _stats(features):
 @app.function(
     gpu=GPU_KIND,
     cpu=8.0,
+    memory=32768,   # latent store is ~10 GiB in CPU RAM during reference pass
     timeout=TIMEOUT,
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
@@ -163,8 +225,23 @@ def evaluate(
 ) -> str:
     import numpy as np
     import torch
-    from diffusers import AutoencoderKL
     
+    # Fail before spending GPU time on a misconfigured dispatch.
+    if not ref_stats_url and ref_mode == "latents" and not latents_repo:
+        raise ValueError(
+            "ref_mode='latents' requires --latents-repo (the HF dataset repo "
+            "holding the SD-VAE latents). Either set it, or pass --ref-stats-url "
+            "pointing at a precomputed reference .npz."
+        )
+    if num_samples % 1000 != 0:
+        print(f"[fid] WARNING: num_samples={num_samples} is not a multiple of 1000, "
+              f"so classes cannot be exactly balanced.")
+
+
+    device = torch.device("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    from diffusers import AutoencoderKL
     from tqdm import tqdm
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -177,7 +254,11 @@ def evaluate(
     torchvision.ops.nms(torch.zeros(1, 4), torch.zeros(1), 0.5)
     print("[fid] torchvision C++ ops OK")
     from pytorch_fid.inception import InceptionV3
+
+
+
     
+
     # ---- Inception (block 3 = 2048-d pool features, the FID standard) ----
     inception = InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[2048]]).to(device).eval()
 
@@ -203,25 +284,17 @@ def evaluate(
         mu_ref, sigma_ref = ref["mu"], ref["sigma"]
         ref_desc = ref_stats_url
     elif ref_mode == "latents":
-        print(f"[fid] computing reference stats from real latents ({num_samples})")
-        from huggingface_hub import snapshot_download
-        from safetensors.torch import load_file
-
-        path = snapshot_download(repo_id=latents_repo, repo_type="dataset")
-        # NOTE: adjust to your latent-store layout.
-        store = load_file(next(Path(path).rglob("*.safetensors")))
-        all_lat = store["latents"]
-        g = torch.Generator().manual_seed(seed)
-        idx = torch.randperm(all_lat.shape[0], generator=g)[:num_samples]
-
+        print(f"[fid] computing reference stats from real latents (n={num_samples})")
+        all_lat, idx = _load_latent_store(latents_repo, num_samples, 1000, seed)
         feats = np.empty((num_samples, 2048), dtype=np.float32)
         for i in tqdm(range(0, num_samples, batch_size), desc="ref"):
             sl = idx[i : i + batch_size]
             lat = all_lat[sl].to(device=device, dtype=torch.float32)
             feats[i : i + len(sl)] = features_from_latents(lat)
         mu_ref, sigma_ref = _stats(feats)
-        ref_desc = f"vae-decoded latents from {latents_repo} (NOT publication-comparable)"
-        del feats
+        ref_desc = (f"VAE-decoded latents from {latents_repo} "
+                    f"(same decoder as generation; NOT comparable to published FID)")
+        del feats, all_lat
     else:
         raise ValueError("supply ref_stats_url, or ref_mode='latents' with latents_repo")
 

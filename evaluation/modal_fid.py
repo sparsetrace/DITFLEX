@@ -51,7 +51,7 @@ TIMEOUT = int(os.environ.get("MODAL_FID_SECONDS", "14400"))
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
-    .pip_install("torch", "torchvision", extra_options=f"--index-url {TORCH_INDEX}")
+    .pip_install("torch", extra_options=f"--index-url {TORCH_INDEX}")
     .pip_install(
         "accelerate>=0.34",     # else diffusers falls back to slow VAE loading
         "diffusers>=0.31",
@@ -85,37 +85,109 @@ VAE_SCALE = 0.18215
 # =============================================================================
 
 def load_checkpoint(repo: str, device):
-    """Return (model, model_config) with EMA weights loaded, in eval mode.
+    """Return (model, ModelConfig) with EMA weights loaded, in eval mode.
 
-    Mirror whatever sampling/sample.py does. The shape is:
-        cfg  = ModelConfig(**checkpoint_config_dict)
-        model = build_dmap_model(cfg) if cfg.qk_mode == "dmap" else build_model(cfg)
-        model.load_state_dict(ema_state_dict)   # <-- EMA, not raw
+    Filenames are discovered rather than assumed: the first run prints the
+    repo's file list, so if the guesses below miss, the log tells you exactly
+    what to put in CFG_NAMES / EMA_NAMES / RAW_NAMES.
+    """
+    import dataclasses
+    import json
+    import sys
+
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
+
+    sys.path.insert(0, "/repo/src")
+    from ditflex.config import ModelConfig
+    from ditflex.diffusion_model import build_dmap_model
+    from ditflex.model import build_model
+
+    CFG_NAMES = ("config.json", "model_config.json", "ditflex_config.json")
+    EMA_NAMES = ("ema.safetensors", "ema_model.safetensors", "model_ema.safetensors")
+    RAW_NAMES = ("model.safetensors", "diffusion_pytorch_model.safetensors",
+                 "pytorch_model.safetensors")
+
+    path = Path(snapshot_download(repo_id=repo, repo_type="model"))
+    listing = sorted(p.relative_to(path).as_posix() for p in path.rglob("*") if p.is_file())
+    print(f"[fid] {repo} contains: {listing}")
+
+    # ---- config ----
+    cfg_file = next((path / n for n in CFG_NAMES if (path / n).exists()), None)
+    if cfg_file is None:
+        raise FileNotFoundError(
+            f"no config json among {CFG_NAMES}; repo has {listing}. "
+            f"Add the correct name to CFG_NAMES."
+        )
+    raw_cfg = json.loads(cfg_file.read_text())
+    model_cfg = raw_cfg.get("model", raw_cfg)        # full Config or flat ModelConfig
+    known = {f.name for f in dataclasses.fields(ModelConfig)}
+    dropped = set(model_cfg) - known
+    if dropped:
+        print(f"[fid] ignoring non-ModelConfig keys: {sorted(dropped)}")
+    cfg = ModelConfig(**{k: v for k, v in model_cfg.items() if k in known})
+    print(f"[fid] cfg: qk_mode={cfg.qk_mode} qk_norm={cfg.qk_norm} "
+          f"dmap_alpha={cfg.dmap_alpha} num_classes={cfg.num_classes}")
+
+    # ---- weights: EMA strongly preferred ----
+    wfile = next((path / n for n in EMA_NAMES if (path / n).exists()), None)
+    used_ema = wfile is not None
+    if wfile is None:
+        wfile = next((path / n for n in RAW_NAMES if (path / n).exists()), None)
+    if wfile is None:
+        raise FileNotFoundError(
+            f"no weights among {EMA_NAMES + RAW_NAMES}; repo has {listing}."
+        )
+    state = load_file(str(wfile))
+    if not used_ema:                                  # EMA may live inside the same file
+        if any(k.startswith("ema.") for k in state):
+            state = {k[4:]: v for k, v in state.items() if k.startswith("ema.")}
+            used_ema = True
+    if used_ema:
+        print(f"[fid] weights: {wfile.name} (EMA)")
+    else:
+        print(f"[fid] *** WARNING: {wfile.name} looks like RAW weights, not EMA.  ***")
+        print("[fid] *** Under constant-LR the raw weights orbit the minimum while ***")
+        print("[fid] *** the EMA sits in it; FID will be inflated. Check the repo.  ***")
+
+    # ---- build + load ----
+    model = build_dmap_model(cfg) if cfg.qk_mode == "dmap" else build_model(cfg)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        print(f"[fid] load_state_dict: {len(missing)} missing, {len(unexpected)} unexpected")
+        if missing:
+            print(f"[fid]   missing[:5]    = {missing[:5]}")
+        if unexpected:
+            print(f"[fid]   unexpected[:5] = {unexpected[:5]}")
+        if len(missing) > 10:
+            raise RuntimeError("too many missing keys -- wrong weights file or config")
+    return model.to(device).eval(), cfg
+
+
+def sample_latents(model, labels, *, steps: int, cfg_scale: float, cfg,
+                   device, objective: str, seed: int):
+    """Return [B,4,32,32] scaled latents using the SAME sampler as sample.py.
+
+    NOTE the per-batch `seed`. sample_flow/sample_ddim seed their initial noise
+    from this argument (default FIXED_SEED), so calling them with a constant
+    seed would draw every batch from the same noise tensors: diversity would
+    collapse and FID would be badly inflated, with no error raised anywhere.
     """
     import sys
-    sys.path.insert(0, "/repo/src")
-    from ditflex.config import ModelConfig                      # noqa: F401
-    from ditflex.model import build_model                       # noqa: F401
-    from ditflex.diffusion_model import build_dmap_model        # noqa: F401
 
-    raise NotImplementedError(
-        "Wire to sampling/sample.py's checkpoint loader. Confirm it selects "
-        "the EMA shadow weights, not the raw ones."
+    sys.path.insert(0, "/repo/src")
+    from ditflex.sample import sample_ddim, sample_flow
+
+    sampler = sample_flow if objective == "flow" else sample_ddim
+    return sampler(
+        model, labels.cpu(),
+        num_classes=cfg.num_classes,
+        cfg_scale=cfg_scale,
+        ode_steps=steps,
+        seed=seed,
+        device=device,
     )
 
-
-def sample_latents(model, labels, *, steps: int, cfg_scale: float, cfg, device):
-    """Return a [B, 4, 32, 32] latent batch. Mirror sample.py's integrator.
-
-    Flow/rectified-flow Euler, matching the `flow` objective:
-        x = randn; for t in linspace(0,1,steps+1)[:-1]:
-            v = model(x, t, labels)                       # velocity
-            v = v_uncond + cfg_scale * (v_cond - v_uncond)
-            x = x + v * dt
-    Use the SAME integrator and step count for every chain you compare, or
-    the comparison measures the sampler rather than the model.
-    """
-    raise NotImplementedError("Wire to sampling/sample.py's sampler.")
 
 
 # =============================================================================
@@ -221,11 +293,9 @@ def evaluate(
     ref_stats_url: str = "",
     ref_mode: str = "latents",
     latents_repo: str = "",
+    objective: str = "flow",
     seed: int = 0,
 ) -> str:
-    import numpy as np
-    import torch
-    
     # Fail before spending GPU time on a misconfigured dispatch.
     if not ref_stats_url and ref_mode == "latents" and not latents_repo:
         raise ValueError(
@@ -237,27 +307,14 @@ def evaluate(
         print(f"[fid] WARNING: num_samples={num_samples} is not a multiple of 1000, "
               f"so classes cannot be exactly balanced.")
 
-
-    device = torch.device("cuda")
-    torch.backends.cuda.matmul.allow_tf32 = True
-
+    import numpy as np
+    import torch
     from diffusers import AutoencoderKL
+    from pytorch_fid.inception import InceptionV3
     from tqdm import tqdm
+
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
-    # --- ABI smoke test: forces torchvision's C++ extension to load ---------
-    # torchvision built against a different torch than the CUDA wheel fails
-    # here with "operator torchvision::nms does not exist" -- cheap to check
-    # now, expensive to discover after an hour of sampling.
-    import torchvision
-    print(f"[fid] torch {torch.__version__} / torchvision {torchvision.__version__}")
-    torchvision.ops.nms(torch.zeros(1, 4), torch.zeros(1), 0.5)
-    print("[fid] torchvision C++ ops OK")
-    from pytorch_fid.inception import InceptionV3
-
-
-
-    
 
     # ---- Inception (block 3 = 2048-d pool features, the FID standard) ----
     inception = InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[2048]]).to(device).eval()
@@ -266,11 +323,13 @@ def evaluate(
 
     @torch.no_grad()
     def features_from_latents(lat):
-        """[B,4,32,32] or flat [B,4096] latents -> [B,2048] Inception features."""
-        if lat.dim() == 2:
-            lat = lat.view(lat.shape[0], 4, 32, 32)     # store keeps them flat
+        """[B,4,32,32] latents -> [B,2048] Inception pool features."""
         img = vae.decode(lat / VAE_SCALE).sample          # [-1, 1]
         img = (img.clamp(-1, 1) + 1.0) / 2.0              # [0, 1]
+        # InceptionV3(resize_input=True, normalize_input=True) handles the
+        # 299x299 bilinear resize and the [-1,1] rescale internally. Do NOT
+        # pre-resize -- resize implementation is a known source of FID drift
+        # between codebases (cf. clean-fid).
         return inception(img)[0].squeeze(-1).squeeze(-1).cpu().numpy()
 
     # ---- reference statistics -------------------------------------------
@@ -284,25 +343,6 @@ def evaluate(
     elif ref_mode == "latents":
         print(f"[fid] computing reference stats from real latents (n={num_samples})")
         all_lat, idx = _load_latent_store(latents_repo, num_samples, 1000, seed)
-
-        # --- layout check: (C,H,W) vs (H,W,C) is silent if wrong ------------
-        if all_lat.dim() == 2:
-            probe = all_lat[idx[:256]].float()
-
-            def _nbr_corr(x):                      # x: [B,C,H,W]
-                u = x[..., :, :-1].reshape(-1)
-                v = x[..., :, 1:].reshape(-1)
-                u = u - u.mean(); v = v - v.mean()
-                return float(u @ v / (u.norm() * v.norm() + 1e-12))
-
-            chw = _nbr_corr(probe.view(-1, 4, 32, 32))
-            hwc = _nbr_corr(probe.view(-1, 32, 32, 4).permute(0, 3, 1, 2))
-            print(f"[fid] layout probe: neighbour corr  CHW={chw:.3f}  HWC={hwc:.3f}")
-            print(f"[fid] -> latents are {'CHW (correct)' if chw > hwc else 'HWC -- FIX THE RESHAPE'}")
-            print(f"[fid] per-channel mean {probe.view(-1,4,32,32).mean((0,2,3)).tolist()}")
-            print(f"[fid] per-channel std  {probe.view(-1,4,32,32).std((0,2,3)).tolist()}")
-        # ---------------------------------------------------------------------
-
         feats = np.empty((num_samples, 2048), dtype=np.float32)
         for i in tqdm(range(0, num_samples, batch_size), desc="ref"):
             sl = idx[i : i + batch_size]
@@ -318,7 +358,8 @@ def evaluate(
     # ---- per-chain generation --------------------------------------------
     results = {"config": {
         "num_samples": num_samples, "sample_steps": sample_steps,
-        "cfg_scale": cfg_scale, "seed": seed, "reference": ref_desc,
+        "cfg_scale": cfg_scale, "seed": seed, "objective": objective,
+        "reference": ref_desc,
         "gpu": GPU_KIND,
     }, "fid": {}}
 
@@ -335,9 +376,11 @@ def evaluate(
         for i in tqdm(range(0, num_samples, batch_size), desc=repo.split("/")[-1]):
             lab = labels_all[i : i + batch_size]
             with torch.no_grad():
+                # Per-batch seed -- see the note in sample_latents().
                 lat = sample_latents(
                     model, lab, steps=sample_steps, cfg_scale=cfg_scale,
-                    cfg=cfg, device=device,
+                    cfg=cfg, device=device, objective=objective,
+                    seed=seed * 1_000_003 + i,
                 )
                 feats[i : i + len(lab)] = features_from_latents(lat)
 
@@ -364,13 +407,14 @@ def main(
     ref_stats_url: str = "",
     ref_mode: str = "latents",
     latents_repo: str = "",
+    objective: str = "flow",
     seed: int = 0,
 ):
     payload = evaluate.remote(
         repos=repos, num_samples=num_samples, batch_size=batch_size,
         sample_steps=sample_steps, cfg_scale=cfg_scale,
         ref_stats_url=ref_stats_url, ref_mode=ref_mode,
-        latents_repo=latents_repo, seed=seed,
+        latents_repo=latents_repo, objective=objective, seed=seed,
     )
     Path("evaluation").mkdir(exist_ok=True)
     Path("evaluation/fid_results.json").write_text(payload)

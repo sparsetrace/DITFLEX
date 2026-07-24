@@ -90,6 +90,25 @@ VAE_SCALE = 0.18215
 # this script needs to know your codebase, and they are deliberately isolated.
 # =============================================================================
 
+def _find_model_cfg(obj, known: set):
+    """Depth-first search for the nested dict carrying the most ModelConfig
+    fields. Checkpoint state files bury the model config at varying depths;
+    this finds it without hardcoding a path."""
+    best, best_score, best_path = None, 0, ""
+    stack = [(obj, "")]
+    while stack:
+        cur, path = stack.pop()
+        if isinstance(cur, dict):
+            score = len(known & set(cur))
+            if score > best_score:
+                best, best_score, best_path = cur, score, path or "<root>"
+            stack.extend((v, f"{path}.{k}" if path else k)
+                         for k, v in cur.items() if isinstance(v, (dict, list)))
+        elif isinstance(cur, list):
+            stack.extend((v, f"{path}[]") for v in cur if isinstance(v, (dict, list)))
+    return best, best_score, best_path
+
+
 def load_checkpoint(repo: str, device):
     """Return (model, ModelConfig) with EMA weights loaded, in eval mode.
 
@@ -109,12 +128,18 @@ def load_checkpoint(repo: str, device):
     from ditflex.diffusion_model import build_dmap_model
     from ditflex.model import build_model
 
-    CFG_NAMES = ("config.json", "model_config.json", "ditflex_config.json")
+    CFG_NAMES = ("state.json", "config.json", "model_config.json",
+                 "ditflex_config.json")
     EMA_NAMES = ("ema.safetensors", "ema_model.safetensors", "model_ema.safetensors")
     RAW_NAMES = ("model.safetensors", "diffusion_pytorch_model.safetensors",
                  "pytorch_model.safetensors")
 
-    path = Path(snapshot_download(repo_id=repo, repo_type="model"))
+    # Skip archive/ (duplicate older checkpoints), samples/ (PNGs) and
+    # optim.safetensors (~2x model size, Adam moments) -- none are needed here.
+    path = Path(snapshot_download(
+        repo_id=repo, repo_type="model",
+        ignore_patterns=["archive/*", "samples/*", "optim.safetensors"],
+    ))
     listing = sorted(p.relative_to(path).as_posix() for p in path.rglob("*") if p.is_file())
     print(f"[fid] {repo} contains: {listing}")
 
@@ -126,11 +151,15 @@ def load_checkpoint(repo: str, device):
             f"Add the correct name to CFG_NAMES."
         )
     raw_cfg = json.loads(cfg_file.read_text())
-    model_cfg = raw_cfg.get("model", raw_cfg)        # full Config or flat ModelConfig
     known = {f.name for f in dataclasses.fields(ModelConfig)}
-    dropped = set(model_cfg) - known
-    if dropped:
-        print(f"[fid] ignoring non-ModelConfig keys: {sorted(dropped)}")
+    model_cfg, score, where = _find_model_cfg(raw_cfg, known)
+    if model_cfg is None or score < 3:
+        raise KeyError(
+            f"{cfg_file.name}: no ModelConfig-like block found (best match had "
+            f"{score} of {len(known)} fields). Top-level keys: {sorted(raw_cfg)}"
+        )
+    print(f"[fid] model config from {cfg_file.name}:{where} "
+          f"({score}/{len(known)} fields present)")
     cfg = ModelConfig(**{k: v for k, v in model_cfg.items() if k in known})
     print(f"[fid] cfg: qk_mode={cfg.qk_mode} qk_norm={cfg.qk_norm} "
           f"dmap_alpha={cfg.dmap_alpha} num_classes={cfg.num_classes}")

@@ -188,14 +188,47 @@ def load_checkpoint(repo: str, device):
     # ---- build + load ----
     model = build_dmap_model(cfg) if cfg.qk_mode == "dmap" else build_model(cfg)
     missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing or unexpected:
-        print(f"[fid] load_state_dict: {len(missing)} missing, {len(unexpected)} unexpected")
-        if missing:
-            print(f"[fid]   missing[:5]    = {missing[:5]}")
+
+    # DMAP ties W_K to W_Q, so no separate W_K was ever trained and the
+    # checkpoint has no to_k tensors -- 2 per block is EXPECTED here, not a
+    # fault. Only non-to_k gaps indicate a wrong file or config.
+    tied_k = [k for k in missing if ".to_k." in k]
+    other_missing = [k for k in missing if ".to_k." not in k]
+
+    if tied_k:
+        if cfg.qk_mode != "dmap":
+            raise RuntimeError(
+                f"{len(tied_k)} to_k tensors missing but qk_mode={cfg.qk_mode!r} "
+                f"-- an amap checkpoint must carry W_K. Wrong weights file?"
+            )
+        print(f"[fid] {len(tied_k)} to_k tensors absent -- expected for "
+              f"qk_mode=dmap (W_K tied to W_Q)")
+        # Verify the built model really ties them. If to_k is a separate,
+        # untrained module the processor MUST never read it, or we would be
+        # sampling with a randomly initialised W_K and see no error.
+        try:
+            a = model.transformer_blocks[0].attn1
+            aliased = (a.to_k is a.to_q) or (
+                a.to_k.weight.data_ptr() == a.to_q.weight.data_ptr())
+            if aliased:
+                print("[fid] to_k aliases to_q -- tying confirmed at the module level")
+            else:
+                print("[fid] NOTE: to_k is a separate module left at init; the dmap "
+                      "processor is expected to ignore it (see build_dmap_model). "
+                      "If samples look like noise, this is the first thing to check.")
+        except AttributeError as e:
+            print(f"[fid] could not inspect attn tying ({e})")
+
+    if other_missing or unexpected:
+        print(f"[fid] load_state_dict: {len(other_missing)} unexpected-missing, "
+              f"{len(unexpected)} unexpected")
+        if other_missing:
+            print(f"[fid]   missing[:5]    = {other_missing[:5]}")
         if unexpected:
             print(f"[fid]   unexpected[:5] = {unexpected[:5]}")
-        if len(missing) > 10:
+        if len(other_missing) > 10:
             raise RuntimeError("too many missing keys -- wrong weights file or config")
+
     return model.to(device).eval(), cfg
 
 

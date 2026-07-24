@@ -1,0 +1,14 @@
+{
+  "config": {
+    "num_samples": 50000,
+    "sample_steps": 50,
+    "cfg_scale": 1.5,
+    "seed": 0,
+    "objective": "flow",
+    "reference": "VAE-decoded latents from sparsetrace/dlatentzz (same decoder as generation; NOT comparable to published FID)",
+    "gpu": "H100"
+  },
+  "fid": {
+    "sparsetrace/ditflex-L2-flow-dmap": 18.7464
+  }
+}

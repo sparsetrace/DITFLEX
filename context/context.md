@@ -1,6 +1,6 @@
 # ditflex -- repo snapshot
 
-Generated 2026-07-21 00:08 UTC by context/context.py. 45 files.
+Generated 2026-07-25 15:36 UTC by context/context.py. 54 files.
 
 ## Tree
 
@@ -9,6 +9,7 @@ DITFLEX/
 ├── .github/
     ├── workflows/
         ├── context.yml
+        ├── fid.yml
         ├── quick-train.yml
         ├── recover-checkpoint.yml
         ├── sampling.yml
@@ -17,10 +18,14 @@ DITFLEX/
         ├── train-recovery-270k.yml
         ├── train.yml
 ├── README.md
+├── evaluation/
+    ├── fid_results.json
+    ├── modal_fid.py
 ├── pyproject.toml
 ├── quick_train/
     ├── modal_quick.py
 ├── run/
+    ├── migrate_qknorm.py
     ├── modal_train.py
     ├── recover_checkpoint.py
 ├── sampling/
@@ -36,8 +41,11 @@ DITFLEX/
         ├── distributed.py
         ├── ema.py
         ├── latents.py
+        ├── migrate.py
+        ├── modal_train.py
         ├── model.py
         ├── objective.py
+        ├── probe.py
         ├── sample.py
         ├── stability.py
         ├── train.py
@@ -53,8 +61,10 @@ DITFLEX/
     ├── test_dmap_model.py
     ├── test_ema.py
     ├── test_latents_shapes.py
+    ├── test_migrate_qknorm.py
     ├── test_objective_math.py
     ├── test_objective_rng.py
+    ├── test_probe.py
     ├── test_stability.py
     ├── verify_identity.py
     ├── verify_latents.py
@@ -121,6 +131,157 @@ jobs:
             git commit -m "context: refresh repo snapshot [skip ci]"
             git push
           fi
+```
+
+### `.github/workflows/fid.yml`
+
+```yaml
+name: fid
+
+# Manual dispatch: compute FID for one or more checkpoint repos and COMMIT
+# evaluation/fid_results.json back into this repo. Non-detached (the job
+# needs the result back to commit it).
+#
+# GPU SIZING -- read before dispatching.
+#   The sampling workflow uses L4 because a 4x4 grid is ~1,600 forward
+#   passes. FID at 50k samples x 50 Euler steps x 2 (CFG) is ~5,000,000
+#   forward passes -- roughly 3,000x more work. Extrapolating from this
+#   model's measured training throughput that is order-of-an-hour on a
+#   B200/H100 and order-of-a-DAY on an L4. Do not use L4 here except for a
+#   num_samples=1000 smoke test.
+#
+# WHAT MAKES THE NUMBER MEANINGFUL
+#   * reference stats: ADM's VIRTUAL_imagenet256_labeled.npz for numbers
+#     comparable to published DiT/SiT; ref_mode=latents for a self-consistent
+#     dmap-vs-amap comparison that is NOT comparable to published figures.
+#   * num_samples: FID is biased upward at small N and the bias does not
+#     cancel between models unless N matches. 50k is the convention.
+#   * identical sampler settings across chains, or you measure the sampler.
+#   * EMA weights (see the ADAPTER section of modal_fid.py).
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: "Comma-separated checkpoint repos (compare arms in ONE dispatch so settings match)"
+        required: false
+        default: "sparsetrace/ditflex-L2-flow,sparsetrace/ditflex-L2-flow-dmap"
+      gpu:
+        description: "GPU kind. H100/B200 for real runs; L4 only for a 1000-sample smoke test."
+        required: false
+        default: "H100"
+      num_samples:
+        description: "Samples per chain (50000 = convention, 10000 = internal comparison, 1000 = smoke test)"
+        required: false
+        default: "50000"
+      batch_size:
+        description: "Sampling batch size (64 fits comfortably on 80GB; drop to 16 on L4)"
+        required: false
+        default: "64"
+      sample_steps:
+        description: "Euler steps (must match across compared chains)"
+        required: false
+        default: "50"
+      cfg_scale:
+        description: "CFG scale. NOTE: published DiT/SiT FID uses 1.5; the 4.0 used for pretty grids inflates FID badly."
+        required: false
+        default: "1.5"
+      ref_stats_url:
+        description: "URL of a precomputed reference .npz (mu/sigma). Leave empty to use ref_mode."
+        required: false
+        default: ""
+      ref_mode:
+        description: "Fallback when ref_stats_url is empty: 'latents' = stats from your own VAE-decoded latents"
+        required: false
+        default: "latents"
+      latents_repo:
+        description: "HF dataset repo with the SD-VAE latents. REQUIRED unless ref_stats_url is set. Decoded with the same VAE as the samples, so the comparison isolates the generative model (but is not comparable to published FID)."
+        required: false
+        default: "sparsetrace/dlatentzz"
+      objective:
+        description: "flow (SiT / rectified flow) or ddpm (DiT). Must match how the chain was trained."
+        required: false
+        default: "flow"
+      seed:
+        description: "Base seed for class assignment and noise. Varied per batch internally; hold fixed across chains."
+        required: false
+        default: "0"
+      fid_seconds:
+        description: "Modal timeout in seconds (50k samples needs hours)"
+        required: false
+        default: "14400"
+
+permissions:
+  contents: write   # required to push fid_results.json
+
+jobs:
+  fid:
+    name: "fid · ${{ inputs.repos }} · N=${{ inputs.num_samples }} · ${{ inputs.gpu }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Modal
+        run: |
+          # huggingface_hub is needed LOCALLY so Modal can deserialize remote
+          # exceptions raised inside HF calls. Without it every such failure
+          # surfaces as an opaque "Could not deserialize remote exception".
+          pip install 'modal<1.5' huggingface_hub
+          modal --version
+
+      - name: Authenticate Modal
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          modal token set --token-id "$MODAL_TOKEN_ID" --token-secret "$MODAL_TOKEN_SECRET"
+
+      - name: Validate inputs
+        run: |
+          if [ -z "${{ inputs.ref_stats_url }}" ] && \
+             [ "${{ inputs.ref_mode }}" = "latents" ] && \
+             [ -z "${{ inputs.latents_repo }}" ]; then
+            echo "::error::ref_mode=latents requires latents_repo (HF dataset repo with the SD-VAE latents)."
+            exit 1
+          fi
+          if [ $(( ${{ inputs.num_samples }} % 1000 )) -ne 0 ]; then
+            echo "::warning::num_samples is not a multiple of 1000; classes cannot be exactly balanced."
+          fi
+
+      - name: Compute FID on Modal
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODAL_GPU: ${{ inputs.gpu }}
+          MODAL_FID_SECONDS: ${{ inputs.fid_seconds }}
+        run: |
+          echo "gpu=${MODAL_GPU} N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }}"
+          modal run evaluation/modal_fid.py \
+            --repos "${{ inputs.repos }}" \
+            --num-samples "${{ inputs.num_samples }}" \
+            --batch-size "${{ inputs.batch_size }}" \
+            --sample-steps "${{ inputs.sample_steps }}" \
+            --cfg-scale "${{ inputs.cfg_scale }}" \
+            --ref-stats-url "${{ inputs.ref_stats_url }}" \
+            --ref-mode "${{ inputs.ref_mode }}" \
+            --objective "${{ inputs.objective }}" \
+            --latents-repo "${{ inputs.latents_repo }}" \
+            --seed "${{ inputs.seed }}"
+
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add evaluation/fid_results.json
+          git diff --cached --quiet && echo "no change" && exit 0
+          git commit -m "fid: N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }} [skip ci]"
+          git push
 ```
 
 ### `.github/workflows/quick-train.yml`
@@ -437,21 +598,79 @@ name: train-diffusion
 # The DMAP-DiT chain: EQ-sector attention (W_K tied to W_Q, R == 0),
 # same recipe and objective as the baseline chain, its OWN checkpoint
 # repo. Manual dispatch only, detached -- monitor in the Modal dashboard
-# (app: ditflex-train-dmap).
+# (app: ditflex-train).
+#
+# This chain now runs through the SAME supervisor as the baseline
+# (run/modal_train.py): transactional retries with LR backoff, stable
+# resume selection, adaptive LR controller, promotion markers, probe
+# diagnostics.  The only chain-defining pins are --qk-mode dmap and the
+# dedicated checkpoint repo; the config-drift guard keeps the two chains
+# from ever cross-resuming.
+#
+# Precision default is tf32 (deliberate mid-chain switch, recorded in
+# run_history.effective).  wd_ada defaults to 0: the DMAP chain has not
+# shown the baseline's adaLN growth; enable it only if the probe shows
+# the same climb.
+#
+# HARDWARE NOTE (RTX PRO 6000 Blackwell):
+#   gpus MUST be >= 2 on this card. The global batch (256) is fixed in the
+#   config and split per rank; run/modal_train.py exposes NO batch-size
+#   override (only --probe-batch). So gpus=1 puts the FULL batch of 256 on
+#   one card and OOMs in the compiled forward at
+#     empty_strided_cuda((256, 256, 1024), ..., torch.float32)
+#   -- 256 == the global batch, not a per-card batch. gpus=2 gives per-card
+#   batch 128, identical to the load each B300 carried, and fits in 96 GB
+#   with room to spare.
+#
+#   Single-card alternatives, if you want one: set precision=bf16 (halves
+#   activation bytes and may fit batch 256), or add a real batch/grad-accum
+#   flag to modal_train.py. Do NOT just shrink the batch without matching
+#   accumulation -- effective batch would change and the run stops being
+#   comparable to the existing chains.
+#
+#   Otherwise the card is fine: it compiled the model, loaded the resident
+#   latents and started stepping before the OOM, so FlexAttention +
+#   torch.compile work on Blackwell workstation silicon. 96 GB GDDR7 holds
+#   the ~9.77 GB resident latents easily (no data-path change needed), and
+#   tf32 (fp32-accumulate) is NOT throttled here -- the gaming-card
+#   restriction is lifted on workstation Blackwell -- so unlike a 5090 this
+#   card runs the tf32 path at full tensor-core rate. No NVLink, so the two
+#   cards talk over PCIe Gen5; expect worse-than-B300 scaling efficiency.
+#
+#   gpu_kind is passed straight through to Modal as f"{GPU_KIND}:{GPU_COUNT}"
+#   with no allowlist, and "RTX-PRO-6000" was accepted (the run launched), so
+#   the string is good.
+#
+# TARGET NOTE:
+#   The DMAP chain is already AT 400,000. With target_steps=400000 the
+#   stepping loop breaks immediately (`if step >= args.target_steps: break`).
+#   Raise target_steps (e.g. 500000) to continue the chain, or set a small
+#   max_steps with a higher target_steps for a throughput benchmark.
+#
+# LR NOTE (aggressive finish, ready-to-run defaults):
+#   Defaults are pre-set for the hot final stretch discussed for the DMAP
+#   chain: lr_policy=constant, lr=1e-4 (full recipe LR, no cosine decay),
+#   reset_lr_controller=true (discard the parked scale + stale reference and
+#   bootstrap fresh at scale 1.0). A plain dispatch therefore runs the
+#   aggressive config directly. Watch blk0 attn-logit max in the first two
+#   stability windows: it should stay in its bounded ~900-1400 band; the
+#   DMAP kernel is bounded above by construction, so a monotonic climb (not
+#   expected) would be the only reason to fall back to lr=5e-5. Set
+#   lr_policy=cosine / lr=0 to restore the decayed-envelope behavior.
 
 on:
   workflow_dispatch:
     inputs:
       gpus:
-        description: "GPU count (2 is the certified sweet spot)"
+        description: "GPU count. MUST be >= 2: global batch 256 is split per rank and there is no batch override, so gpus=1 OOMs with the full batch on one card."
         required: false
         default: "2"
       gpu_kind:
-        description: "GPU kind (B300 | B200)"
+        description: "GPU kind (RTX6000Ada-class Blackwell workstation | B300 | B200). Modal string for RTX PRO 6000 Blackwell."
         required: false
-        default: "B300"
+        default: "RTX-PRO-6000"
       train_seconds:
-        description: "Stepping budget in seconds (14400 = 4 h)"
+        description: "Stepping budget in seconds; Modal timeout adds retry allowance"
         required: false
         default: "14400"
       objective:
@@ -462,34 +681,93 @@ on:
         description: "Checkpoint repo for the DMAP chain (never share with the baseline)"
         required: false
         default: "sparsetrace/ditflex-L2-flow-dmap"
-      lr:
-        description: "LR override for this run (0 = keep recipe 1e-4; gain-compensation: 0.00005)"
+      target_steps:
+        description: "Global stop and cosine horizon"
+        required: false
+        default: "400000"
+      max_steps:
+        description: "Maximum data steps this invocation (0 = time-box only)"
         required: false
         default: "0"
-      wd:
-        description: "Weight-decay override for this run (-1 = keep recipe 0)"
-        required: false
-        default: "-1"
-      clip:
-        description: "Gradient-clip max-norm (46K cliff protocol: 0.25)"
-        required: false
-        default: "1.0"
-      spike_skip:
-        description: "Skip steps with grad norm > this x EMA (0 = off)"
-        required: false
-        default: "4.0"
-      grad_ceiling:
-        description: "Absolute grad-norm skip ceiling (0 = off)"
-        required: false
-        default: "25.0"
       dmap_alpha:
         description: "Coifman-Lafon exponent (0 | 0.5 | 1)"
         required: false
         default: "0.0"
 
+      # Numerics, stabilization, and diagnostics.
+      precision:
+        description: "Training numerics (tf32 | bf16). tf32 is full-rate on RTX PRO 6000 (no gaming throttle)."
+        required: false
+        default: "tf32"
+      wd_ada:
+        description: "Decoupled adaLN-only weight decay (0 = off, recipe-clean)"
+        required: false
+        default: "0"
+      probe:
+        description: "Enable ditflex.probe diagnostics (rank 0)"
+        required: false
+        default: "true"
+
+      lr_policy:
+        description: "constant | cosine | adaptive. Default constant for the aggressive finish; set cosine to restore the decayed envelope."
+        required: false
+        default: "constant"
+      lr:
+        description: "Base LR override (0 = recipe 1e-4). Default 0.0001 = full recipe LR, flat."
+        required: false
+        default: "0.0001"
+      lr_min:
+        description: "Cosine envelope floor at target_steps (only used when lr_policy=cosine/adaptive)"
+        required: false
+        default: "0.00001"
+      lr_hard_min:
+        description: "Absolute floor after adaptive backoffs"
+        required: false
+        default: "0.000001"
+      lr_backoff:
+        description: "Adaptive multiplier after sustained instability"
+        required: false
+        default: "0.5"
+      lr_min_scale:
+        description: "Minimum adaptive multiplier"
+        required: false
+        default: "0.125"
+      reset_lr_controller:
+        description: "Discard persisted controller state (parked scale + stale reference) and bootstrap fresh at scale 1.0. Default TRUE for the hot restart."
+        required: false
+        type: boolean
+        default: true
+
+      wd:
+        description: "Weight decay override (-1 = keep checkpoint/config)"
+        required: false
+        default: "-1"
+      clip:
+        description: "Global gradient-clip max norm"
+        required: false
+        default: "1.0"
+      spike_skip:
+        description: "Skip update above this multiple of the frozen gradient reference (0 = off)"
+        required: false
+        default: "4.0"
+      grad_ceiling:
+        description: "Absolute raw gradient-norm skip ceiling (0 = off; 25.0 was this chain's historical setting)"
+        required: false
+        default: "25.0"
+
+      extra_args:
+        description: >-
+          Extra modal-run flags, passed through verbatim (e.g.
+          "--probe-batch 16 --resume-step 100000 --no-auto-legacy-rollback").
+        required: false
+        default: ""
+
 jobs:
   launch:
-    name: "dmap · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }}"
+    name: >-
+      dmap · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }} ·
+      ${{ inputs.lr_policy }} to ${{ inputs.target_steps }} · ${{ inputs.precision }}
+
     runs-on: ubuntu-latest
 
     steps:
@@ -513,16 +791,31 @@ jobs:
           MODAL_GPUS: ${{ inputs.gpus }}
           MODAL_TRAIN_SECONDS: ${{ inputs.train_seconds }}
         run: |
-          modal run --detach train_diffusion/modal_train_dmap.py \
+          echo "modal token id present: ${MODAL_TOKEN_ID:+yes}"
+          echo "gpu: ${MODAL_GPUS}x${MODAL_GPU}  lr_policy=${{ inputs.lr_policy }} lr=${{ inputs.lr }} reset=${{ inputs.reset_lr_controller }}"
+          modal run --detach run/modal_train.py \
             --train-seconds "${{ inputs.train_seconds }}" \
             --objective "${{ inputs.objective }}" \
             --hub-repo "${{ inputs.hub_repo }}" \
+            --target-steps "${{ inputs.target_steps }}" \
+            --max-steps "${{ inputs.max_steps }}" \
+            --qk-mode dmap \
             --dmap-alpha "${{ inputs.dmap_alpha }}" \
+            --precision "${{ inputs.precision }}" \
+            --wd-ada "${{ inputs.wd_ada }}" \
+            ${{ inputs.probe == 'true' && '--probe-attn-logits' || '' }} \
+            --lr-policy "${{ inputs.lr_policy }}" \
+            --lr "${{ inputs.lr }}" \
+            --lr-min "${{ inputs.lr_min }}" \
+            --lr-hard-min "${{ inputs.lr_hard_min }}" \
+            --lr-backoff "${{ inputs.lr_backoff }}" \
+            --lr-min-scale "${{ inputs.lr_min_scale }}" \
+            --wd "${{ inputs.wd }}" \
             --clip "${{ inputs.clip }}" \
             --spike-skip "${{ inputs.spike_skip }}" \
             --grad-ceiling "${{ inputs.grad_ceiling }}" \
-            --lr "${{ inputs.lr }}" \
-            --wd "${{ inputs.wd }}"
+            ${{ inputs.reset_lr_controller && '--reset-lr-controller' || '' }} \
+            ${{ inputs.extra_args }}
 ```
 
 ### `.github/workflows/train-recovery-270k.yml`
@@ -570,6 +863,16 @@ on:
         required: false
         default: "5000"
 
+      # Numerics and diagnostics.
+      precision:
+        description: "Training numerics (tf32 = published recipe | bf16 = previous default)"
+        required: false
+        default: "tf32"
+      probe:
+        description: "Enable ditflex.probe diagnostics (grad families + attn logits, rank 0)"
+        required: false
+        default: "true"
+
       # Keep the checkpoint's current LR/controller by default.
       lr:
         description: "LR override (0 = restore checkpoint LR)"
@@ -596,6 +899,14 @@ on:
         description: "Weight decay override (-1 = restore recipe/checkpoint value)"
         required: false
         default: "-1"
+      wd_ada:
+        description: "Decoupled weight decay on the adaLN family only (0 = off)"
+        required: false
+        default: "0.01"
+      qk_norm:
+        description: "Model has per-head RMSNorm on Q/K (set true after the 344K migration)"
+        required: false
+        default: "false"
       clip:
         description: "Global gradient clipping max norm"
         required: false
@@ -608,10 +919,6 @@ on:
         description: "Absolute pre-clip gradient skip ceiling (0 = disabled)"
         required: false
         default: "500.0"
-      grad_reference:
-        description: "Optional frozen gradient reference override (0 = checkpoint reference)"
-        required: false
-        default: "0"
 
       # A high skip rate alone should warn before it rejects a flat-loss run.
       skip_warn_rate:
@@ -627,16 +934,13 @@ on:
         required: false
         default: "0.60"
 
-      seed_offset:
-        description: "Base deterministic stochastic-stream offset"
-        required: false
-        default: "0"
 
 jobs:
   launch:
     name: >-
       recovery · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} ·
-      step=${{ inputs.resume_step }} · max=${{ inputs.max_steps }}
+      step=${{ inputs.resume_step }} · max=${{ inputs.max_steps }} ·
+      ${{ inputs.precision }}${{ inputs.probe == 'true' && ' · probe' || '' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -673,19 +977,22 @@ jobs:
             --target-steps "${{ inputs.target_steps }}" \
             --max-steps "${{ inputs.max_steps }}" \
             --max-retries "${{ inputs.max_retries }}" \
+            --precision "${{ inputs.precision }}" \
+            ${{ inputs.probe == 'true' && '--probe-attn-logits' || '' }} \
             --lr "${{ inputs.lr }}" \
             --lr-policy "${{ inputs.lr_policy }}" \
             --lr-backoff "${{ inputs.lr_backoff }}" \
             --lr-min-scale "${{ inputs.lr_min_scale }}" \
             --wd "${{ inputs.wd }}" \
+            --wd-ada "${{ inputs.wd_ada }}" \
+            ${{ inputs.qk_norm == 'true' && '--qk-norm' || '' }} \
             --clip "${{ inputs.clip }}" \
             --spike-skip "${{ inputs.spike_skip }}" \
             --grad-ceiling "${{ inputs.grad_ceiling }}" \
-            --grad-reference "${{ inputs.grad_reference }}" \
             --skip-warn-rate "${{ inputs.skip_warn_rate }}" \
             --skip-retry-rate "${{ inputs.skip_retry_rate }}" \
             --skip-emergency-rate "${{ inputs.skip_emergency_rate }}" \
-            --seed-offset "${{ inputs.seed_offset }}"
+            ${{ inputs.extra_args }}
 ```
 
 ### `.github/workflows/train.yml`
@@ -695,6 +1002,16 @@ name: train
 
 # Manual dispatch only.  Each run is detached: GitHub exits after launch while
 # Modal pulls the latest healthy checkpoint, trains, saves, and pushes.
+#
+# Resume behavior: no pinned anchor.  The supervisor's stable-resume selection
+# runs; once latest is a v3 transactional checkpoint it is trusted as-is, so
+# this workflow simply picks up wherever the chain left off and continues
+# toward target_steps.  Use train-recovery-270k.yml when you need to pin an
+# exact historical step instead.
+#
+# GitHub caps workflow_dispatch at 25 inputs.  The deprecated v2 loss-ratio
+# inputs and seed_offset were removed to make room for precision / probe /
+# wd_ada; anything without a dedicated field goes through extra_args.
 
 on:
   workflow_dispatch:
@@ -708,7 +1025,7 @@ on:
         required: false
         default: "B200"
       train_seconds:
-        description: "Stepping budget in seconds; Modal timeout adds one hour"
+        description: "Stepping budget in seconds; Modal timeout adds retry allowance"
         required: false
         default: "14400"
       objective:
@@ -727,6 +1044,24 @@ on:
         description: "Maximum data steps this invocation (0 = time-box only)"
         required: false
         default: "0"
+
+      # Numerics, stabilization, and diagnostics.
+      precision:
+        description: "Training numerics (tf32 = published recipe | bf16 = legacy)"
+        required: false
+        default: "tf32"
+      wd_ada:
+        description: "Decoupled weight decay on the adaLN family only (0 = off)"
+        required: false
+        default: "0.01"
+      qk_norm:
+        description: "Model has per-head RMSNorm on Q/K (set true after the 344K migration)"
+        required: false
+        default: "false"
+      probe:
+        description: "Enable ditflex.probe diagnostics (grad families + attn logits, rank 0)"
+        required: false
+        default: "true"
 
       lr_policy:
         description: "constant | cosine | adaptive (cosine plus loss/spike backoff)"
@@ -752,14 +1087,6 @@ on:
         description: "Minimum adaptive multiplier"
         required: false
         default: "0.125"
-      loss_rise_ratio:
-        description: "Fast-loss EMA / slow-loss EMA warning threshold"
-        required: false
-        default: "1.08"
-      loss_emergency_ratio:
-        description: "Fast-loss EMA / slow-loss EMA emergency threshold"
-        required: false
-        default: "1.35"
       reset_lr_controller:
         description: "Discard persisted controller state after intentional policy changes"
         required: false
@@ -775,23 +1102,28 @@ on:
         required: false
         default: "1.0"
       spike_skip:
-        description: "Skip update above this multiple of gradient-norm EMA (0 = off)"
+        description: "Skip update above this multiple of the frozen gradient reference (0 = off)"
         required: false
         default: "4.0"
       grad_ceiling:
-        description: "Absolute raw gradient-norm skip ceiling (0 = off; recommended)"
+        description: "Absolute raw gradient-norm skip ceiling (0 = off)"
         required: false
         default: "0"
-      seed_offset:
-        description: "Runtime-only data-order seed offset"
+
+      extra_args:
+        description: >-
+          Extra modal-run flags, passed through verbatim (e.g.
+          "--probe-batch 16 --seed-offset 7 --resume-step 275000").
+          Anything without a dedicated field above goes here.
         required: false
-        default: "0"
+        default: ""
 
 jobs:
   launch:
     name: >-
       launch · ${{ inputs.gpus }}x${{ inputs.gpu_kind }} · ${{ inputs.objective }} ·
-      ${{ inputs.lr_policy }} to ${{ inputs.target_steps }}
+      ${{ inputs.lr_policy }} to ${{ inputs.target_steps }} · ${{ inputs.precision }} ·
+      wd_ada=${{ inputs.wd_ada }}${{ inputs.probe == 'true' && ' · probe' || '' }}
     runs-on: ubuntu-latest
 
     steps:
@@ -822,20 +1154,22 @@ jobs:
             --hub-repo "${{ inputs.hub_repo }}" \
             --target-steps "${{ inputs.target_steps }}" \
             --max-steps "${{ inputs.max_steps }}" \
+            --precision "${{ inputs.precision }}" \
+            --wd-ada "${{ inputs.wd_ada }}" \
+            ${{ inputs.qk_norm == 'true' && '--qk-norm' || '' }} \
+            ${{ inputs.probe == 'true' && '--probe-attn-logits' || '' }} \
             --lr-policy "${{ inputs.lr_policy }}" \
             --lr "${{ inputs.lr }}" \
             --lr-min "${{ inputs.lr_min }}" \
             --lr-hard-min "${{ inputs.lr_hard_min }}" \
             --lr-backoff "${{ inputs.lr_backoff }}" \
             --lr-min-scale "${{ inputs.lr_min_scale }}" \
-            --loss-rise-ratio "${{ inputs.loss_rise_ratio }}" \
-            --loss-emergency-ratio "${{ inputs.loss_emergency_ratio }}" \
             --wd "${{ inputs.wd }}" \
             --clip "${{ inputs.clip }}" \
             --spike-skip "${{ inputs.spike_skip }}" \
             --grad-ceiling "${{ inputs.grad_ceiling }}" \
-            --seed-offset "${{ inputs.seed_offset }}" \
-            ${{ inputs.reset_lr_controller && '--reset-lr-controller' || '' }}
+            ${{ inputs.reset_lr_controller && '--reset-lr-controller' || '' }} \
+            ${{ inputs.extra_args }}
 ```
 
 ### `README.md`
@@ -847,247 +1181,786 @@ DiT-L/2 on ImageNet-256 latents, with self-attention routed through PyTorch
 FlexAttention so the attention score function is a swappable component.
 
 Baselines: **DiT** (Peebles & Xie, 2023) for the DDPM objective, **SiT**
-(Ma et al., 2024) for flow matching — SiT is the same architecture with the
-objective swapped, so both are directly comparable at the DiT-L/2 config.
+(Ma et al., 2024) for flow matching — same architecture, objective swapped,
+directly comparable at DiT-L/2.
 
-Training runs are **time-boxed and chained**: each job trains for a fixed wall
-clock, pushes a checkpoint to the HF Hub, and exits. The next job resumes from
-it. Long training is many short runs, not one long one.
+Two chains train in parallel, each with its own Hub checkpoint repo:
+
+| chain | attention | repo | status |
+|---|---|---|---|
+| **amap** (baseline) | directed QK, R learned freely | `sparsetrace/ditflex-L2-flow` | ~344K / 400K; qk-norm migration at 344K |
+| **dmap** (experiment) | W_K ≡ W_Q, symmetric scores, R ≡ 0 | `sparsetrace/ditflex-L2-flow-dmap` | ~117K / 400K; stable, no interventions |
+
+Training is **time-boxed, transactional, and chained**: each job pulls the
+last *committed healthy* checkpoint from the Hub, trains a candidate, and
+promotes it only after consecutive stability windows pass loss and
+gradient-distribution gates. A bad candidate exits with code 75 and is never
+uploaded; the Modal supervisor retries from committed latest with a lower LR
+factor and a fresh deterministic seed stream. Long training is many short
+runs, not one long one.
 
 ---
 
-## Status / TODO
+## Stability findings (the 240K–344K arc)
 
-Ordered. Do not skip ahead — each step makes the next one interpretable.
+This section records what actually happened, because the interventions in
+this repo exist as responses to it.
 
-### Phase 0 — correctness gates
-- [x] Encode ImageNet-256 → SD-VAE latents, upload to HF
-- [x] Verify latent reconstruction (decode → image looks right)
-- [ ] `scripts/verify_identity.py` — identity FlexAttention vs default Diffusers
-      processor, assert max abs diff < 1e-4 in bf16. **Blocks everything.**
-- [ ] `scripts/verify_latents.py` — load from Hub, assert shape `[N, 4096]`,
-      `std ≈ 1.0` (scaling factor already applied — see Data Notes), labels in
-      `[0, 999]`, N matches manifest
-- [ ] `scripts/overfit_smoke.py` — 128 samples, loss → ~0 in a few hundred steps
+**The failure.** From ~240K the amap chain developed a gradient-spike
+instability with a distinctive signature: *loss perfectly flat* (~0.77)
+while pre-clip gradient norms drifted up in slow motion — median 8 → 68 →
+102 → 250 → 1000+ across ~60K steps — punctuated by spike storms that
+tripped skip-guards and, at 273K, a transactional retry cascade.
 
-### Phase 1 — plumbing
-- [ ] `config.py` dataclasses, JSON round-trip test
-- [ ] `latents.py` — GPU-resident store, rank-offset deterministic sampling
-- [ ] `objective.py` — DDPM eps and flow matching behind one interface
-- [ ] `checkpoint.py` — save/load/resume, HF Hub push/pull
-- [ ] `train.py` — DDP, `torch.compile`, time-boxed loop
-- [ ] `modal_app.py` — the only Modal-aware file
+**The diagnosis** (via `src/ditflex/probe.py`, opt-in rank-0 diagnostics):
 
-### Phase 2 — CI and launch
-- [ ] `.github/workflows/test.yml` — CPU unit tests on push
-- [ ] `.github/workflows/smoke.yml` — manual, 2 GPU / 10 min, full path
-      (download → train → checkpoint → upload) end to end
-- [ ] `.github/workflows/run.yml` — manual, 8 GPU / 5 h, detached
+1. **adaLN modulation weights grow without bound** under the published
+   recipe (wd = 0). The `ada` family reached |w| ≈ 4900 of |w|_total ≈ 4930
+   — an order of magnitude heavier than every other family combined — and
+   carried **~99% of every gradient spike** (per-family attribution on each
+   skipped step names it every time).
+2. **Downstream, block-1's QK logits explode.** The probe measured them at
+   3.4e6 → 8.6e6 → 16.2e6 over 270K → 334K. A softmax at that magnitude is
+   an exactly one-hot, discontinuous switch: near-zero gradient almost
+   everywhere, enormous gradient at flip boundaries — which is precisely
+   the flat-loss-plus-spikes signature.
+3. The two compose: adaLN's scale modulations amplify the tokens feeding
+   attention; attention logits inherit the growth; spikes route back
+   through adaLN.
 
-### Phase 3 — first real run
-- [ ] 2×B300 smoke: 1000 steps, confirm loss decreasing and checkpoint round-trips
-- [ ] 8×B300 × 5 h, DDPM objective, batch 256 — matches published DiT-L/2 recipe
-- [ ] Chain runs to 400K steps
-- [ ] `eval.py` + cached ImageNet reference stats → FID vs published DiT-L/2
+**What helped, in order of leverage:**
 
-### Phase 4 — the actual experiment
-- [ ] Flow matching objective, same config → compare against SiT-L/2
-- [ ] The score_mod modification
-- [ ] Horizontal-flip latents (see Data Notes) if chasing published numbers
+* **QK-norm** (per-head `RMSNorm(head_dim, eps=1e-6)` on Q and K) — the
+  structural fix, adopted at the 344K migration. Bounds per-head logits by
+  construction; the saturated head's function survives (a logit gap of ~30
+  is already functionally one-hot) while the flip-boundary cliffs do not.
+* **tf32 precision** (fp32 activations, TF32 tensor-core matmuls — the
+  published DiT/SiT numerics) — `--precision tf32`, now the default.
+  Observed calmer gradient behavior than the previous bf16-autocast
+  configuration at the same LR, at ~2× activation memory and lower
+  throughput (~2.3 vs ~4 steps/s at batch 256). Not sufficient alone: the
+  logit growth continued under tf32, confirming the pathology is
+  architectural, not numerical.
+* **adaLN-only decoupled weight decay** (`--wd-ada`, default 0.01 on the
+  amap chain) — a targeted restoring force, `p *= 1 − lr·wd_ada` on the
+  adaLN family only, applied outside the optimizer so checkpoints stay
+  compatible. Measurably shrinks |w|_ada, but at safe doses it loses the
+  race against episode-timescale logit growth — background hygiene, not
+  the cure. Kept at 0.01 post-migration.
+* **Adaptive LR backoff** (the v4 stability controller) — kept the chain
+  alive and learning throughout (samples improved 270K → 344K), at the
+  cost of running at ~28% of the scheduled LR. The controller's
+  bounded-growth health reference also *normalized* the drift over many
+  promotions (reference 38.5 → 320); treat a slowly ratcheting reference
+  as a red flag, not adaptation.
+
+**What the dmap chain shows.** Under the identical recipe, the R ≡ 0 chain
+exhibits none of this: grad p90/median ≈ 1.1, zero skips, flat probe
+logits (effective logits are bounded above by construction:
+`−|q_i−q_j|² + const`). Its adaLN family is just as heavy — so adaLN
+growth alone is not sufficient; the directed-attention chain's use of it
+is part of the mechanism. This is itself a datapoint for the R-ratio
+experiment. The dmap chain is deliberately **not** given qk-norm: untied
+norms would break R ≡ 0, and a tied norm flattens the destination
+potential `g_j` that defines the DMAP kernel. Pre-committed trigger: if
+its probe shows logit growth or grad-median ratcheting in the 200–280K
+range, a DMAP-appropriate intervention gets designed then, as its own arm.
+
+**Comparability note for any writeup.** The chains are no longer
+recipe-identical: amap carries {tf32 from ~275K, wd_ada = 0.01, qk-norm
+from 344K}; dmap carries {tf32 from ~117K}. The honest framing is "each
+arm run under the minimal stabilization it required, deviations tabulated
+per arm"; per-run settings are recorded in every checkpoint's
+`run_history[*].effective`.
+
+---
+
+## Known deviations from the published DiT/SiT recipe
+
+* `out_channels = 4` (no learned-sigma channels; MSE-only objectives).
+* Latents are posterior **mode**, not sampled; no horizontal-flip pass;
+  torchvision Resize+CenterCrop rather than ADM `center_crop_arr`.
+* **qk-norm** on the amap chain from step 344K (see above). Pre-migration
+  checkpoints (≤ 344K, first revision) are the pure-recipe artifact.
+* **wd_ada = 0.01** on the amap chain (adaLN-only decoupled decay).
+* LR followed the adaptive controller, not constant 1e-4, from ~250K on
+  the amap chain (retry backoffs; exact trajectory in `run_history`).
+* dmap chain: W_K ≡ W_Q (~25M fewer params), DMAP logit modification —
+  these ARE the experiment, not incidental deviations.
 
 ---
 
 ## Repo structure
 
 ```
-dit-flex/
-├── README.md
-├── pyproject.toml
+DITFLEX/
 ├── .github/workflows/
-│   ├── test.yml                 # CPU unit tests, on push
-│   ├── smoke.yml                # manual: 2 GPU, ~10 min, full path
-│   └── run.yml                  # manual: 8 GPU, ~5 h, --detach
-├── modal_app.py                 # the ONLY Modal-aware file
+│   ├── tests.yml                # CPU+GPU gates on push (Modal CI)
+│   ├── quick-train.yml          # 2-GPU dress rehearsal of the full chain
+│   ├── train.yml                # amap chain: pulls latest, transactional
+│   ├── train-diffusion.yml      # dmap chain: same supervisor, qk-mode pinned
+│   ├── train-recovery-270k.yml  # pinned-step bounded recovery segments
+│   ├── recover-checkpoint.yml   # restore a healthy step as Hub latest
+│   └── sampling.yml             # fixed-seed grids from both chains
+├── run/
+│   ├── modal_train.py           # THE transactional supervisor (both chains)
+│   ├── migrate_qknorm.py        # one-shot 344K qk-norm migration CLI
+│   └── recover_checkpoint.py
 ├── src/ditflex/
-│   ├── config.py                # dataclasses -> JSON -> checkpoint
-│   ├── distributed.py           # rank/world/init, rank0-only helpers
-│   ├── attention.py             # IdentityFlexSelfAttnProcessor + score_mods
-│   ├── model.py                 # build DiT-L/2, swap processors
-│   ├── latents.py               # GPU-resident store; NO DataLoader
-│   ├── objective.py             # DDPM eps | flow matching
-│   ├── ema.py
-│   ├── train.py                 # loop, compile, DDP, time-box
-│   ├── checkpoint.py            # save/load/resume + HF Hub
-│   ├── sample.py                # DDIM / ODE sampling + CFG
-│   └── eval.py                  # FID vs cached reference stats
-├── scripts/
-│   ├── prepare_latents.py       # cleaned from imagenet-processing.ipynb
-│   ├── verify_identity.py
-│   ├── verify_latents.py
-│   └── overfit_smoke.py
-└── tests/
-    ├── test_attention_identity.py
-    ├── test_latents_shapes.py
-    └── test_config_roundtrip.py
+│   ├── attention.py             # Flex processor; qk-norm applied pre-kernel
+│   ├── model.py                 # baseline builder (+ install_qk_norms)
+│   ├── diffusion.py             # DMAP operators & score_mods (the paper)
+│   ├── diffusion_model.py       # dmap builder (refuses qk_norm)
+│   ├── migrate.py               # name-keyed checkpoint migration core
+│   ├── probe.py                 # opt-in diagnostics: grad families, logits
+│   ├── stability.py             # v4 controller: windows, references, retry
+│   ├── train.py                 # transactional loop; --precision, --wd-ada,
+│   │                            #   --qk-norm, --probe-attn-logits
+│   ├── checkpoint.py / ema.py / latents.py / objective.py / sample.py
+│   └── config.py / distributed.py
+└── tests/                       # incl. verify_identity (both attention
+                                 #   configs), test_migrate_qknorm, test_probe
 ```
-
-`torch.compile` lives in `train.py`, not `model.py` — tests and
-`verify_identity.py` need the uncompiled model.
 
 ---
 
-## Secrets
+## Operational runbook
 
-The important thing is **where** each lives. GitHub only launches; Modal does
-the work and needs the data credentials.
+**Routine links.** Dispatch `train` (amap) or `train-diffusion` (dmap) with
+defaults. Both route through `run/modal_train.py`: stable resume selection,
+bounded transactional retries, adaptive LR, promotion markers. amap
+defaults: tf32, wd_ada 0.01, probe on, qk_norm **false until the 344K
+migration is pushed, true after**. dmap defaults: tf32, wd_ada 0, probe on.
 
-### GitHub repository secrets
-Used by the workflow launcher only.
-
-| Secret | Purpose |
-|---|---|
-| `MODAL_TOKEN_ID` | authenticate `modal run` from CI |
-| `MODAL_TOKEN_SECRET` | same |
-
-`GITHUB_TOKEN` is injected automatically and does not need to be created.
-The repo being private does not require an extra token: `actions/checkout`
-uses the automatic token, and `modal run` uploads the checked-out source
-into the container, so Modal never clones from GitHub.
-
-### Modal secrets
-Created with `modal secret create <name> KEY=value`. Referenced by name in
-`modal_app.py`.
-
-| Modal secret | Keys | Purpose |
-|---|---|---|
-| `huggingface` | `HF_TOKEN` | pull latents dataset, push checkpoints — **needs write scope** |
-| `wandb` *(optional)* | `WANDB_API_KEY` | run logging |
-
-One token with write access is simplest. If you want least privilege, split
-into a read token for `sparsetrace/dlatentzz` and a write token scoped to the
-checkpoint repo, as `HF_TOKEN_READ` / `HF_TOKEN_WRITE`.
-
-### Local development
-`.env` (gitignored), or just export:
+**The 344K qk-norm migration** (one-time, amap only):
 
 ```bash
-export HF_TOKEN=hf_...
-modal token new          # writes ~/.modal.toml, no env var needed
+# full local rehearsal, uploads nothing:
+python run/migrate_qknorm.py --repo sparsetrace/ditflex-L2-flow --step 344000 --dry-run
+# then for real:
+python run/migrate_qknorm.py --repo sparsetrace/ditflex-L2-flow --step 344000 --push
 ```
 
-**Never** commit tokens. The source notebook had `HF_TOKEN` read from env —
-keep that pattern in `scripts/prepare_latents.py`.
+The migration remaps the index-keyed AdamW state **by parameter name**
+(inserting norm params shifts `named_parameters()` order — an
+index-preserving load would attach moments to the wrong tensors), extends
+the EMA shadow, embeds `qk_norm: true` in the config, resets the stability
+reference (the pre-norm reference was contaminated by the divergence), and
+pushes under an unmistakable commit message. Then:
+
+1. **Warmup** — `train-recovery-270k`: `resume_step=344000`,
+   `qk_norm=true`, `reset_lr_controller=true`, `lr=0.00001`,
+   `max_steps=5000`. Expect a loss bump at step one (ones-init RMSNorms
+   rescale Q/K), recovery within a few hundred steps, and the probe's
+   blk1 logit line reading double digits instead of 1.6e7.
+2. **Final stretch** — `train`: `qk_norm=true`, `reset_lr_controller=true`
+   (the warmup's base LR differs; the controller refuses silent LR
+   changes), `lr=0`, defaults otherwise → full cosine to 400K.
+
+**Reading the probe.** `[probe] attn logits` healthy range is ~5–30 per
+head; three-digit values are worth watching, sustained growth is the
+alarm. `[probe] ... (SPIKE)` lines print raw pre-clip per-family norms —
+the dominant family IS the spike's address. Turn the probe off
+(`probe=false`) for routine links once trends are boring.
+
+**Recovery.** Every promotion is a Hub commit; `recover-checkpoint.yml`
+(dry-run by default) restores any historical step as latest. The
+`stability window` log lines plus `run_history` in `state.json` are the
+forensic record.
 
 ---
 
 ## Data notes
 
-Latents: `sparsetrace/dlatentzz` — 32 safetensors files, ~10.5 GB total,
-1.28 M ImageNet train images.
+Latents: `sparsetrace/dlatentzz` — 32 safetensors shards, ~10.5 GB, 1.28M
+ImageNet-1k train images, `[N, 4096]` bf16, **scaling factor 0.18215
+already applied** (std ≈ 1.0 asserted on every load; ≈ 5.5 means unscaled,
+≈ 0.18 means double-scaled). Encoded with `posterior.mode()`, no flips.
+The full tensor lives on every GPU; batches are fancy-indexed with seeds
+that are pure functions of `(base_seed, step, rank)` — resume is exact and
+survives world-size changes. No DataLoader anywhere.
 
-Four properties of the encoding that the training code must respect:
-
-1. **Flat storage.** Shape is `[N, 4096]`, not `[N, 4, 32, 32]`.
-   `latents.py` must `.view(-1, 4, 32, 32)`.
-2. **Scaling factor already applied.** `z = z * 0.18215` happened at encode
-   time. **Do not apply it again.** Assert `std ≈ 1.0` on load — if you see
-   `≈ 5.5`, something is double-scaling.
-3. **Deterministic latents.** Encoded with `posterior.mode()`, not
-   `.sample()`. DiT samples the posterior each epoch; we froze the mean.
-   Deviation from the published recipe — acceptable, but state it in any writeup.
-4. **No horizontal flips.** DiT trains with random h-flip before the VAE.
-   Latents cannot be flipped directly (the conv VAE is not exactly
-   equivariant), so matching the reference recipe requires encoding a second
-   flipped pass (+10.5 GB, trivial at 96 GB/GPU).
-
-`dtype` is bf16 on disk, cast to fp32 or bf16 at load depending on the
-training precision.
-
----
-
-## Design decisions
-
-**No DataLoader, no DistributedSampler.** The full 10.5 GB tensor lives on
-each GPU. Each rank draws indices from a generator seeded by
-`(global_step, rank)` — stateless, so resume is exact and survives a change
-of world size.
-
-**DDP, not FSDP.** DiT-L is 458 M params; weights + EMA + AdamW states are
-~7.3 GB in fp32. Sharding buys nothing at this scale and costs complexity.
-
-**Fixed shapes everywhere.** Fixed batch, fixed 256-token sequence,
-`drop_last=True` → one `torch.compile`, no recompiles.
-
-**Compile inner, then DDP-wrap.** Test the other order once; this interaction
-has been version-sensitive.
-
-**Save uncompiled, unwrapped state dicts.** Strip `_orig_mod.` and `module.`
-prefixes before writing, or checkpoints will not load into a bare model for
-sampling.
-
----
-
-## Checkpointing
-
-Runs are time-boxed. The loop checks a deadline every 500 steps (rank 0
-decides, broadcast to all — avoids clock drift), stops cleanly, saves, uploads.
-
-Budget: ~7.3 GB per checkpoint, ~12 min up and ~12 min down at 100 MB/s.
-A 5 h job is ~4.5 h of training. `torch.compile` costs another 2–5 min on a
-cold container.
-
-Hub layout (`sparsetrace/dit-flex-L2`, model repo):
-
-```
-state.json              # step, wall-clock, config, git sha, run_history
-model.safetensors       # fp32 weights
-ema.safetensors         # fp32 EMA (0.9999)
-optim.safetensors       # AdamW m, v
-archive/step_0200000/   # periodic, EMA + state only, kept forever
-```
-
-Top level is always "latest" and is overwritten each run; HF repos are git,
-so prior revisions remain recoverable. `run_history` in `state.json` records
-each run's step range and duration — worth having when a loss discontinuity
-turns out to align with a run boundary.
-
----
-
-## Quickstart
-
-```bash
-# gates
-python scripts/verify_identity.py
-python scripts/verify_latents.py
-python scripts/overfit_smoke.py
-
-# short run on Modal
-modal run modal_app.py::train --gpus 2 --train-seconds 600 --objective ddpm
-
-# real run, detached (survives the CI job exiting)
-modal run --detach modal_app.py::train \
-    --gpus 8 --train-seconds 18000 --objective flow
-```
-
----
-
-## Recipe
-
-Held at the published DiT-L/2 settings so the baseline is comparable:
+## Recipe (amap chain, as originally launched)
 
 | | |
 |---|---|
-| model | DiT-L/2, 458 M params, patch 2, 24 layers, width 1024, 16 heads |
+| model | DiT-L/2, 458M params, patch 2, 24 layers, width 1024, 16 heads |
 | latents | 32×32×4 → 256 tokens |
 | batch | 256 global |
-| optimizer | AdamW, lr 1e-4 constant, no warmup, no weight decay |
+| optimizer | AdamW, lr 1e-4, no warmup, wd 0 |
 | EMA | 0.9999 |
-| precision | bf16 autocast, fp32 master weights |
-| label dropout | 10% (for classifier-free guidance) |
+| precision | bf16 autocast originally; **tf32 from ~275K** |
+| label dropout | 10% (CFG) |
+| stabilization | see "Stability findings" — wd_ada 0.01, qk-norm from 344K |
 
-Do not scale the batch on the first run — if batch and objective change
-together, the comparison to published numbers means nothing.
+## Secrets
+
+GitHub repo secrets: `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` (launch only).
+Modal secret `huggingface` → `HF_TOKEN` with write scope (latents pull,
+checkpoint push). `modal run` uploads the checkout, so Modal never clones
+from GitHub. Never commit tokens.
 ````
+
+### `evaluation/fid_results.json`
+
+```json
+{
+  "config": {
+    "num_samples": 50000,
+    "sample_steps": 50,
+    "cfg_scale": 1.5,
+    "seed": 0,
+    "objective": "flow",
+    "reference": "VAE-decoded latents from sparsetrace/dlatentzz (same decoder as generation; NOT comparable to published FID)",
+    "gpu": "H100"
+  },
+  "fid": {
+    "sparsetrace/ditflex-L2-flow-dmap": 18.7464
+  }
+}
+```
+
+### `evaluation/modal_fid.py`
+
+```python
+"""FID evaluation for the ditflex chains.
+
+Streams: sample latents -> VAE decode -> InceptionV3 pool features ->
+Frechet distance against reference statistics. Images are never written to
+disk; only the 2048-d features are retained (50k x 2048 fp32 = 410 MB).
+
+RUN:
+    modal run evaluation/modal_fid.py --repos "sparsetrace/ditflex-L2-flow-dmap" \
+        --num-samples 50000 --ref-stats-url <url-or-empty>
+
+=============================================================================
+THREE THINGS THAT DECIDE WHETHER YOUR NUMBER MEANS ANYTHING
+=============================================================================
+
+1. REFERENCE STATISTICS. FID is a distance to a reference distribution; the
+   number is meaningless without saying which.
+     * ref_stats_url = ADM's VIRTUAL_imagenet256_labeled.npz  -> comparable
+       to published DiT/SiT numbers (they all use the ADM eval suite).
+     * ref_mode = "latents"  -> statistics computed from YOUR OWN VAE-decoded
+       latents. This measures the generative model only, factoring out VAE
+       reconstruction error. Self-consistent and ideal for dmap-vs-amap, but
+       NOT comparable to any published figure. Say which one you used.
+
+2. SAMPLE COUNT. FID is biased upward at small N and the bias does not
+   cancel between models unless N is identical. 50,000 is the convention.
+   10,000 is defensible for internal comparison; 1,000 is a smoke test and
+   should never be reported as "FID".
+
+3. EMA WEIGHTS. Under the constant-LR recipe the raw weights orbit the
+   minimum and the EMA sits in it. Sampling raw weights understates the
+   model. See the ADAPTER section: confirm load_checkpoint() pulls EMA.
+=============================================================================
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import modal
+
+REPO_ROOT = Path(__file__).parent.parent
+GPU_KIND = os.environ.get("MODAL_GPU", "H100")
+TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
+
+# 50k samples x 50 Euler steps x 2 (CFG) = 5e6 forward passes. Budget hours,
+# not minutes, and size the timeout accordingly.
+TIMEOUT = int(os.environ.get("MODAL_FID_SECONDS", "14400"))
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git")
+    # torchvision MUST come from the same index as torch: pytorch-fid pulls it
+    # in, and a PyPI CPU wheel against a CUDA torch fails with
+    # "operator torchvision::nms does not exist".
+    .pip_install("torch", "torchvision", extra_options=f"--index-url {TORCH_INDEX}")
+    .pip_install(
+        "accelerate>=0.34",     # else diffusers falls back to slow VAE loading
+        "diffusers>=0.31",
+        # NOT transformers: diffusers only needs it for single-file loaders,
+        # and importing it drags in transformers.AutoImageProcessor ->
+        # torchvision.io, which is where the ABI mismatch explodes.
+        # AutoencoderKL loads fine without it.
+        "safetensors>=0.4.5",
+        "huggingface_hub>=0.26",
+        "numpy>=1.26",
+        "scipy>=1.11",
+        "pytorch-fid>=0.3.0",   # canonical ported InceptionV3 weights
+        "pillow",
+        "tqdm",
+    )
+    .add_local_dir(
+        REPO_ROOT,
+        remote_path="/repo",
+        ignore=[".git", "**/__pycache__", "*.egg-info", ".venv",
+                ".ruff_cache", ".pytest_cache"],
+        copy=True,   # install-time visibility; see modal_sample.py notes
+    )
+)
+
+app = modal.App("ditflex-fid", image=image)
+
+VAE_ID = "stabilityai/sd-vae-ft-ema"   # the DiT/SiT standard decoder
+VAE_SCALE = 0.18215
+
+
+# =============================================================================
+# ADAPTER -- wire these two to sampling/sample.py. They are the only places
+# this script needs to know your codebase, and they are deliberately isolated.
+# =============================================================================
+
+def _find_model_cfg(obj, known: set):
+    """Depth-first search for the nested dict carrying the most ModelConfig
+    fields. Checkpoint state files bury the model config at varying depths;
+    this finds it without hardcoding a path."""
+    best, best_score, best_path = None, 0, ""
+    stack = [(obj, "")]
+    while stack:
+        cur, path = stack.pop()
+        if isinstance(cur, dict):
+            score = len(known & set(cur))
+            if score > best_score:
+                best, best_score, best_path = cur, score, path or "<root>"
+            stack.extend((v, f"{path}.{k}" if path else k)
+                         for k, v in cur.items() if isinstance(v, (dict, list)))
+        elif isinstance(cur, list):
+            stack.extend((v, f"{path}[]") for v in cur if isinstance(v, (dict, list)))
+    return best, best_score, best_path
+
+
+def load_checkpoint(repo: str, device):
+    """Return (model, ModelConfig) with EMA weights loaded, in eval mode.
+
+    Filenames are discovered rather than assumed: the first run prints the
+    repo's file list, so if the guesses below miss, the log tells you exactly
+    what to put in CFG_NAMES / EMA_NAMES / RAW_NAMES.
+    """
+    import dataclasses
+    import json
+    import sys
+
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
+
+    sys.path.insert(0, "/repo/src")
+    from ditflex.config import ModelConfig
+    from ditflex.diffusion_model import build_dmap_model
+    from ditflex.model import build_model
+
+    CFG_NAMES = ("state.json", "config.json", "model_config.json",
+                 "ditflex_config.json")
+    EMA_NAMES = ("ema.safetensors", "ema_model.safetensors", "model_ema.safetensors")
+    RAW_NAMES = ("model.safetensors", "diffusion_pytorch_model.safetensors",
+                 "pytorch_model.safetensors")
+
+    # Skip archive/ (duplicate older checkpoints), samples/ (PNGs) and
+    # optim.safetensors (~2x model size, Adam moments) -- none are needed here.
+    path = Path(snapshot_download(
+        repo_id=repo, repo_type="model",
+        ignore_patterns=["archive/*", "samples/*", "optim.safetensors"],
+    ))
+    listing = sorted(p.relative_to(path).as_posix() for p in path.rglob("*") if p.is_file())
+    print(f"[fid] {repo} contains: {listing}")
+
+    # ---- config ----
+    cfg_file = next((path / n for n in CFG_NAMES if (path / n).exists()), None)
+    if cfg_file is None:
+        raise FileNotFoundError(
+            f"no config json among {CFG_NAMES}; repo has {listing}. "
+            f"Add the correct name to CFG_NAMES."
+        )
+    raw_cfg = json.loads(cfg_file.read_text())
+    known = {f.name for f in dataclasses.fields(ModelConfig)}
+    model_cfg, score, where = _find_model_cfg(raw_cfg, known)
+    if model_cfg is None or score < 3:
+        raise KeyError(
+            f"{cfg_file.name}: no ModelConfig-like block found (best match had "
+            f"{score} of {len(known)} fields). Top-level keys: {sorted(raw_cfg)}"
+        )
+    print(f"[fid] model config from {cfg_file.name}:{where} "
+          f"({score}/{len(known)} fields present)")
+    cfg = ModelConfig(**{k: v for k, v in model_cfg.items() if k in known})
+    print(f"[fid] cfg: qk_mode={cfg.qk_mode} qk_norm={cfg.qk_norm} "
+          f"dmap_alpha={cfg.dmap_alpha} num_classes={cfg.num_classes}")
+
+    # ---- weights: EMA strongly preferred ----
+    wfile = next((path / n for n in EMA_NAMES if (path / n).exists()), None)
+    used_ema = wfile is not None
+    if wfile is None:
+        wfile = next((path / n for n in RAW_NAMES if (path / n).exists()), None)
+    if wfile is None:
+        raise FileNotFoundError(
+            f"no weights among {EMA_NAMES + RAW_NAMES}; repo has {listing}."
+        )
+    state = load_file(str(wfile))
+    if not used_ema:                                  # EMA may live inside the same file
+        if any(k.startswith("ema.") for k in state):
+            state = {k[4:]: v for k, v in state.items() if k.startswith("ema.")}
+            used_ema = True
+    if used_ema:
+        print(f"[fid] weights: {wfile.name} (EMA)")
+    else:
+        print(f"[fid] *** WARNING: {wfile.name} looks like RAW weights, not EMA.  ***")
+        print("[fid] *** Under constant-LR the raw weights orbit the minimum while ***")
+        print("[fid] *** the EMA sits in it; FID will be inflated. Check the repo.  ***")
+
+    # ---- build + load ----
+    model = build_dmap_model(cfg) if cfg.qk_mode == "dmap" else build_model(cfg)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+
+    # DMAP ties W_K to W_Q, so no separate W_K was ever trained and the
+    # checkpoint has no to_k tensors -- 2 per block is EXPECTED here, not a
+    # fault. Only non-to_k gaps indicate a wrong file or config.
+    tied_k = [k for k in missing if ".to_k." in k]
+    other_missing = [k for k in missing if ".to_k." not in k]
+
+    if tied_k:
+        if cfg.qk_mode != "dmap":
+            raise RuntimeError(
+                f"{len(tied_k)} to_k tensors missing but qk_mode={cfg.qk_mode!r} "
+                f"-- an amap checkpoint must carry W_K. Wrong weights file?"
+            )
+        print(f"[fid] {len(tied_k)} to_k tensors absent -- expected for "
+              f"qk_mode=dmap (W_K tied to W_Q)")
+        # Verify the built model really ties them. If to_k is a separate,
+        # untrained module the processor MUST never read it, or we would be
+        # sampling with a randomly initialised W_K and see no error.
+        try:
+            a = model.transformer_blocks[0].attn1
+            aliased = (a.to_k is a.to_q) or (
+                a.to_k.weight.data_ptr() == a.to_q.weight.data_ptr())
+            if aliased:
+                print("[fid] to_k aliases to_q -- tying confirmed at the module level")
+            else:
+                print("[fid] NOTE: to_k is a separate module left at init; the dmap "
+                      "processor is expected to ignore it (see build_dmap_model). "
+                      "If samples look like noise, this is the first thing to check.")
+        except AttributeError as e:
+            print(f"[fid] could not inspect attn tying ({e})")
+
+    if other_missing or unexpected:
+        print(f"[fid] load_state_dict: {len(other_missing)} unexpected-missing, "
+              f"{len(unexpected)} unexpected")
+        if other_missing:
+            print(f"[fid]   missing[:5]    = {other_missing[:5]}")
+        if unexpected:
+            print(f"[fid]   unexpected[:5] = {unexpected[:5]}")
+        if len(other_missing) > 10:
+            raise RuntimeError("too many missing keys -- wrong weights file or config")
+
+    return model.to(device).eval(), cfg
+
+
+def sample_latents(model, labels, *, steps: int, cfg_scale: float, cfg,
+                   device, objective: str, seed: int):
+    """Return [B,4,32,32] scaled latents using the SAME sampler as sample.py.
+
+    NOTE the per-batch `seed`. sample_flow/sample_ddim seed their initial noise
+    from this argument (default FIXED_SEED), so calling them with a constant
+    seed would draw every batch from the same noise tensors: diversity would
+    collapse and FID would be badly inflated, with no error raised anywhere.
+    """
+    import sys
+
+    sys.path.insert(0, "/repo/src")
+    from ditflex.sample import sample_ddim, sample_flow
+
+    sampler = sample_flow if objective == "flow" else sample_ddim
+    return sampler(
+        model, labels.cpu(),
+        num_classes=cfg.num_classes,
+        cfg_scale=cfg_scale,
+        ode_steps=steps,
+        seed=seed,
+        device=device,
+    )
+
+
+
+# =============================================================================
+
+
+
+def _load_latent_store(latents_repo: str, n: int, num_classes: int, seed: int):
+    """Sample n latents (class-balanced when labels are present) from an HF store.
+
+    Handles sharded stores: the previous version grabbed the FIRST shard via
+    rglob(), which silently sampled a fraction of the dataset.
+    """
+    import torch
+    from huggingface_hub import snapshot_download
+    from safetensors.torch import load_file
+
+    path = Path(snapshot_download(repo_id=latents_repo, repo_type="dataset"))
+    shards = sorted(path.rglob("*.safetensors"))
+    if not shards:
+        raise FileNotFoundError(
+            f"no .safetensors under {path} -- check latents_repo and repo_type "
+            f"(this branch assumes repo_type='dataset')"
+        )
+    print(f"[fid] latent store: {len(shards)} shard(s)")
+
+    lat_parts, lab_parts = [], []
+    for s in shards:
+        d = load_file(str(s))
+        lk = next((k for k in ("latents", "latent", "x", "data") if k in d), None)
+        if lk is None:
+            raise KeyError(f"{s.name}: no latent tensor found; keys = {list(d)}")
+        lat_parts.append(d[lk])
+        bk = next((k for k in ("labels", "label", "y", "classes") if k in d), None)
+        if bk is not None:
+            lab_parts.append(d[bk])
+
+    lat = torch.cat(lat_parts) if len(lat_parts) > 1 else lat_parts[0]
+    lab = None
+    if lab_parts:
+        lab = torch.cat(lab_parts) if len(lab_parts) > 1 else lab_parts[0]
+    print(f"[fid] {lat.shape[0]:,} latents, labels={'yes' if lab is not None else 'no'}")
+
+    if lat.shape[0] < n:
+        raise ValueError(f"store has {lat.shape[0]} latents, need {n}")
+
+    g = torch.Generator().manual_seed(seed)
+    if lab is not None:
+        # Class-balanced, matching the generation side exactly.
+        per = n // num_classes
+        idx = []
+        for c in range(num_classes):
+            pool = (lab == c).nonzero(as_tuple=True)[0]
+            if len(pool) < per:
+                raise ValueError(f"class {c}: {len(pool)} available, need {per}")
+            idx.append(pool[torch.randperm(len(pool), generator=g)[:per]])
+        idx = torch.cat(idx)
+        idx = idx[torch.randperm(len(idx), generator=g)]
+        print(f"[fid] reference: class-balanced, {per}/class")
+    else:
+        idx = torch.randperm(lat.shape[0], generator=g)[:n]
+        print("[fid] reference: uniform random (no labels found -- NOT class-balanced, "
+              "which biases FID against the class-balanced generation side)")
+    return lat, idx
+
+
+def frechet_distance(mu1, sigma1, mu2, sigma2, eps: float = 1e-6) -> float:
+    """Standard FID formula (Heusel et al. 2017)."""
+    import numpy as np
+    from scipy import linalg
+
+    diff = mu1 - mu2
+    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        # Numerically singular product; nudge both covariances.
+        offset = np.eye(sigma1.shape[0]) * eps
+        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+    return float(diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2)
+                 - 2.0 * np.trace(covmean))
+
+
+def _stats(features):
+    import numpy as np
+    mu = features.mean(axis=0)
+    sigma = np.cov(features, rowvar=False)
+    return mu, sigma
+
+
+@app.function(
+    gpu=GPU_KIND,
+    cpu=8.0,
+    memory=32768,   # latent store is ~10 GiB in CPU RAM during reference pass
+    timeout=TIMEOUT,
+    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
+)
+def evaluate(
+    repos: str = "sparsetrace/ditflex-L2-flow-dmap",
+    num_samples: int = 50_000,
+    batch_size: int = 64,
+    sample_steps: int = 50,
+    cfg_scale: float = 1.5,
+    ref_stats_url: str = "",
+    ref_mode: str = "latents",
+    latents_repo: str = "",
+    objective: str = "flow",
+    seed: int = 0,
+) -> str:
+    # Fail before spending GPU time on a misconfigured dispatch.
+    if not ref_stats_url and ref_mode == "latents" and not latents_repo:
+        raise ValueError(
+            "ref_mode='latents' requires --latents-repo (the HF dataset repo "
+            "holding the SD-VAE latents). Either set it, or pass --ref-stats-url "
+            "pointing at a precomputed reference .npz."
+        )
+    if num_samples % 1000 != 0:
+        print(f"[fid] WARNING: num_samples={num_samples} is not a multiple of 1000, "
+              f"so classes cannot be exactly balanced.")
+
+    # --- ABI smoke test FIRST ----------------------------------------------
+    # torchvision built against a different torch than the CUDA wheel fails
+    # with "operator torchvision::nms does not exist". Both diffusers (via
+    # transformers.AutoImageProcessor) and pytorch_fid import torchvision, so
+    # this MUST run before either or the failure surfaces as an opaque
+    # "Could not import module 'AutoImageProcessor'" from inside their lazy
+    # import machinery.
+    import torch
+    import torchvision
+
+    print(f"[fid] torch {torch.__version__} / torchvision {torchvision.__version__}")
+    torchvision.ops.nms(torch.zeros(1, 4), torch.zeros(1), 0.5)
+    print("[fid] torchvision C++ ops OK")
+    # -----------------------------------------------------------------------
+
+    import numpy as np
+    from diffusers import AutoencoderKL
+    from pytorch_fid.inception import InceptionV3
+    from tqdm import tqdm
+
+    device = torch.device("cuda")
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    # ---- Inception (block 3 = 2048-d pool features, the FID standard) ----
+    inception = InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[2048]]).to(device).eval()
+
+    vae = AutoencoderKL.from_pretrained(VAE_ID).to(device).eval()
+
+    @torch.no_grad()
+    def features_from_latents(lat):
+        """latents -> [B,2048] Inception pool features.
+
+        Accepts flat [B,4096] (how the store keeps them) or shaped
+        [B,4,32,32] (what the sampler returns). Layout is channel-major,
+        confirmed by the neighbour-correlation probe below.
+        """
+        if lat.dim() == 2:
+            lat = lat.view(lat.shape[0], 4, 32, 32)
+        img = vae.decode(lat / VAE_SCALE).sample          # [-1, 1]
+        img = (img.clamp(-1, 1) + 1.0) / 2.0              # [0, 1]
+        # InceptionV3(resize_input=True, normalize_input=True) handles the
+        # 299x299 bilinear resize and the [-1,1] rescale internally. Do NOT
+        # pre-resize -- resize implementation is a known source of FID drift
+        # between codebases (cf. clean-fid).
+        return inception(img)[0].squeeze(-1).squeeze(-1).cpu().numpy()
+
+    # ---- reference statistics -------------------------------------------
+    if ref_stats_url:
+        import urllib.request
+        print(f"[fid] downloading reference stats: {ref_stats_url}")
+        urllib.request.urlretrieve(ref_stats_url, "/tmp/ref.npz")
+        ref = np.load("/tmp/ref.npz")
+        mu_ref, sigma_ref = ref["mu"], ref["sigma"]
+        ref_desc = ref_stats_url
+    elif ref_mode == "latents":
+        print(f"[fid] computing reference stats from real latents (n={num_samples})")
+        all_lat, idx = _load_latent_store(latents_repo, num_samples, 1000, seed)
+
+        # --- layout probe: (C,H,W) vs (H,W,C) is silent if wrong ------------
+        # Images are spatially smooth, channels are not, so the correct
+        # reshape has the higher horizontal-neighbour correlation. A wrong
+        # layout decodes without error and yields meaningless FID.
+        if all_lat.dim() == 2:
+            probe = all_lat[idx[:256]].float()
+
+            def _nbr_corr(x):                          # x: [B,C,H,W]
+                u = x[..., :, :-1].reshape(-1)
+                v = x[..., :, 1:].reshape(-1)
+                u = u - u.mean()
+                v = v - v.mean()
+                return float(u @ v / (u.norm() * v.norm() + 1e-12))
+
+            chw = _nbr_corr(probe.view(-1, 4, 32, 32))
+            hwc = _nbr_corr(probe.view(-1, 32, 32, 4).permute(0, 3, 1, 2))
+            print(f"[fid] layout probe: neighbour corr  CHW={chw:.3f}  HWC={hwc:.3f}")
+            print(f"[fid] -> latents are "
+                  f"{'CHW (correct)' if chw > hwc else 'HWC -- FIX THE RESHAPE'}")
+            shaped = probe.view(-1, 4, 32, 32)
+            print(f"[fid] per-channel mean {shaped.mean((0, 2, 3)).tolist()}")
+            print(f"[fid] per-channel std  {shaped.std((0, 2, 3)).tolist()}")
+            print("[fid] std ~1 => latents are pre-scaled, so dividing by "
+                  f"{VAE_SCALE} before decode is correct")
+        # ---------------------------------------------------------------------
+
+        feats = np.empty((num_samples, 2048), dtype=np.float32)
+        for i in tqdm(range(0, num_samples, batch_size), desc="ref"):
+            sl = idx[i : i + batch_size]
+            lat = all_lat[sl].to(device=device, dtype=torch.float32)
+            feats[i : i + len(sl)] = features_from_latents(lat)
+        mu_ref, sigma_ref = _stats(feats)
+        ref_desc = (f"VAE-decoded latents from {latents_repo} "
+                    f"(same decoder as generation; NOT comparable to published FID)")
+        del feats, all_lat
+    else:
+        raise ValueError("supply ref_stats_url, or ref_mode='latents' with latents_repo")
+
+    # ---- per-chain generation --------------------------------------------
+    results = {"config": {
+        "num_samples": num_samples, "sample_steps": sample_steps,
+        "cfg_scale": cfg_scale, "seed": seed, "objective": objective,
+        "reference": ref_desc,
+        "gpu": GPU_KIND,
+    }, "fid": {}}
+
+    for repo in [r.strip() for r in repos.split(",") if r.strip()]:
+        print(f"[fid] === {repo} ===")
+        model, cfg = load_checkpoint(repo, device)
+
+        torch.manual_seed(seed)
+        # Class-balanced: exactly num_samples/1000 per class, then shuffled.
+        labels_all = torch.arange(num_samples, device=device) % cfg.num_classes
+        labels_all = labels_all[torch.randperm(num_samples, device=device)]
+
+        feats = np.empty((num_samples, 2048), dtype=np.float32)
+        for i in tqdm(range(0, num_samples, batch_size), desc=repo.split("/")[-1]):
+            lab = labels_all[i : i + batch_size]
+            with torch.no_grad():
+                # Per-batch seed -- see the note in sample_latents().
+                lat = sample_latents(
+                    model, lab, steps=sample_steps, cfg_scale=cfg_scale,
+                    cfg=cfg, device=device, objective=objective,
+                    seed=seed * 1_000_003 + i,
+                )
+                feats[i : i + len(lab)] = features_from_latents(lat)
+
+        mu, sigma = _stats(feats)
+        score = frechet_distance(mu, sigma, mu_ref, sigma_ref)
+        results["fid"][repo] = round(score, 4)
+        print(f"[fid] {repo}: FID = {score:.4f}")
+
+        del model, feats
+        torch.cuda.empty_cache()
+
+    out = json.dumps(results, indent=2)
+    print(out)
+    return out
+
+
+@app.local_entrypoint()
+def main(
+    repos: str = "sparsetrace/ditflex-L2-flow-dmap",
+    num_samples: int = 50_000,
+    batch_size: int = 64,
+    sample_steps: int = 50,
+    cfg_scale: float = 1.5,
+    ref_stats_url: str = "",
+    ref_mode: str = "latents",
+    latents_repo: str = "",
+    objective: str = "flow",
+    seed: int = 0,
+):
+    payload = evaluate.remote(
+        repos=repos, num_samples=num_samples, batch_size=batch_size,
+        sample_steps=sample_steps, cfg_scale=cfg_scale,
+        ref_stats_url=ref_stats_url, ref_mode=ref_mode,
+        latents_repo=latents_repo, objective=objective, seed=seed,
+    )
+    Path("evaluation").mkdir(exist_ok=True)
+    Path("evaluation/fid_results.json").write_text(payload)
+    print("[fid] wrote evaluation/fid_results.json")
+```
 
 ### `pyproject.toml`
 
@@ -1340,6 +2213,132 @@ def main(
         raise SystemExit(rc)
 ```
 
+### `run/migrate_qknorm.py`
+
+```python
+"""run/migrate_qknorm.py -- Hub-facing CLI for the qk-norm migration.
+
+Pulls one committed revision of the amap chain, runs
+ditflex.migrate.migrate_checkpoint (name-keyed remap of model / EMA /
+AdamW state into the qk_norm=True architecture), and pushes the result as
+the new Hub latest under an unmistakable commit message so
+run/recover_checkpoint.py and the revision ledger can always identify the
+migration boundary.
+
+SAFETY: defaults to --dry-run, which performs the FULL migration locally
+(pull, remap, validate) and prints the summary, uploading nothing.
+Inspect, then re-run with --push.
+
+    HF_TOKEN=... python run/migrate_qknorm.py \
+        --repo sparsetrace/ditflex-L2-flow --step 344000 --dry-run
+    HF_TOKEN=... python run/migrate_qknorm.py \
+        --repo sparsetrace/ditflex-L2-flow --step 344000 --push
+
+Runs on CPU: two DiT-L models in fp32 (~4 GB RAM), a few minutes, no GPU.
+
+After pushing, resume the chain with:
+    workflow train-recovery-270k: resume_step=<step>, max_steps=5000,
+        qk_norm=true, reset_lr_controller=true, lr=0.00001   (warmup)
+    then workflow train: qk_norm=true, reset_lr_controller=true, lr=0
+        (full cosine to 400K)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import tempfile
+from pathlib import Path
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", required=True)
+    parser.add_argument(
+        "--step",
+        type=int,
+        default=0,
+        help="committed step to migrate (0 = current Hub latest)",
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--dry-run", action="store_true", default=True)
+    group.add_argument(
+        "--push",
+        dest="dry_run",
+        action="store_false",
+        help="actually upload the migrated checkpoint as Hub latest",
+    )
+    parser.add_argument(
+        "--keep-dir",
+        type=str,
+        default="",
+        help="optional directory to retain the migrated checkpoint locally",
+    )
+    args = parser.parse_args()
+
+    from ditflex.checkpoint import pull_from_hub, push_to_hub, resolve_revision_for_step
+    from ditflex.migrate import migrate_checkpoint
+
+    revision = None
+    if args.step > 0:
+        revision = resolve_revision_for_step(args.repo, args.step)
+        print(f"[migrate] step {args.step:,} -> revision {revision[:12]}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "source"
+        dest = Path(args.keep_dir) if args.keep_dir else Path(tmp) / "migrated"
+
+        print(f"[migrate] pulling {args.repo} ({revision[:12] if revision else 'latest'}) ...")
+        pulled = pull_from_hub(args.repo, source, revision=revision)
+        if pulled is None:
+            raise SystemExit(f"no checkpoint found in {args.repo}")
+
+        print("[migrate] migrating (CPU; a few minutes for DiT-L) ...")
+        new_state = migrate_checkpoint(source, dest, source_revision=revision)
+        summary = new_state["migration_summary"]
+        print(
+            f"[migrate] OK: step {summary['from_step']:,}  "
+            f"new_tensors={summary['new_tensors']}  "
+            f"optim_states_migrated={summary['optim_states_migrated']}/"
+            f"{summary['optim_states_total_old']}"
+        )
+        print(json.dumps(summary, indent=2))
+
+        if args.dry_run:
+            print(
+                "[migrate] DRY RUN -- nothing uploaded. Re-run with --push to "
+                "promote the migrated checkpoint as Hub latest."
+            )
+            if not args.keep_dir:
+                return 0
+            print(f"[migrate] migrated checkpoint retained at {dest}")
+            return 0
+
+        commit = push_to_hub(
+            dest,
+            args.repo,
+            commit_message=(
+                f"MIGRATION qk-norm: step {summary['from_step']} "
+                "(RMSNorm on Q/K; optimizer state remapped by name; "
+                "guard reset; resume with --qk-norm --reset-lr-controller)"
+            ),
+        )
+        print(
+            f"[migrate] PUSHED migrated step {summary['from_step']:,} to "
+            f"{args.repo}" + (f" revision={commit[:12]}" if commit else "")
+        )
+        if args.keep_dir:
+            print(f"[migrate] local copy retained at {dest}")
+        else:
+            shutil.rmtree(dest, ignore_errors=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+```
+
 ### `run/modal_train.py`
 
 ```python
@@ -1457,6 +2456,7 @@ def train(
     reset_lr_controller: bool = False,
     grad_reference: float = 0.0,
     wd: float = -1.0,
+    wd_ada: float = 0.0,
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
@@ -1464,6 +2464,11 @@ def train(
     skip_warn_rate: float = 0.30,
     skip_retry_rate: float = 0.40,
     skip_emergency_rate: float = 0.60,
+    precision: str = "tf32",
+    probe_attn_logits: bool = False,
+    probe_batch: int = 8,
+    qk_mode: str = "amap",
+    dmap_alpha: float = 0.0,
 ) -> int:
     import subprocess
     import sys
@@ -1478,6 +2483,15 @@ def train(
         return 2
     if train_seconds <= 0:
         print("[modal] train_seconds must be positive")
+        return 2
+    if precision not in {"tf32", "bf16"}:
+        print(f"[modal] unknown precision: {precision!r}")
+        return 2
+    if wd_ada < 0.0:
+        print("[modal] wd_ada must be non-negative")
+        return 2
+    if qk_mode not in {"amap", "dmap"}:
+        print(f"[modal] unknown qk_mode: {qk_mode!r}")
         return 2
     if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
         print(
@@ -1602,7 +2616,13 @@ def train(
             f"--skip-warn-rate={skip_warn_rate}",
             f"--skip-retry-rate={skip_retry_rate}",
             f"--skip-emergency-rate={skip_emergency_rate}",
+            f"--precision={precision}",
+            f"--qk-mode={qk_mode}",
+            f"--dmap-alpha={dmap_alpha}",
         ]
+        if probe_attn_logits:
+            command.append("--probe-attn-logits")
+            command.append(f"--probe-batch={probe_batch}")
         if hub_repo:
             command.append(f"--hub-repo={hub_repo}")
         if selected_revision:
@@ -1615,13 +2635,15 @@ def train(
             command.append(f"--grad-reference={grad_reference}")
         if wd >= 0.0:
             command.append(f"--wd={wd}")
+        if wd_ada > 0.0:
+            command.append(f"--wd-ada={wd_ada}")
         if reset_lr_controller and attempt == 0:
             command.append("--reset-lr-controller")
 
         print(
             f"\n[modal] attempt {attempt}/{max_retries}: "
             f"lr_factor={attempt_factor:g} seed_offset={attempt_seed_offset} "
-            f"budget={child_budget}s anchor="
+            f"budget={child_budget}s precision={precision} qk_mode={qk_mode} anchor="
             f"{selected_revision[:12] if selected_revision else 'latest'}\n"
             f"[modal] running: {' '.join(command)}\n"
         )
@@ -1704,6 +2726,7 @@ def main(
     reset_lr_controller: bool = False,
     grad_reference: float = 0.0,
     wd: float = -1.0,
+    wd_ada: float = 0.0,
     clip: float = 1.0,
     spike_skip: float = 4.0,
     seed_offset: int = 0,
@@ -1711,11 +2734,22 @@ def main(
     skip_warn_rate: float = 0.30,
     skip_retry_rate: float = 0.40,
     skip_emergency_rate: float = 0.60,
+    precision: str = "tf32",
+    probe_attn_logits: bool = False,
+    probe_batch: int = 8,
+    qk_mode: str = "amap",
+    dmap_alpha: float = 0.0,
 ):
     if objective not in {"ddpm", "flow"}:
         raise SystemExit(f"unknown objective: {objective!r}")
     if lr_policy not in {"constant", "cosine", "adaptive"}:
         raise SystemExit(f"unknown lr_policy: {lr_policy!r}")
+    if precision not in {"tf32", "bf16"}:
+        raise SystemExit(f"unknown precision: {precision!r}")
+    if wd_ada < 0.0:
+        raise SystemExit("wd_ada must be non-negative")
+    if qk_mode not in {"amap", "dmap"}:
+        raise SystemExit(f"unknown qk_mode: {qk_mode!r}")
     if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
         raise SystemExit(
             "skip thresholds must satisfy "
@@ -1753,6 +2787,7 @@ def main(
         reset_lr_controller=reset_lr_controller,
         grad_reference=grad_reference,
         wd=wd,
+        wd_ada=wd_ada,
         clip=clip,
         spike_skip=spike_skip,
         seed_offset=seed_offset,
@@ -1760,6 +2795,11 @@ def main(
         skip_warn_rate=skip_warn_rate,
         skip_retry_rate=skip_retry_rate,
         skip_emergency_rate=skip_emergency_rate,
+        precision=precision,
+        probe_attn_logits=probe_attn_logits,
+        probe_batch=probe_batch,
+        qk_mode=qk_mode,
+        dmap_alpha=dmap_alpha,
     )
     if return_code != 0:
         raise SystemExit(return_code)
@@ -1903,6 +2943,10 @@ def sample_repo(repo: str, sample_steps: int = 50, cfg_scale: float = 4.0) -> tu
     from PIL import Image
     from safetensors.torch import load_file
 
+    import sys
+    sys.path.insert(0, "/repo/src")
+    from ditflex.config import Config
+    
     from ditflex.config import Config
     from ditflex.model import build_model
 
@@ -2068,12 +3112,29 @@ Three things live here:
      that depends on no fused kernel at all. Test utility only, never a
      training path.
 
+QK-NORM (added at the 344K migration; DEVIATION from published DiT/SiT):
+if the module carries ``norm_q`` / ``norm_k`` (RMSNorm over head_dim),
+the processor applies them per-head AFTER the [B, N, H*D] -> [B, H, N, D]
+reshape and BEFORE flex_attention -- entirely upstream of the score_mod,
+so the swappable-score dispatch path is untouched. The fp64 reference
+applies the identical normalization from the same weights, so the
+identity gate certifies both configurations. Rationale recorded in the
+migration commit and README: at ~270-312K steps the un-normalized chain
+developed unbounded QK logits (block 1 reaching 8.6e6), driven by adaLN
+weight growth, producing the gradient-spike instability; RMSNorm on Q and
+K bounds per-head logits by construction. The DMAP chain does NOT use
+qk-norm (see model.py / diffusion_model.py guards): it shows no logit
+pathology, untied norms would break its R == 0 symmetry, and tied norms
+would change the squared-distance kernel's geometry.
+
 Scope: DiT-L/2 self-attention on [B, N, C] tokens. Cross-attention,
-attention masks, 4D inputs, group/spatial norm, qk-norm, in-processor
-residuals, and output rescaling are all rejected loudly rather than
-handled -- in a repo whose premise is that every deviation from the
-baseline is known, a config surprise should fail at the gate, not show up
-later as an uninterpretable training curve.
+attention masks, 4D inputs, group/spatial norm, in-processor residuals,
+and output rescaling are all rejected loudly rather than handled -- in a
+repo whose premise is that every deviation from the baseline is known, a
+config surprise should fail at the gate, not show up later as an
+uninterpretable training curve. qk-norm moved from the rejected list to
+the handled list in the 344K migration, with gate coverage for both the
+with-norm and without-norm configurations.
 
 Performance note: eager flex_attention is the slow-but-correct fallback
 and is what the gates use. The fast path is whole-model torch.compile in
@@ -2100,6 +3161,8 @@ ScoreMod = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
     torch.Tensor,
 ]
+
+QK_NORM_EPS = 1e-6
 
 
 def identity_score_mod(score, b, h, q_idx, kv_idx):
@@ -2140,12 +3203,18 @@ class FlexSelfAttnProcessor:
             raise ValueError("group_norm is not handled by this processor.")
         if getattr(attn, "spatial_norm", None) is not None:
             raise ValueError("spatial_norm is not handled by this processor.")
-        if getattr(attn, "norm_q", None) is not None or getattr(attn, "norm_k", None) is not None:
-            raise ValueError("qk-norm is not handled by this processor.")
         if getattr(attn, "residual_connection", False):
             raise ValueError("residual_connection is handled by the block, not the processor.")
         if getattr(attn, "rescale_output_factor", 1.0) != 1.0:
             raise ValueError("rescale_output_factor != 1 is not handled.")
+
+        norm_q = getattr(attn, "norm_q", None)
+        norm_k = getattr(attn, "norm_k", None)
+        if (norm_q is None) != (norm_k is None):
+            raise ValueError(
+                "qk-norm must be installed on BOTH norm_q and norm_k or neither; "
+                "a half-installed configuration is a migration bug."
+            )
 
         batch, seq_len, _ = hidden_states.shape
 
@@ -2160,6 +3229,12 @@ class FlexSelfAttnProcessor:
         query = query.view(batch, seq_len, heads, head_dim).transpose(1, 2)
         key = key.view(batch, seq_len, heads, head_dim).transpose(1, 2)
         value = value.view(batch, seq_len, heads, head_dim).transpose(1, 2)
+
+        # QK-norm: per-head RMSNorm over head_dim, applied before the kernel
+        # and entirely outside the score_mod dispatch path.
+        if norm_q is not None:
+            query = norm_q(query)
+            key = norm_k(key)
 
         out = flex_attention(
             query,
@@ -2184,6 +3259,21 @@ class IdentityFlexSelfAttnProcessor(FlexSelfAttnProcessor):
         super().__init__(score_mod=identity_score_mod)
 
 
+def _reference_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = QK_NORM_EPS,
+) -> torch.Tensor:
+    """RMSNorm written straight from the math, for the fp64 reference path.
+
+    Matches torch.nn.RMSNorm semantics: x / sqrt(mean(x^2) + eps) * weight,
+    normalized over the last dimension. Written explicitly (no fused op) so
+    the reference depends on nothing but arithmetic.
+    """
+    rms = x.pow(2).mean(dim=-1, keepdim=True).add(eps).sqrt()
+    return x / rms * weight
+
+
 def reference_self_attention(
     attn,
     hidden_states: torch.Tensor,
@@ -2193,9 +3283,10 @@ def reference_self_attention(
     """Softmax self-attention written straight from the math.
 
     Uses the weights of ``attn`` but none of its forward code and no fused
-    attention kernel of any kind: explicit projections, an explicit
-    ``q @ k^T * scale`` score matrix, an explicit softmax, explicit output
-    projection.
+    attention kernel of any kind: explicit projections, optional explicit
+    per-head RMSNorm on Q/K (when the module carries norm_q/norm_k), an
+    explicit ``q @ k^T * scale`` score matrix, an explicit softmax, explicit
+    output projection.
 
     Args:
         attn: a diffusers Attention module (self-attention config).
@@ -2233,6 +3324,14 @@ def reference_self_attention(
     query = query.view(batch, seq_len, heads, head_dim).transpose(1, 2)
     key = key.view(batch, seq_len, heads, head_dim).transpose(1, 2)
     value = value.view(batch, seq_len, heads, head_dim).transpose(1, 2)
+
+    norm_q = getattr(attn, "norm_q", None)
+    norm_k = getattr(attn, "norm_k", None)
+    if norm_q is not None:
+        eps_q = float(getattr(norm_q, "eps", QK_NORM_EPS) or QK_NORM_EPS)
+        eps_k = float(getattr(norm_k, "eps", QK_NORM_EPS) or QK_NORM_EPS)
+        query = _reference_rms_norm(query, cast(norm_q.weight), eps_q)
+        key = _reference_rms_norm(key, cast(norm_k.weight), eps_k)
 
     scores = (query @ key.transpose(-2, -1)) * attn.scale
     probs = scores.softmax(dim=-1)
@@ -2746,6 +3845,17 @@ class ModelConfig:
     #   row-softmax (only the source term g_i is killed).
     # 0.5 = Fokker-Planck; 1 = Laplace-Beltrami. Ignored for amap.
     dmap_alpha: float = 0.0
+    # DEVIATION (adopted at the 344K migration, amap chain only): per-head
+    # RMSNorm(head_dim, eps=1e-6) on Q and K before attention. Forced by
+    # evidence: unbounded block-1 QK logits (8.6e6 at 312.5K) driven by
+    # adaLN weight growth produced the gradient-spike instability; RMSNorm
+    # bounds per-head logits by construction. INVALID for qk_mode="dmap":
+    # untied norms would break the R == 0 symmetry, tied norms would
+    # flatten the destination potential g_j that defines the DMAP kernel
+    # (build_dmap_model refuses the combination). Old checkpoints lacking
+    # this key deserialize to False, so pre-migration configs round-trip
+    # unchanged.
+    qk_norm: bool = False
 
 
 @dataclass
@@ -3150,6 +4260,19 @@ on top:
        surviving destination potential, plus the Coifman-Lafon Doob
        correction when cfg.dmap_alpha > 0.
 
+QK-NORM IS REFUSED HERE, deliberately.  The amap chain adopted per-head
+RMSNorm on Q/K at its 344K migration (unbounded-logit instability).  It
+does not transfer to this chain: untied norm_q/norm_k would make the
+effective bilinear asymmetric (destroying the R == 0 invariant that IS
+the experiment), and even a tied norm forces every |q_j| toward unit
+RMS, flattening the destination potential g_j = scale*|q_j|^2 whose
+survival in the softmax is the defining difference between DMAP and
+plain attention (Sec. 3.1).  A "normed DMAP" is a third architecture,
+not a stabilized DMAP.  Pre-committed trigger recorded here: if this
+chain's probe shows sustained logit growth or grad-median ratcheting in
+the 200-280K range (where the amap chain's pathology developed), design
+a DMAP-appropriate intervention then -- as its own documented arm.
+
 Dependency direction: baseline -> paper, never backward. model.py and
 attention.py import nothing from here or from diffusion.py.
 """
@@ -3169,6 +4292,15 @@ from ditflex.model import build_model
 def build_dmap_model(cfg: ModelConfig) -> DiTTransformer2DModel:
     if cfg.qk_mode != "dmap":
         raise ValueError(f"build_dmap_model expects qk_mode='dmap', got {cfg.qk_mode!r}")
+    if getattr(cfg, "qk_norm", False):
+        raise ValueError(
+            "qk_norm=True is not valid for the DMAP chain: untied norms break "
+            "the R == 0 symmetry; a tied norm flattens the destination "
+            "potential g_j that defines the DMAP kernel. If this chain ever "
+            "develops the amap chain's logit pathology, design a "
+            "DMAP-appropriate intervention as its own documented arm (see "
+            "module docstring)."
+        )
 
     # The frozen builder constructs the geometry (and refuses dmap configs
     # by design), so hand it an amap-labeled copy of the same geometry.
@@ -3504,6 +4636,702 @@ class LatentStore:
         return store
 ```
 
+### `src/ditflex/migrate.py`
+
+```python
+"""src/ditflex/migrate.py -- one-shot checkpoint migration to qk-norm.
+
+Turns a committed amap checkpoint WITHOUT qk-norm into a complete, valid
+checkpoint WITH qk-norm, preserving everything that can be preserved:
+
+  * model weights   -- copied by name; the 2*num_layers new RMSNorm weight
+                       tensors initialize to ones (RMSNorm default);
+  * EMA shadow      -- copied by name; norm weights seeded from the (ones)
+                       online values so EMA covers them from step one;
+  * AdamW state     -- THE LOAD-BEARING STEP.  checkpoint.py flattens
+                       optimizer state keyed by PARAMETER INDEX.  Inserting
+                       norm parameters changes named_parameters() ordering,
+                       so index-preserving load would silently attach each
+                       parameter's first/second moments to the WRONG
+                       parameter.  This module remaps old index -> parameter
+                       name (via the old architecture's ordering) -> new
+                       parameter object.  New norm parameters start with no
+                       state; AdamW lazily initializes them on their first
+                       step;
+  * hyperparameters -- lr, betas, eps, weight_decay copied from the stored
+                       param_groups, so the migrated checkpoint resumes at
+                       the LR the chain was actually running;
+  * step / history  -- step unchanged; a migration record is appended to
+                       run_history.
+
+Deliberately NOT preserved:
+
+  * stability controller / health reference / recent losses -- the
+    post-norm gradient regime is a different distribution; carrying the
+    contaminated pre-norm reference (grown 38.5 -> 115 through capped
+    promotions during the divergence) would misconfigure the guard in both
+    directions.  The first post-migration run bootstraps a fresh reference
+    from its own first windows (resume with --reset-lr-controller).
+
+Lives in src/ditflex so tests can import it; run/migrate_qknorm.py is the
+thin Hub-facing CLI around migrate_checkpoint().
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict
+from datetime import UTC, datetime
+from pathlib import Path
+
+import torch
+from safetensors.torch import load_file
+
+from ditflex.checkpoint import _unflatten_optim, save_checkpoint, validate_checkpoint
+from ditflex.config import Config
+from ditflex.ema import EMA
+from ditflex.model import build_model
+
+EXPECTED_NEW_SUFFIXES = ("norm_q.weight", "norm_k.weight")
+
+
+def _assert_only_norm_keys(keys: list[str], what: str) -> None:
+    bad = [k for k in keys if not k.endswith(EXPECTED_NEW_SUFFIXES)]
+    if bad:
+        raise RuntimeError(f"unexpected non-qk-norm {what} keys: {bad[:5]}")
+
+
+def migrate_checkpoint(
+    source_dir: str | Path,
+    dest_dir: str | Path,
+    *,
+    source_revision: str | None = None,
+) -> dict:
+    """Migrate one validated local checkpoint directory to qk_norm=True.
+
+    Returns the new state dict (already written to dest_dir along with the
+    model/EMA/optim safetensors).  Raises on any structural surprise rather
+    than proceeding: a migration that is not exactly understood must not
+    produce a checkpoint.
+    """
+    source_dir = Path(source_dir)
+    dest_dir = Path(dest_dir)
+    validate_checkpoint(source_dir)
+    state = json.loads((source_dir / "state.json").read_text())
+    step = int(state["step"])
+
+    old_cfg = Config.from_dict(state["config"])
+    if old_cfg.model.qk_mode != "amap":
+        raise ValueError(
+            f"qk-norm migration is amap-only; checkpoint has qk_mode="
+            f"{old_cfg.model.qk_mode!r}"
+        )
+    if getattr(old_cfg.model, "qk_norm", False):
+        raise ValueError("checkpoint already has qk_norm=True; nothing to migrate")
+
+    new_cfg = Config.from_dict(json.loads(old_cfg.to_json()))  # deep copy via JSON
+    new_cfg.model.qk_norm = True
+
+    # -- models -----------------------------------------------------------
+    old_model = build_model(old_cfg.model)
+    old_sd = load_file(str(source_dir / "model.safetensors"))
+    old_model.load_state_dict(old_sd)  # strict: the old architecture must match exactly
+
+    new_model = build_model(new_cfg.model)
+    missing, unexpected = new_model.load_state_dict(old_sd, strict=False)
+    if unexpected:
+        raise RuntimeError(f"old checkpoint has keys the new model lacks: {unexpected[:5]}")
+    _assert_only_norm_keys(list(missing), "missing model")
+    expected_new = 2 * new_cfg.model.num_layers
+    if len(missing) != expected_new:
+        raise RuntimeError(
+            f"expected exactly {expected_new} new qk-norm tensors, found {len(missing)}"
+        )
+    # Norm weights keep their RMSNorm init (ones): NOT an identity map on
+    # pre-trained Q/K -- resume with the documented reduced-LR warmup.
+
+    # -- EMA --------------------------------------------------------------
+    ema = EMA(new_model, decay=old_cfg.train.ema_decay)
+    old_ema = load_file(str(source_dir / "ema.safetensors"))
+    extra_shadow = sorted(set(ema.shadow) - set(old_ema))
+    _assert_only_norm_keys(extra_shadow, "EMA-new")
+    stray = sorted(set(old_ema) - set(ema.shadow))
+    if stray:
+        raise RuntimeError(f"old EMA has keys absent from new model: {stray[:5]}")
+    for name, tensor in old_ema.items():
+        ema.shadow[name] = tensor.detach().to(dtype=torch.float32, copy=True)
+    # Norm entries in the shadow remain the (ones) online values -- EMA
+    # tracks them from step one of the resumed run.
+
+    # -- optimizer: index -> name -> new parameter ------------------------
+    old_groups = state["optim_param_groups"]
+    if len(old_groups) != 1:
+        raise RuntimeError(
+            f"migration assumes the repo's single param group, found {len(old_groups)}"
+        )
+    old_tensors = load_file(str(source_dir / "optim.safetensors"))
+    old_osd = _unflatten_optim(old_tensors, old_groups)
+    old_names = [name for name, _ in old_model.named_parameters()]
+    state_indices = set(old_osd["state"].keys())
+    if state_indices and max(state_indices) >= len(old_names):
+        raise RuntimeError(
+            f"optimizer state index {max(state_indices)} exceeds old parameter "
+            f"count {len(old_names)} -- ordering assumption violated"
+        )
+
+    hp = old_groups[0]
+    new_optimizer = torch.optim.AdamW(
+        new_model.parameters(),
+        lr=float(hp.get("lr", old_cfg.train.lr)),
+        betas=tuple(hp.get("betas", (0.9, 0.999))),
+        eps=float(hp.get("eps", 1e-8)),
+        weight_decay=float(hp.get("weight_decay", old_cfg.train.weight_decay)),
+    )
+    new_params = dict(new_model.named_parameters())
+    migrated = 0
+    for index, name in enumerate(old_names):
+        entry = old_osd["state"].get(index)
+        if entry is None:
+            continue
+        if name not in new_params:
+            raise RuntimeError(f"old parameter {name!r} not present in new model")
+        new_optimizer.state[new_params[name]] = {
+            key: (value.clone() if torch.is_tensor(value) else value)
+            for key, value in entry.items()
+        }
+        migrated += 1
+
+    # -- state.json -------------------------------------------------------
+    run_history = list(state.get("run_history", []))
+    run_history.append(
+        {
+            "start_step": step,
+            "end_step": step,
+            "seconds": 0.0,
+            "world": 0,
+            "objective": old_cfg.train.objective,
+            "completed": False,
+            "finished_at": datetime.now(UTC).isoformat(),
+            "promotion_reason": "offline qk-norm migration",
+            "effective": {
+                "migration": "qk_norm",
+                "source_revision": source_revision,
+                "new_tensors": expected_new,
+                "optim_states_migrated": migrated,
+            },
+        }
+    )
+    new_state = {
+        "step": step,
+        "run_history": run_history,
+        # Fresh guard: the post-norm gradient regime must define its own
+        # normality.  spikes_total is carried as a cumulative counter only.
+        "guard_state": {
+            "version": 3,
+            "spikes_total": int(state.get("guard_state", {}).get("spikes_total", 0)),
+            "migration": "qk_norm",
+        },
+        "transaction": {
+            "status": "committed",
+            "committed_at": datetime.now(UTC).isoformat(),
+            "migration": "qk_norm",
+            "source_revision": source_revision,
+            "note": (
+                "resume with --qk-norm and --reset-lr-controller; expect a "
+                "loss bump at step one (fresh RMSNorms rescale Q/K) and run "
+                "a bounded reduced-LR warmup segment first"
+            ),
+        },
+        "migration_summary": {
+            "from_step": step,
+            "new_tensors": expected_new,
+            "optim_states_migrated": migrated,
+            "optim_states_total_old": len(state_indices),
+            "config_change": {"model.qk_norm": [False, True]},
+        },
+    }
+
+    save_checkpoint(dest_dir, new_model, ema, new_optimizer, new_cfg, new_state)
+    validate_checkpoint(dest_dir, expected_step=step)
+    return new_state
+```
+
+### `src/ditflex/modal_train.py`
+
+```python
+"""Detached Modal supervisor for transactional DiT/SiT training.
+
+One Modal container may launch several *fresh* torchrun processes.  Exit code
+75 means the child detected retryable numerical instability and deliberately
+discarded its candidate.  The supervisor then reloads the last promoted Hub
+checkpoint with:
+
+* a lower retry LR multiplier;
+* a deterministic new data/objective seed offset;
+* the same model, EMA, AdamW moments, and global step from the committed state.
+
+The retry count is bounded.  Code errors and unrelated subprocess failures are
+not hidden by a broad exception handler.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+import modal
+
+REPO_ROOT = Path(__file__).parent.parent
+GPU_KIND = os.environ.get("MODAL_GPU", "B300")
+GPU_COUNT = int(os.environ.get("MODAL_GPUS", "8"))
+TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
+
+_BUDGET = int(os.environ.get("MODAL_TRAIN_SECONDS", "7200"))
+_MAX_RETRIES_ENV = int(os.environ.get("MODAL_MAX_RETRIES", "2"))
+# Per attempt: checkpoint pull + compile + upload allowance.  The stepping
+# budget itself is shared across retries by reading the child's retry marker.
+TIMEOUT_CEILING = _BUDGET + 3600 * (_MAX_RETRIES_ENV + 1)
+
+RETRY_EXIT_CODE = 75
+RETRY_MARKER = Path("/tmp/ditflex_retry.json")
+PROMOTION_MARKER = Path("/tmp/ditflex_promotion.json")
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git")
+    .pip_install("torch", extra_options=f"--index-url {TORCH_INDEX}")
+    .pip_install(
+        "diffusers>=0.31",
+        "transformers>=4.44",
+        "safetensors>=0.4.5",
+        "huggingface_hub>=0.26",
+        "numpy>=1.26",
+        "tqdm",
+        "pillow",
+    )
+    .add_local_dir(
+        REPO_ROOT,
+        remote_path="/repo",
+        ignore=[
+            ".git",
+            "**/__pycache__",
+            "*.egg-info",
+            ".venv",
+            ".ruff_cache",
+            ".pytest_cache",
+        ],
+    )
+)
+
+app = modal.App("ditflex-train", image=image)
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+@app.function(
+    gpu=f"{GPU_KIND}:{GPU_COUNT}",
+    timeout=TIMEOUT_CEILING,
+    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
+)
+def train(
+    train_seconds: int = 7200,
+    objective: str = "flow",
+    hub_repo: str = "",
+    max_steps: int = 0,
+    target_steps: int = 400_000,
+    resume_revision: str = "",
+    resume_step: int = 0,
+    auto_legacy_rollback: bool = True,
+    legacy_suspect_ratio: float = 8.0,
+    max_retries: int = 2,
+    retry_seed_stride: int = 1_000_003,
+    lr: float = 0.0,
+    lr_policy: str = "adaptive",
+    lr_min: float = 1e-5,
+    lr_hard_min: float = 1e-6,
+    lr_backoff: float = 0.5,
+    lr_min_scale: float = 0.125,
+    # Kept only so the existing v2 GitHub workflow remains callable.  V3 uses
+    # committed-reference thresholds below rather than fast/slow EMA ratios.
+    loss_rise_ratio: float = 1.08,
+    loss_emergency_ratio: float = 1.35,
+    health_loss_warn_ratio: float = 1.015,
+    health_loss_retry_ratio: float = 1.025,
+    health_loss_emergency_ratio: float = 1.05,
+    health_grad_warn_ratio: float = 2.0,
+    health_grad_retry_ratio: float = 4.0,
+    health_grad_emergency_ratio: float = 8.0,
+    commit_windows: int = 2,
+    warning_patience: int = 2,
+    reset_lr_controller: bool = False,
+    grad_reference: float = 0.0,
+    wd: float = -1.0,
+    wd_ada: float = 0.0,
+    clip: float = 1.0,
+    spike_skip: float = 4.0,
+    seed_offset: int = 0,
+    grad_ceiling: float = 0.0,
+    skip_warn_rate: float = 0.30,
+    skip_retry_rate: float = 0.40,
+    skip_emergency_rate: float = 0.60,
+    precision: str = "tf32",
+    probe_attn_logits: bool = False,
+    probe_batch: int = 8,
+    qk_mode: str = "amap",
+    dmap_alpha: float = 0.0,
+    qk_norm: bool = False,
+) -> int:
+    import subprocess
+    import sys
+
+    import torch
+
+    if max_retries < 0:
+        print("[modal] max_retries must be non-negative")
+        return 2
+    if not (0.0 < lr_backoff < 1.0):
+        print("[modal] lr_backoff must lie in (0, 1)")
+        return 2
+    if train_seconds <= 0:
+        print("[modal] train_seconds must be positive")
+        return 2
+    if precision not in {"tf32", "bf16"}:
+        print(f"[modal] unknown precision: {precision!r}")
+        return 2
+    if wd_ada < 0.0:
+        print("[modal] wd_ada must be non-negative")
+        return 2
+    if qk_mode not in {"amap", "dmap"}:
+        print(f"[modal] unknown qk_mode: {qk_mode!r}")
+        return 2
+    if qk_norm and qk_mode != "amap":
+        print("[modal] qk_norm is valid for the amap chain only")
+        return 2
+    if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
+        print(
+            "[modal] skip thresholds must satisfy "
+            "0 <= warn <= retry <= emergency <= 1"
+        )
+        return 2
+
+    n_gpu = torch.cuda.device_count()
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+        capture_output=True,
+        text=True,
+    )
+    print(f"[modal] {n_gpu} GPUs:\n{result.stdout.strip()}")
+    if n_gpu <= 0:
+        print("[modal] no CUDA devices visible")
+        return 2
+
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-e", "/repo", "--no-deps"],
+        check=True,
+    )
+
+    # The editable install above happens after this Modal worker interpreter
+    # has already started.  pip writes a .pth/editable-finder file, but the
+    # running interpreter does not automatically re-process newly created
+    # .pth files.  Add the src-layout directory explicitly for imports in this
+    # supervisor process and export it for every fresh torchrun child.
+    repo_src = Path("/repo/src")
+    if not repo_src.is_dir():
+        raise RuntimeError(f"expected source directory is missing: {repo_src}")
+    repo_src_str = str(repo_src)
+    if repo_src_str not in sys.path:
+        sys.path.insert(0, repo_src_str)
+    inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+    pythonpath_parts = [part for part in inherited_pythonpath.split(os.pathsep) if part]
+    if repo_src_str not in pythonpath_parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([repo_src_str, *pythonpath_parts])
+
+    from ditflex.checkpoint import (
+        resolve_revision_for_step,
+        select_stable_resume_revision,
+    )
+
+    selected_revision = resume_revision.strip()
+    selected_step: int | None = resume_step if resume_step > 0 else None
+    if selected_revision and selected_step is not None:
+        print("[modal] use only one of resume_revision or resume_step")
+        return 2
+    if selected_step is not None:
+        if not hub_repo:
+            print("[modal] resume_step requires hub_repo")
+            return 2
+        selected_revision = resolve_revision_for_step(hub_repo, selected_step)
+        print(
+            f"[modal] explicit anchor step {selected_step:,} -> "
+            f"revision {selected_revision[:12]}"
+        )
+    elif not selected_revision and auto_legacy_rollback and hub_repo:
+        selection = select_stable_resume_revision(
+            hub_repo,
+            suspect_ratio=legacy_suspect_ratio,
+        )
+        selected_revision = selection.revision or ""
+        selected_step = selection.step
+        print(f"[modal] resume selection: {selection.reason}")
+        if selected_revision:
+            print(
+                f"[modal] using migration anchor step {selected_step:,} "
+                f"revision {selected_revision[:12]}"
+            )
+
+    if loss_rise_ratio != 1.08 or loss_emergency_ratio != 1.35:
+        print(
+            "[modal] NOTE: v2 loss_rise_ratio/loss_emergency_ratio are deprecated; "
+            "v3 uses health_loss_* committed-reference thresholds"
+        )
+
+    remaining_train_seconds = float(train_seconds)
+    for attempt in range(max_retries + 1):
+        if remaining_train_seconds < 1.0:
+            print("[modal] retry budget exhausted before another attempt")
+            return RETRY_EXIT_CODE
+
+        RETRY_MARKER.unlink(missing_ok=True)
+        PROMOTION_MARKER.unlink(missing_ok=True)
+
+        attempt_factor = lr_backoff**attempt
+        attempt_seed_offset = seed_offset + attempt * retry_seed_stride
+        child_budget = max(1, int(remaining_train_seconds))
+
+        command = [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            f"--nproc-per-node={n_gpu}",
+            "--standalone",
+            "-m",
+            "ditflex.train",
+            f"--train-seconds={child_budget}",
+            f"--objective={objective}",
+            f"--target-steps={target_steps}",
+            f"--attempt={attempt}",
+            f"--attempt-lr-factor={attempt_factor}",
+            f"--seed-offset={attempt_seed_offset}",
+            f"--lr-policy={lr_policy}",
+            f"--lr-min={lr_min}",
+            f"--lr-hard-min={lr_hard_min}",
+            f"--lr-min-scale={lr_min_scale}",
+            f"--commit-windows={commit_windows}",
+            f"--warning-patience={warning_patience}",
+            f"--loss-warn-ratio={health_loss_warn_ratio}",
+            f"--loss-retry-ratio={health_loss_retry_ratio}",
+            f"--loss-emergency-ratio={health_loss_emergency_ratio}",
+            f"--grad-warn-ratio={health_grad_warn_ratio}",
+            f"--grad-retry-ratio={health_grad_retry_ratio}",
+            f"--grad-emergency-ratio={health_grad_emergency_ratio}",
+            f"--clip={clip}",
+            f"--spike-skip={spike_skip}",
+            f"--grad-ceiling={grad_ceiling}",
+            f"--skip-warn-rate={skip_warn_rate}",
+            f"--skip-retry-rate={skip_retry_rate}",
+            f"--skip-emergency-rate={skip_emergency_rate}",
+            f"--precision={precision}",
+            f"--qk-mode={qk_mode}",
+            f"--dmap-alpha={dmap_alpha}",
+        ]
+        if qk_norm:
+            command.append("--qk-norm")
+        if probe_attn_logits:
+            command.append("--probe-attn-logits")
+            command.append(f"--probe-batch={probe_batch}")
+        if hub_repo:
+            command.append(f"--hub-repo={hub_repo}")
+        if selected_revision:
+            command.append(f"--resume-revision={selected_revision}")
+        if max_steps > 0:
+            command.append(f"--max-steps={max_steps}")
+        if lr > 0.0:
+            command.append(f"--lr={lr}")
+        if grad_reference > 0.0:
+            command.append(f"--grad-reference={grad_reference}")
+        if wd >= 0.0:
+            command.append(f"--wd={wd}")
+        if wd_ada > 0.0:
+            command.append(f"--wd-ada={wd_ada}")
+        if reset_lr_controller and attempt == 0:
+            command.append("--reset-lr-controller")
+
+        print(
+            f"\n[modal] attempt {attempt}/{max_retries}: "
+            f"lr_factor={attempt_factor:g} seed_offset={attempt_seed_offset} "
+            f"budget={child_budget}s precision={precision} qk_mode={qk_mode} anchor="
+            f"{selected_revision[:12] if selected_revision else 'latest'}\n"
+            f"[modal] running: {' '.join(command)}\n"
+        )
+        started = time.time()
+        result = subprocess.run(command, cwd="/repo")
+        child_wall = time.time() - started
+        if result.returncode == 0:
+            print(f"[modal] attempt {attempt} completed successfully")
+            return 0
+
+        # torchrun commonly wraps a worker's exit code in ChildFailedError and
+        # returns 1 itself.  The rank-0 atomic marker is therefore the source of
+        # truth for a deliberate transactional retry.
+        retry = _read_json(RETRY_MARKER)
+        retry_requested = int(retry.get("exit_code", 0) or 0) == RETRY_EXIT_CODE
+        if not retry_requested:
+            print(
+                f"[modal] child failed with non-retryable exit code "
+                f"{result.returncode}; not masking the failure"
+            )
+            return result.returncode
+
+        consumed = float(retry.get("elapsed_training_seconds", child_wall))
+        remaining_train_seconds = max(0.0, remaining_train_seconds - consumed)
+        print(
+            f"[modal] retry requested: {retry.get('reason', 'no marker reason')}\n"
+            f"[modal] stepping budget consumed={consumed:.1f}s, "
+            f"remaining={remaining_train_seconds:.1f}s"
+        )
+
+        # If this attempt promoted healthy progress before a later failure,
+        # retry from ordinary latest.  Otherwise preserve the explicit legacy
+        # migration anchor instead of falling back to a suspect old latest.
+        promotion = _read_json(PROMOTION_MARKER)
+        promoted_step = int(promotion.get("step", 0) or 0)
+        if promoted_step > 0 and (selected_step is None or promoted_step > selected_step):
+            selected_revision = ""
+            selected_step = promoted_step
+            print(
+                f"[modal] attempt promoted healthy step {promoted_step:,}; "
+                "next retry will pull Hub latest"
+            )
+
+        if attempt >= max_retries:
+            print("[modal] retry limit reached; last committed checkpoint remains untouched")
+            return RETRY_EXIT_CODE
+
+    return RETRY_EXIT_CODE
+
+
+@app.local_entrypoint()
+def main(
+    train_seconds: int = 7200,
+    objective: str = "flow",
+    hub_repo: str = "",
+    max_steps: int = 0,
+    target_steps: int = 400_000,
+    resume_revision: str = "",
+    resume_step: int = 0,
+    auto_legacy_rollback: bool = True,
+    legacy_suspect_ratio: float = 8.0,
+    max_retries: int = 2,
+    retry_seed_stride: int = 1_000_003,
+    lr: float = 0.0,
+    lr_policy: str = "adaptive",
+    lr_min: float = 1e-5,
+    lr_hard_min: float = 1e-6,
+    lr_backoff: float = 0.5,
+    lr_min_scale: float = 0.125,
+    loss_rise_ratio: float = 1.08,
+    loss_emergency_ratio: float = 1.35,
+    health_loss_warn_ratio: float = 1.015,
+    health_loss_retry_ratio: float = 1.025,
+    health_loss_emergency_ratio: float = 1.05,
+    health_grad_warn_ratio: float = 2.0,
+    health_grad_retry_ratio: float = 4.0,
+    health_grad_emergency_ratio: float = 8.0,
+    commit_windows: int = 2,
+    warning_patience: int = 2,
+    reset_lr_controller: bool = False,
+    grad_reference: float = 0.0,
+    wd: float = -1.0,
+    wd_ada: float = 0.0,
+    clip: float = 1.0,
+    spike_skip: float = 4.0,
+    seed_offset: int = 0,
+    grad_ceiling: float = 0.0,
+    skip_warn_rate: float = 0.30,
+    skip_retry_rate: float = 0.40,
+    skip_emergency_rate: float = 0.60,
+    precision: str = "tf32",
+    probe_attn_logits: bool = False,
+    probe_batch: int = 8,
+    qk_mode: str = "amap",
+    dmap_alpha: float = 0.0,
+    qk_norm: bool = False,
+):
+    if objective not in {"ddpm", "flow"}:
+        raise SystemExit(f"unknown objective: {objective!r}")
+    if lr_policy not in {"constant", "cosine", "adaptive"}:
+        raise SystemExit(f"unknown lr_policy: {lr_policy!r}")
+    if precision not in {"tf32", "bf16"}:
+        raise SystemExit(f"unknown precision: {precision!r}")
+    if wd_ada < 0.0:
+        raise SystemExit("wd_ada must be non-negative")
+    if qk_mode not in {"amap", "dmap"}:
+        raise SystemExit(f"unknown qk_mode: {qk_mode!r}")
+    if qk_norm and qk_mode != "amap":
+        raise SystemExit("qk_norm is valid for the amap chain only")
+    if not (0.0 <= skip_warn_rate <= skip_retry_rate <= skip_emergency_rate <= 1.0):
+        raise SystemExit(
+            "skip thresholds must satisfy "
+            "0 <= warn <= retry <= emergency <= 1"
+        )
+
+    return_code = train.remote(
+        train_seconds=train_seconds,
+        objective=objective,
+        hub_repo=hub_repo,
+        max_steps=max_steps,
+        target_steps=target_steps,
+        resume_revision=resume_revision,
+        resume_step=resume_step,
+        auto_legacy_rollback=auto_legacy_rollback,
+        legacy_suspect_ratio=legacy_suspect_ratio,
+        max_retries=max_retries,
+        retry_seed_stride=retry_seed_stride,
+        lr=lr,
+        lr_policy=lr_policy,
+        lr_min=lr_min,
+        lr_hard_min=lr_hard_min,
+        lr_backoff=lr_backoff,
+        lr_min_scale=lr_min_scale,
+        loss_rise_ratio=loss_rise_ratio,
+        loss_emergency_ratio=loss_emergency_ratio,
+        health_loss_warn_ratio=health_loss_warn_ratio,
+        health_loss_retry_ratio=health_loss_retry_ratio,
+        health_loss_emergency_ratio=health_loss_emergency_ratio,
+        health_grad_warn_ratio=health_grad_warn_ratio,
+        health_grad_retry_ratio=health_grad_retry_ratio,
+        health_grad_emergency_ratio=health_grad_emergency_ratio,
+        commit_windows=commit_windows,
+        warning_patience=warning_patience,
+        reset_lr_controller=reset_lr_controller,
+        grad_reference=grad_reference,
+        wd=wd,
+        wd_ada=wd_ada,
+        clip=clip,
+        spike_skip=spike_skip,
+        seed_offset=seed_offset,
+        grad_ceiling=grad_ceiling,
+        skip_warn_rate=skip_warn_rate,
+        skip_retry_rate=skip_retry_rate,
+        skip_emergency_rate=skip_emergency_rate,
+        precision=precision,
+        probe_attn_logits=probe_attn_logits,
+        probe_batch=probe_batch,
+        qk_mode=qk_mode,
+        dmap_alpha=dmap_alpha,
+        qk_norm=qk_norm,
+    )
+    if return_code != 0:
+        raise SystemExit(return_code)
+```
+
 ### `src/ditflex/model.py`
 
 ```python
@@ -3520,16 +5348,25 @@ DiTTransformer2DModel. The walk also counts what it touched and demands
 exactly one self-attention per layer, so an architecture surprise fails
 here, loudly, instead of surfacing as an uninterpretable training curve.
 
+QK-NORM (cfg.qk_norm, amap only; DEVIATION adopted at the 344K
+migration): installs torch.nn.RMSNorm(head_dim, eps=1e-6) as norm_q and
+norm_k on every Attention module. The Flex processor applies them
+per-head after the head reshape (see attention.py). The parameters are
+named ``...attn1.norm_q.weight`` / ``...attn1.norm_k.weight`` and are
+therefore covered by EMA, checkpointing, and the migration tooling
+(ditflex.migrate) by name.
+
 torch.compile does NOT happen here -- train.py compiles. Tests and the
 identity gate need the uncompiled module.
 """
 
 from __future__ import annotations
 
+import torch
 from diffusers import DiTTransformer2DModel
 from diffusers.models.attention_processor import Attention
 
-from ditflex.attention import FlexSelfAttnProcessor, ScoreMod
+from ditflex.attention import QK_NORM_EPS, FlexSelfAttnProcessor, ScoreMod
 from ditflex.config import ModelConfig
 
 
@@ -3540,6 +5377,27 @@ def install_flex_processors(model, score_mod: ScoreMod | None = None) -> int:
     for module in model.modules():
         if isinstance(module, Attention):
             module.set_processor(FlexSelfAttnProcessor(score_mod=score_mod))
+            count += 1
+    return count
+
+
+def install_qk_norms(model, head_dim: int) -> int:
+    """Install per-head RMSNorm(head_dim) as norm_q/norm_k on every
+    Attention module. Returns the number of modules touched.
+
+    Assigning the modules as attributes registers them as submodules, so
+    the new parameters appear in named_parameters(), state_dict(), the
+    EMA shadow, and the optimizer -- everything downstream keys by name.
+    Weight init is RMSNorm's default (ones), which is NOT an identity
+    transform on pre-trained Q/K (it rescales each head vector to unit
+    RMS): a migrated checkpoint needs the short reduced-LR warmup
+    documented in run/migrate_qknorm.py.
+    """
+    count = 0
+    for module in model.modules():
+        if isinstance(module, Attention):
+            module.norm_q = torch.nn.RMSNorm(head_dim, eps=QK_NORM_EPS)
+            module.norm_k = torch.nn.RMSNorm(head_dim, eps=QK_NORM_EPS)
             count += 1
     return count
 
@@ -3570,6 +5428,23 @@ def build_model(cfg: ModelConfig, score_mod: ScoreMod | None = None) -> DiTTrans
             f"has {cfg.num_layers} layers -- the DiT architecture is not one "
             "self-attention per block as assumed. Do not train on this."
         )
+
+    if getattr(cfg, "qk_norm", False):
+        # GUARD: qk-norm is an amap-chain deviation only. A dmap-labeled
+        # config never reaches here (rejected below), but a future builder
+        # calling this with a variant config must decide explicitly.
+        if getattr(cfg, "qk_mode", "amap") != "amap":
+            raise ValueError(
+                "qk_norm=True is defined for the amap baseline only; "
+                f"qk_mode={cfg.qk_mode!r} must not carry it (untied norms break "
+                "R == 0; tied norms flatten the DMAP destination potential)."
+            )
+        n_normed = install_qk_norms(model, cfg.attention_head_dim)
+        if n_normed != cfg.num_layers:
+            raise RuntimeError(
+                f"installed qk-norm on {n_normed} Attention modules, expected "
+                f"{cfg.num_layers}."
+            )
 
     # GUARD, not a feature: this builder produces ONLY the certified
     # baseline DiT. Variant configs must go through their own builders so
@@ -3778,6 +5653,212 @@ def build_objective(name: str, label_dropout: float = 0.1, num_classes: int = 10
     if name == "flow":
         return FlowMatchingObjective(label_dropout=label_dropout, null_class=num_classes)
     raise ValueError(f"unknown objective: {name!r} (expected 'ddpm' or 'flow')")
+```
+
+### `src/ditflex/probe.py`
+
+```python
+"""src/ditflex/probe.py -- opt-in training diagnostics. NEVER on the production path.
+
+Two questions, answered with data instead of pattern-matching:
+
+  1. WHICH parameter family produces the gradient tail?
+     grad_family_norms() walks named_parameters AFTER backward (grads must
+     still be present) and reduces squared grad norms into the same six
+     families train.py's weight-norm log already uses (qk / vo / mlp /
+     ada / emb / oth). If one family's grad norm dominates and grows across
+     a bounded diagnostic run, the culprit has a name in the logs.
+
+  2. ARE attention logits growing?
+     attention_logit_probe() captures every Attention module's input with
+     forward pre-hooks, recomputes the QK logits EXPLICITLY from the
+     module's own projections in fp32 (no fused kernel, same spirit as
+     reference_self_attention), and returns per-layer |logit| max.
+     Calibration: healthy DiT attention logits sit roughly 5-20; values of
+     50+ that climb over a few thousand steps are the attention-logit-growth
+     signature, and QK-norm is the established fix. If instead logits stay
+     tame while the 'ada' grad family dominates, the adaLN modulation MLPs
+     are the target and the surgery is different (per-group weight decay),
+     with no new parameters and no optimizer-state migration.
+
+Both helpers are rank-0-only by convention, use NO collectives, and are
+read-only with respect to training state: safe to call on the RAW
+(uncompiled, unwrapped) module in the middle of a DDP training step. The
+probe forward runs the eager Flex path (the model handed in is the raw
+module train.py keeps around for exactly this kind of use); at N=256 and a
+small probe batch this is well under a second per stability window.
+
+Everything here is gated behind --probe-attn-logits in train.py. With the
+flag off, train.py never calls into this module and the production chain
+is byte-for-byte the same behavior as before.
+"""
+
+from __future__ import annotations
+
+import torch
+import torch.nn.functional as F
+
+FAMILIES = ("qk", "vo", "mlp", "ada", "emb", "oth")
+
+
+def family_of(name: str) -> str:
+    """Identical classification to train.py's LOG_EVERY weight-norm block.
+
+    Kept as a duplicate on purpose: probe.py must not import from the
+    training loop, and the production loop must not import its logging
+    taxonomy from a diagnostics module.
+    """
+    if "to_q" in name or "to_k" in name:
+        return "qk"
+    if "to_v" in name or "to_out" in name:
+        return "vo"
+    if ".ff." in name:
+        return "mlp"
+    if "norm1" in name or "norm_out" in name or "adaln" in name.lower():
+        return "ada"
+    if "emb" in name or "pos_embed" in name or "proj_out" in name:
+        return "emb"
+    return "oth"
+
+
+@torch.no_grad()
+def grad_family_norms(model: torch.nn.Module) -> dict[str, float]:
+    """Per-family L2 gradient norms. Call after backward, before zero_grad.
+
+    Returns {family: ||grad||_2} with families summed in squared space, so
+    the values compose exactly like the global grad norm train.py already
+    logs (global**2 == sum over families of family**2, up to shared-param
+    dedup in the dmap chain, where tied to_k/to_q gradients accumulate
+    into the one shared parameter and are counted once, in 'qk').
+    """
+    squares = dict.fromkeys(FAMILIES, 0.0)
+    seen: set[int] = set()  # dmap ties to_k to to_q: count shared params once
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None or id(parameter) in seen:
+            continue
+        seen.add(id(parameter))
+        squares[family_of(name)] += (
+            parameter.grad.detach().float().pow(2).sum().item()
+        )
+    return {key: value**0.5 for key, value in squares.items()}
+
+
+def format_families(norms: dict[str, float]) -> str:
+    return "  ".join(f"{key}={norms[key]:9.2f}" for key in FAMILIES)
+
+
+def _make_capture_hook(store: dict[str, torch.Tensor], name: str):
+    def hook(_module, args):
+        # args[0] is hidden_states [B, N, C]; keep it for the explicit
+        # logit recomputation below. detach: this is a read-only probe.
+        store[name] = args[0].detach()
+
+    return hook
+
+
+@torch.no_grad()
+def attention_logit_probe(
+    model: torch.nn.Module,
+    x0: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    t_value: float = 500.0,
+    autocast_dtype: torch.dtype = torch.bfloat16,
+    top_k: int = 5,
+) -> dict:
+    """Max |QK logit| per attention layer, computed explicitly in fp32.
+
+    The forward runs under the same autocast dtype as training so captured
+    inputs reflect the numerics the model actually sees; the logits
+    themselves are then recomputed in fp32 from the module's own to_q/to_k
+    weights (explicit matmul, no fused kernel), so the number reported is
+    the mathematical logit, not a kernel artifact.
+
+    Args:
+        model:  the RAW module (uncompiled, unwrapped). Never the DDP wrapper.
+        x0:     [B, 4, 32, 32] probe batch (a small slice of the current
+                training batch is fine; B=8 keeps captures under ~150 MB).
+        labels: [B] class labels for the same slice.
+        t_value: timestep passed to the model; the DiT embedder accepts a
+                float for both objectives, and mid-schedule (500) is a
+                representative operating point. Logit growth, when present,
+                shows up at every t.
+
+    Returns dict with:
+        per_layer: {module_name: max_abs_logit}
+        max:       overall max
+        argmax:    name of the layer attaining it
+        top:       [(short_name, value)] for the top_k layers, descending
+    """
+    from diffusers.models.attention_processor import Attention
+
+    attention_modules = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, Attention)
+    ]
+    if not attention_modules:
+        raise ValueError("no diffusers Attention modules found on the probe model")
+
+    captured: dict[str, torch.Tensor] = {}
+    handles = [
+        module.register_forward_pre_hook(_make_capture_hook(captured, name))
+        for name, module in attention_modules
+    ]
+
+    was_training = model.training
+    model.eval()
+    try:
+        t = torch.full((x0.shape[0],), float(t_value), device=x0.device)
+        if x0.is_cuda and autocast_dtype != torch.float32:
+            with torch.autocast("cuda", dtype=autocast_dtype):
+                model(hidden_states=x0, timestep=t, class_labels=labels)
+        else:
+            # fp32 / TF32 training mode, or the CPU path used by unit tests:
+            # run the plain forward so captures match training numerics.
+            model(hidden_states=x0, timestep=t, class_labels=labels)
+    finally:
+        for handle in handles:
+            handle.remove()
+        if was_training:
+            model.train()
+
+    per_layer: dict[str, float] = {}
+    for name, module in attention_modules:
+        hidden = captured[name].float()
+        weight_q = module.to_q.weight.detach().float()
+        weight_k = module.to_k.weight.detach().float()
+        bias_q = None if module.to_q.bias is None else module.to_q.bias.detach().float()
+        bias_k = None if module.to_k.bias is None else module.to_k.bias.detach().float()
+
+        query = F.linear(hidden, weight_q, bias_q)
+        key = F.linear(hidden, weight_k, bias_k)
+
+        batch, seq_len, _ = hidden.shape
+        heads = module.heads
+        head_dim = query.shape[-1] // heads
+        query = query.view(batch, seq_len, heads, head_dim).transpose(1, 2)
+        key = key.view(batch, seq_len, heads, head_dim).transpose(1, 2)
+
+        logits = (query @ key.transpose(-2, -1)) * module.scale
+        per_layer[name] = logits.abs().amax().item()
+
+    ranked = sorted(per_layer.items(), key=lambda kv: kv[1], reverse=True)
+    argmax_name, max_value = ranked[0]
+
+    def short(name: str) -> str:
+        # "transformer_blocks.17.attn1" -> "blk17"
+        for token in name.split("."):
+            if token.isdigit():
+                return f"blk{token}"
+        return name
+
+    return {
+        "per_layer": per_layer,
+        "max": max_value,
+        "argmax": short(argmax_name),
+        "top": [(short(n), round(v, 2)) for n, v in ranked[:top_k]],
+    }
 ```
 
 ### `src/ditflex/sample.py`
@@ -4672,6 +6753,33 @@ This is intentionally not a broad ``try/except`` recovery loop.  The observed
 failure stayed finite while the pre-clip gradient median moved by orders of
 magnitude, so recovery must be driven by explicit health metrics rather than by
 exceptions alone.
+
+PRECISION: ``--precision`` selects the training numerics.  ``tf32``
+(default) runs the published DiT/SiT recipe -- fp32 activations with TF32
+tensor-core matmuls, no autocast.  ``bf16`` restores the previous behavior
+(bf16 autocast over fp32 master weights).  Latents, EMA, optimizer state,
+and checkpoints are fp32 in both modes; the choice is recorded in each
+run_history entry, not in the config, so the config-drift guard never
+refuses a resume across a precision change.
+
+ADALN WEIGHT DECAY: ``--wd-ada`` applies decoupled (AdamW-style) weight
+decay to the adaLN modulation family only (norm1 / norm_out / *adaln*),
+implemented as a manual per-step shrink immediately before
+``optimizer.step``.  Diagnosis behind it: the adaLN weights grow unbounded
+under the published wd=0 recipe (|w|_ada ~4.9k of |w|_total ~4.9k at 274K
+steps), their scale modulations amplify the tokens feeding attention, and
+block-1 QK logits explode (3.4e6 observed) -- the gradient-spike source.
+Implemented OUTSIDE the optimizer on purpose: the single AdamW param group
+is untouched, so index-keyed optimizer checkpoints load unchanged in both
+directions and 0.0 (default) is byte-for-byte the previous behavior.
+Skipped (spiked) steps do not decay -- decay accompanies real updates only,
+so effective decay per accepted step is exactly lr*wd_ada.
+
+DIAGNOSTICS (opt-in, off by default): ``--probe-attn-logits`` enables
+``ditflex.probe`` -- per-family gradient norms at LOG_EVERY cadence and on
+every skipped (spike) step, plus an explicit fp32 max-attention-logit probe at
+every stability window.  Rank 0 only, no collectives, read-only.  With the
+flag off this file's behavior is identical to before the probe existed.
 """
 
 from __future__ import annotations
@@ -4679,6 +6787,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from contextlib import nullcontext
 import os
 import shutil
 import statistics
@@ -4713,6 +6822,7 @@ from ditflex.ema import EMA
 from ditflex.latents import LatentStore
 from ditflex.model import build_model
 from ditflex.objective import build_objective, make_step_generator
+from ditflex.probe import attention_logit_probe, format_families, grad_family_norms
 from ditflex.stability import AdaptiveLrController, StabilitySpec, WindowMetrics
 
 CKPT_DIR = "/tmp/ditflex_ckpt"  # committed checkpoint pulled from Hub
@@ -4785,12 +6895,63 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(auto_infer_grad_reference=True)
     parser.add_argument("--wd", type=float, default=-1.0)
+    parser.add_argument(
+        "--wd-ada",
+        type=float,
+        default=0.0,
+        help=(
+            "decoupled weight decay applied ONLY to the adaLN modulation "
+            "family (norm1/norm_out/adaln), as a manual shrink before "
+            "optimizer.step. 0 = off (previous behavior). The optimizer's "
+            "param group is untouched, so checkpoints remain compatible."
+        ),
+    )
     parser.add_argument("--clip", type=float, default=1.0)
     parser.add_argument("--spike-skip", type=float, default=4.0)
     parser.add_argument("--grad-ceiling", type=float, default=0.0)
     parser.add_argument("--seed-offset", type=int, default=0)
 
+    parser.add_argument(
+        "--precision",
+        choices=["tf32", "bf16"],
+        default="tf32",
+        help=(
+            "tf32: fp32 activations + TF32 matmuls (published DiT/SiT recipe, "
+            "~2x activation memory, lower throughput). bf16: bf16 autocast "
+            "over fp32 master weights (previous default)."
+        ),
+    )
+
+    # Opt-in diagnostics (ditflex.probe).  Off by default: with the flag off,
+    # nothing in this file calls into the probe module and the production
+    # chain's behavior is unchanged.
+    parser.add_argument(
+        "--probe-attn-logits",
+        action="store_true",
+        help=(
+            "rank-0 diagnostics: per-family grad norms at LOG_EVERY cadence "
+            "and on every skipped spike step; explicit fp32 max-attention-"
+            "logit probe at every stability window"
+        ),
+    )
+    parser.add_argument(
+        "--probe-batch",
+        type=int,
+        default=8,
+        help="probe forward batch size (slice of the current training batch)",
+    )
+
     parser.add_argument("--qk-mode", choices=["amap", "dmap"], default="amap")
+    parser.add_argument(
+        "--qk-norm",
+        action="store_true",
+        help=(
+            "build the amap model with per-head RMSNorm on Q/K (post-344K "
+            "migration architecture). Must match the checkpoint's embedded "
+            "config or the drift guard refuses the resume. Invalid with "
+            "--qk-mode dmap."
+        ),
+    )
     parser.add_argument("--dmap-alpha", type=float, default=0.0)
     parser.add_argument("--sample-count", type=int, default=16)
     parser.add_argument("--sample-steps", type=int, default=50)
@@ -4837,12 +6998,26 @@ def main() -> int:
         raise ValueError("use only one of --resume-step or --resume-revision")
     if not (0.0 < args.attempt_lr_factor <= 1.0):
         raise ValueError("--attempt-lr-factor must lie in (0, 1]")
+    if args.probe_batch <= 0:
+        raise ValueError("--probe-batch must be positive")
+    if args.wd_ada < 0.0:
+        raise ValueError("--wd-ada must be non-negative")
 
     ctx = setup()
+
+    # Precision backends.  TF32 mode follows the published DiT/SiT recipe:
+    # fp32 activations, tensor-core TF32 matmuls.  In bf16 mode TF32 flags
+    # are irrelevant (autocast matmuls run in bf16) but harmless.
+    if args.precision == "tf32":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+
     cfg = Config()
     cfg.train.objective = args.objective
     cfg.model.qk_mode = args.qk_mode
     cfg.model.dmap_alpha = args.dmap_alpha
+    cfg.model.qk_norm = args.qk_norm
     if args.hub_repo:
         cfg.hub.checkpoint_repo = args.hub_repo
 
@@ -4852,7 +7027,21 @@ def main() -> int:
 
     if ctx.is_rank0:
         print(f"[train] world={ctx.world}  per_rank_batch={per_rank_batch}")
+        print(
+            f"[train] precision={args.precision}"
+            + (
+                " (fp32 activations, TF32 matmuls -- published recipe)"
+                if args.precision == "tf32"
+                else " (bf16 autocast, fp32 master weights)"
+            )
+        )
         print(cfg.to_json())
+        if args.probe_attn_logits:
+            print(
+                f"[train] PROBE ENABLED: grad families @ every {LOG_EVERY} steps "
+                f"and on spikes; attn logits @ every {LOSS_WINDOW}-step window "
+                f"(probe_batch={args.probe_batch}, rank 0 only)"
+            )
         Path(RETRY_MARKER).unlink(missing_ok=True)
         shutil.rmtree(CANDIDATE_DIR, ignore_errors=True)
 
@@ -5013,6 +7202,38 @@ def main() -> int:
         if ctx.is_rank0:
             print(f"[train] WD OVERRIDE for this run: {args.wd:g}")
 
+    # adaLN-only decoupled decay: same family classification as the logging
+    # blocks and ditflex.probe.  Collected once from the RAW model; DDP and
+    # torch.compile wrappers share these Parameter objects, so shrinking them
+    # here shrinks the training weights.  Deduplicated by identity for the
+    # dmap chain's tied modules (adaLN is never tied today, but cheap safety).
+    ada_params: list[torch.nn.Parameter] = []
+    if args.wd_ada > 0.0:
+        seen_ids: set[int] = set()
+        for _name, _param in model.named_parameters():
+            if (
+                ("norm1" in _name or "norm_out" in _name or "adaln" in _name.lower())
+                and id(_param) not in seen_ids
+            ):
+                seen_ids.add(id(_param))
+                ada_params.append(_param)
+        if not ada_params:
+            raise RuntimeError(
+                "--wd-ada > 0 but no adaLN parameters matched norm1/norm_out/"
+                "adaln -- the architecture naming has drifted; refusing to "
+                "silently no-op."
+            )
+        if ctx.is_rank0:
+            ada_sq = sum(
+                p.detach().float().pow(2).sum().item() for p in ada_params
+            )
+            print(
+                f"[train] ADA WEIGHT DECAY enabled: wd_ada={args.wd_ada:g} on "
+                f"{len(ada_params)} tensors, |w|_ada={ada_sq**0.5:.1f} at start; "
+                f"decay is decoupled (p *= 1 - lr*wd_ada) and applied only on "
+                f"accepted (non-skipped) steps"
+            )
+
     start_lr = controller.apply(optimizer, start_step)
     if ctx.is_rank0:
         reference = None if controller.reference is None else controller.reference.state_dict()
@@ -5134,6 +7355,7 @@ def main() -> int:
                 "promotion_reason": reason,
                 "effective": {
                     "attempt": args.attempt,
+                    "precision": args.precision,
                     "lr_policy": stability_spec.policy,
                     "lr_base": stability_spec.base_lr,
                     "lr_start": start_lr if segment_start == start_step else None,
@@ -5142,6 +7364,7 @@ def main() -> int:
                     "lr_hard_min": stability_spec.hard_min_lr,
                     "lr_scale": controller.scale,
                     "weight_decay": optimizer.param_groups[0]["weight_decay"],
+                    "wd_ada": args.wd_ada,
                     "clip": args.clip,
                     "spike_skip": args.spike_skip,
                     "grad_ceiling": args.grad_ceiling,
@@ -5264,7 +7487,12 @@ def main() -> int:
             rank=ctx.rank,
             seed_offset=args.seed_offset,
         )
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        autocast_ctx = (
+            torch.autocast("cuda", dtype=torch.bfloat16)
+            if args.precision == "bf16"
+            else nullcontext()
+        )
+        with autocast_ctx:
             loss = objective.loss(
                 wrapped,
                 x0,
@@ -5283,6 +7511,18 @@ def main() -> int:
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+
+        # PROBE (pre-clip): capture RAW per-family gradient norms before
+        # clip_grad_norm_ rescales grads in place.  Cheap (one reduction over
+        # params, rank 0 only) and only when the flag is on; printed later
+        # once the spike decision is known so the line can carry the tag.
+        raw_families: dict[str, float] | None = None
+        if args.probe_attn_logits and ctx.is_rank0:
+            try:
+                raw_families = grad_family_norms(model)
+            except Exception as exc:  # noqa: BLE001 - diagnostics never kill training
+                print(f"[probe] grad-family probe failed (non-fatal): {exc!r}")
+
         grad_norm_tensor = torch.nn.utils.clip_grad_norm_(
             model.parameters(),
             max_norm=args.clip,
@@ -5316,6 +7556,17 @@ def main() -> int:
         spike_decision = (relative_spike or absolute_spike) if ctx.is_rank0 else False
         spiked = broadcast_flag(ctx, spike_decision)
 
+        # PROBE: print the RAW (pre-clip) per-family norms captured above,
+        # now that the spike decision is known.  These compose to the raw
+        # |g| (sum of squares), so on a spike line the dominant family's
+        # value IS the spike magnitude, not a clipped fraction of 1.0.
+        if raw_families is not None and (spiked or step % LOG_EVERY == 0):
+            tag = "SPIKE" if spiked else "cadence"
+            print(
+                f"[probe] step {step:,} ({tag})  |g|raw={grad_norm:9.2f}  "
+                f"{format_families(raw_families)}"
+            )
+
         if spiked:
             optimizer.zero_grad(set_to_none=True)
             spikes_total += 1
@@ -5338,6 +7589,12 @@ def main() -> int:
                     f"(total skipped: {spikes_total})"
                 )
         else:
+            if ada_params:
+                # Decoupled decay at the CURRENT scheduled LR, so the decay
+                # strength tracks the controller exactly like the update does.
+                decay = 1.0 - float(optimizer.param_groups[0]["lr"]) * args.wd_ada
+                with torch.no_grad():
+                    torch._foreach_mul_(ada_params, decay)
             optimizer.step()
             ema.update(model)
 
@@ -5375,6 +7632,32 @@ def main() -> int:
                     f"ratios(loss={event.loss_ratio:.3f}, grad={event.grad_ratio:.2f}, "
                     f"p90={event.grad_p90_ratio:.2f})  {event.reason}"
                 )
+
+            # PROBE: explicit fp32 max attention logits, once per window, on a
+            # small slice of the batch this step just trained on.  Runs on the
+            # RAW module in eager mode (the compiled/DDP wrapper is untouched);
+            # a probe failure is logged and never affects the training loop or
+            # the retry decision below.
+            if args.probe_attn_logits and ctx.is_rank0:
+                try:
+                    n_probe = min(args.probe_batch, x0.shape[0])
+                    stats = attention_logit_probe(
+                        model,
+                        x0[:n_probe],
+                        labels[:n_probe],
+                        autocast_dtype=(
+                            torch.bfloat16
+                            if args.precision == "bf16"
+                            else torch.float32
+                        ),
+                    )
+                    print(
+                        f"[probe] attn logits @ {step:,}: max={stats['max']:.2f} "
+                        f"at {stats['argmax']}  top={stats['top']}"
+                    )
+                except Exception as exc:  # noqa: BLE001 - diagnostics never kill training
+                    print(f"[probe] attn-logit probe failed (non-fatal): {exc!r}")
+
             retry_decision = broadcast_flag(
                 ctx,
                 event.should_retry if ctx.is_rank0 else False,
@@ -5961,6 +8244,11 @@ if __name__ == "__main__":
 Same checks, same reference: FlexAttention vs explicit fp64 math built from
 the same weights. No SDPA anywhere. Skips (does not fail) on machines
 without CUDA so the CPU test workflow stays green.
+
+Parametrized over qk_norm since the 344K migration: the with-norm
+configuration attaches RMSNorm(head_dim) to norm_q/norm_k with
+NON-TRIVIAL weights (1 + noise), so a silently-skipped norm cannot pass
+by accident, and the fp64 reference applies the identical normalization.
 """
 
 from __future__ import annotations
@@ -5985,13 +8273,31 @@ def strict_fp32():
     torch.backends.cuda.matmul.allow_tf32 = prev
 
 
-def build_attention(dtype: torch.dtype, requires_grad: bool = False):
+def attach_qk_norms(attn, dtype: torch.dtype, seed: int = 7) -> None:
+    """Install RMSNorm(head_dim) with non-trivial weights (1 + 0.1*noise).
+
+    Ones-weights would make a dropped multiply invisible; perturbed weights
+    make the norm's presence measurable in every comparison.
+    """
+    from ditflex.attention import QK_NORM_EPS
+
+    g = torch.Generator().manual_seed(seed)
+    for name in ("norm_q", "norm_k"):
+        norm = torch.nn.RMSNorm(HEAD_DIM, eps=QK_NORM_EPS)
+        with torch.no_grad():
+            norm.weight.add_(0.1 * torch.randn(HEAD_DIM, generator=g))
+        setattr(attn, name, norm.to(device="cuda", dtype=dtype))
+
+
+def build_attention(dtype: torch.dtype, qk_norm: bool, requires_grad: bool = False):
     from diffusers.models.attention_processor import Attention
 
     attn = Attention(
         query_dim=DIM, heads=HEADS, dim_head=HEAD_DIM, dropout=0.0, bias=True, out_bias=True
     )
     attn = attn.to(device="cuda", dtype=dtype).eval()
+    if qk_norm:
+        attach_qk_norms(attn, dtype)
     for p in attn.parameters():
         p.requires_grad_(requires_grad)
     return attn
@@ -6007,15 +8313,16 @@ def agree(got: torch.Tensor, ref: torch.Tensor, rtol: float, atol: float = 1e-8)
 
 
 @requires_cuda
+@pytest.mark.parametrize("qk_norm", [False, True], ids=["plain", "qknorm"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_flex_matches_math_reference(dtype):
+def test_flex_matches_math_reference(dtype, qk_norm):
     from ditflex.attention import (
         IdentityFlexSelfAttnProcessor,
         reference_self_attention,
     )
 
     torch.manual_seed(0)
-    attn = build_attention(dtype)
+    attn = build_attention(dtype, qk_norm)
     x = torch.randn(BATCH, SEQ_LEN, DIM, device="cuda", dtype=dtype)
 
     assert abs(attn.scale - HEAD_DIM**-0.5) < 1e-9
@@ -6033,6 +8340,39 @@ def test_flex_matches_math_reference(dtype):
 
 
 @requires_cuda
+def test_qk_norm_changes_the_output():
+    """A dropped norm is invisible to the identity comparison when weights
+    are ones; with perturbed weights, with-norm and without-norm outputs
+    must measurably differ -- proving the norm is live in the Flex path."""
+    from ditflex.attention import IdentityFlexSelfAttnProcessor
+
+    torch.manual_seed(0)
+    attn = build_attention(torch.float32, qk_norm=False)
+    attn.set_processor(IdentityFlexSelfAttnProcessor())
+    x = torch.randn(BATCH, SEQ_LEN, DIM, device="cuda")
+    with torch.no_grad():
+        plain = attn(x)
+
+    attach_qk_norms(attn, torch.float32)
+    with torch.no_grad():
+        normed = attn(x)
+
+    assert (normed - plain).abs().max().item() > 1e-3
+
+
+@requires_cuda
+def test_half_installed_norms_are_rejected():
+    from ditflex.attention import IdentityFlexSelfAttnProcessor
+
+    attn = build_attention(torch.float32, qk_norm=True)
+    attn.norm_k = None  # simulate a broken migration
+    attn.set_processor(IdentityFlexSelfAttnProcessor())
+    x = torch.randn(BATCH, SEQ_LEN, DIM, device="cuda")
+    with pytest.raises(ValueError, match="BOTH"):
+        attn(x)
+
+
+@requires_cuda
 def test_score_mod_is_wired():
     """Identity comparison cannot catch a silently-dropped score_mod
     (identity == no-mod). A zero score_mod forces uniform attention, which
@@ -6040,7 +8380,7 @@ def test_score_mod_is_wired():
     from ditflex.attention import FlexSelfAttnProcessor, IdentityFlexSelfAttnProcessor
 
     torch.manual_seed(0)
-    attn = build_attention(torch.float32)
+    attn = build_attention(torch.float32, qk_norm=False)
     x = torch.randn(BATCH, SEQ_LEN, DIM, device="cuda")
 
     attn.set_processor(IdentityFlexSelfAttnProcessor())
@@ -6055,14 +8395,15 @@ def test_score_mod_is_wired():
 
 
 @requires_cuda
-def test_flex_backward_matches_reference():
+@pytest.mark.parametrize("qk_norm", [False, True], ids=["plain", "qknorm"])
+def test_flex_backward_matches_reference(qk_norm):
     from ditflex.attention import (
         IdentityFlexSelfAttnProcessor,
         reference_self_attention,
     )
 
     torch.manual_seed(0)
-    attn = build_attention(torch.float32, requires_grad=True)
+    attn = build_attention(torch.float32, qk_norm, requires_grad=True)
     x = torch.randn(BATCH, SEQ_LEN, DIM, device="cuda")
 
     attn.zero_grad(set_to_none=True)
@@ -6070,6 +8411,8 @@ def test_flex_backward_matches_reference():
     ref_grads = {
         n: p.grad.detach().clone() for n, p in attn.named_parameters() if p.grad is not None
     }
+    if qk_norm:
+        assert any("norm_q" in n for n in ref_grads), "reference gave no grad to norm_q"
 
     attn.zero_grad(set_to_none=True)
     attn.set_processor(IdentityFlexSelfAttnProcessor())
@@ -6084,7 +8427,7 @@ def test_flex_backward_matches_reference():
 def test_processor_rejects_out_of_contract_inputs():
     from ditflex.attention import IdentityFlexSelfAttnProcessor
 
-    attn = build_attention(torch.float32)
+    attn = build_attention(torch.float32, qk_norm=False)
     attn.set_processor(IdentityFlexSelfAttnProcessor())
     x = torch.randn(BATCH, SEQ_LEN, DIM, device="cuda")
 
@@ -7053,6 +9396,170 @@ def test_wrong_flat_dim_rejected():
         LatentStore(torch.randn(8, 1024).bfloat16(), torch.zeros(8, dtype=torch.long))
 ```
 
+### `tests/test_migrate_qknorm.py`
+
+```python
+"""ditflex.migrate: the qk-norm migration must be exactly understood.
+
+Round-trips a tiny amap checkpoint through migrate_checkpoint and asserts
+the load-bearing properties one by one: weights preserved by name, norm
+weights fresh ones, EMA carried, AdamW moments attached to the SAME
+parameters they belonged to (by name, not index), hyperparameters kept,
+step kept, guard reset, and the drift guard behavior on both sides of the
+migration. CPU-only."""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from ditflex.checkpoint import load_checkpoint, save_checkpoint, validate_checkpoint
+from ditflex.config import Config
+from ditflex.ema import EMA
+from ditflex.migrate import migrate_checkpoint
+from ditflex.model import build_model
+
+
+def tiny_config(qk_norm: bool = False) -> Config:
+    cfg = Config()
+    cfg.model.num_attention_heads = 2
+    cfg.model.attention_head_dim = 16
+    cfg.model.num_layers = 2
+    cfg.model.sample_size = 8
+    cfg.model.num_classes = 10
+    cfg.model.qk_norm = qk_norm
+    cfg.train.objective = "flow"
+    return cfg
+
+
+def make_trained_checkpoint(directory, steps: int = 3) -> tuple[Config, dict]:
+    torch.manual_seed(0)
+    cfg = tiny_config(qk_norm=False)
+    model = build_model(cfg.model)
+    ema = EMA(model, decay=cfg.train.ema_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3.3e-5, weight_decay=0.0)
+    # Populate real AdamW state (exp_avg, exp_avg_sq, step) with synthetic
+    # gradients: identical migration mechanics to a trained checkpoint, and
+    # CPU-safe (FlexAttention has no CPU backward, so a real backward would
+    # break the CPU test workflow).
+    for _ in range(steps):
+        for p in model.parameters():
+            p.grad = torch.randn_like(p) * 1e-3
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        ema.update(model)
+    state = {
+        "step": 344_000,
+        "run_history": [{"start_step": 0, "end_step": 344_000}],
+        "guard_state": {
+            "version": 3,
+            "spikes_total": 2823,
+            "recent_losses": [0.77] * 200,
+            "stability_controller": {"version": 4, "committed_scale": 0.282},
+        },
+    }
+    save_checkpoint(directory, model, ema, optimizer, cfg, state)
+    return cfg, {
+        "model": {k: v.clone() for k, v in model.state_dict().items()},
+        "ema": {k: v.clone() for k, v in ema.state_dict().items()},
+        "optim_names": [n for n, _ in model.named_parameters()],
+        "optim_state": {
+            n: {k: v.clone() for k, v in optimizer.state[p].items() if torch.is_tensor(v)}
+            for n, p in model.named_parameters()
+            if p in optimizer.state
+        },
+    }
+
+
+def test_migration_roundtrip(tmp_path):
+    src = tmp_path / "old"
+    dst = tmp_path / "new"
+    _, before = make_trained_checkpoint(src)
+
+    new_state = migrate_checkpoint(src, dst)
+    assert new_state["step"] == 344_000
+    validate_checkpoint(dst, expected_step=344_000)
+
+    # Load into the qk_norm architecture through the ordinary path.
+    new_cfg = tiny_config(qk_norm=True)
+    model = build_model(new_cfg.model)
+    ema = EMA(model, decay=new_cfg.train.ema_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0, weight_decay=0.0)
+    state = load_checkpoint(dst, model, ema, optimizer, new_cfg)
+    assert state["step"] == 344_000
+
+    # 1. Every pre-existing weight preserved by NAME; norm weights are ones.
+    new_sd = model.state_dict()
+    for name, tensor in before["model"].items():
+        assert torch.equal(new_sd[name], tensor), name
+    norm_keys = [k for k in new_sd if k.endswith(("norm_q.weight", "norm_k.weight"))]
+    assert len(norm_keys) == 2 * new_cfg.model.num_layers
+    for key in norm_keys:
+        assert torch.equal(new_sd[key], torch.ones_like(new_sd[key])), key
+
+    # 2. EMA carried by name; norm shadow entries are the (ones) online values.
+    for name, tensor in before["ema"].items():
+        assert torch.equal(ema.shadow[name], tensor), name
+    for key in norm_keys:
+        assert torch.equal(ema.shadow[key], torch.ones_like(ema.shadow[key]))
+
+    # 3. AdamW moments attached to the SAME named parameters (the index
+    #    remap): exp_avg for each old parameter must match exactly, and the
+    #    fresh norm parameters must have no state.
+    params = dict(model.named_parameters())
+    for name, entry in before["optim_state"].items():
+        migrated_entry = optimizer.state[params[name]]
+        for key, value in entry.items():
+            assert torch.allclose(
+                migrated_entry[key].float(), value.float()
+            ), f"optim state mismatch: {name}.{key}"
+    for key in norm_keys:
+        assert params[key] not in optimizer.state or not optimizer.state[params[key]]
+
+    # 4. Hyperparameters preserved.
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(3.3e-5)
+
+    # 5. Guard reset: no controller, no recent losses; spike counter carried.
+    guard = state["guard_state"]
+    assert "stability_controller" not in guard
+    assert "recent_losses" not in guard
+    assert guard["spikes_total"] == 2823
+
+
+def test_migrated_checkpoint_refuses_old_config(tmp_path):
+    src = tmp_path / "old"
+    dst = tmp_path / "new"
+    make_trained_checkpoint(src)
+    migrate_checkpoint(src, dst)
+
+    old_cfg = tiny_config(qk_norm=False)
+    model = build_model(old_cfg.model)
+    ema = EMA(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+    with pytest.raises(ValueError, match="same experiment"):
+        load_checkpoint(dst, model, ema, optimizer, old_cfg)
+
+
+def test_migration_refuses_wrong_inputs(tmp_path):
+    src = tmp_path / "old"
+    dst = tmp_path / "new"
+    make_trained_checkpoint(src)
+
+    # Already migrated -> refuse a second migration.
+    migrate_checkpoint(src, dst)
+    with pytest.raises(ValueError, match="already"):
+        migrate_checkpoint(dst, tmp_path / "again")
+
+
+def test_dmap_builder_refuses_qk_norm():
+    from ditflex.diffusion_model import build_dmap_model
+
+    cfg = tiny_config(qk_norm=True)
+    cfg.model.qk_mode = "dmap"
+    with pytest.raises(ValueError, match="not valid for the DMAP chain"):
+        build_dmap_model(cfg.model)
+```
+
 ### `tests/test_objective_math.py`
 
 ```python
@@ -7222,6 +9729,196 @@ def test_retry_seed_changes_flow_and_ddpm_objective():
         assert not loss1.equal(loss2)
 ```
 
+### `tests/test_probe.py`
+
+```python
+"""ditflex.probe: the diagnostics must themselves be trustworthy.
+
+Three properties, checked exactly:
+  - grad_family_norms composes to the global grad norm (squared-sum identity)
+    and counts dmap's tied to_q/to_k parameter once;
+  - attention_logit_probe's explicit fp32 logit max agrees with a dense
+    fp64 recomputation on the same weights;
+  - the probe is read-only: params, grads, and training mode unchanged.
+
+CPU-only where possible; the logit-vs-dense check builds a tiny DiT and
+runs on CPU too (eager flex works on CPU for these shapes).
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from ditflex.config import ModelConfig
+from ditflex.model import build_model
+from ditflex.probe import (
+    FAMILIES,
+    attention_logit_probe,
+    family_of,
+    grad_family_norms,
+)
+
+
+def tiny():
+    return ModelConfig(
+        num_attention_heads=2, attention_head_dim=16, num_layers=2,
+        sample_size=8, patch_size=2, num_classes=10,
+    )
+
+
+def test_family_classification_matches_train_py_taxonomy():
+    assert family_of("transformer_blocks.0.attn1.to_q.weight") == "qk"
+    assert family_of("transformer_blocks.0.attn1.to_k.bias") == "qk"
+    assert family_of("transformer_blocks.0.attn1.to_v.weight") == "vo"
+    assert family_of("transformer_blocks.0.attn1.to_out.0.weight") == "vo"
+    assert family_of("transformer_blocks.0.ff.net.0.proj.weight") == "mlp"
+    assert family_of("transformer_blocks.0.norm1.linear.weight") == "ada"
+    assert family_of("pos_embed.proj.weight") == "emb"
+    assert family_of("proj_out.weight") == "emb"
+
+
+def test_grad_family_norms_compose_to_global_norm():
+    torch.manual_seed(0)
+    model = build_model(tiny())
+    x0 = torch.randn(2, 4, 8, 8)
+    t = torch.full((2,), 500.0)
+    y = torch.randint(0, 10, (2,))
+    out = model(hidden_states=x0, timestep=t, class_labels=y).sample
+    out.square().mean().backward()
+
+    families = grad_family_norms(model)
+    assert set(families) == set(FAMILIES)
+    composed = sum(v**2 for v in families.values()) ** 0.5
+    global_norm = torch.norm(
+        torch.stack([
+            p.grad.detach().float().norm()
+            for p in model.parameters()
+            if p.grad is not None
+        ])
+    ).item()
+    assert composed == pytest.approx(global_norm, rel=1e-5)
+
+
+def test_grad_family_norms_count_tied_params_once():
+    from ditflex.diffusion_model import build_dmap_model
+
+    cfg = tiny()
+    cfg.qk_mode = "dmap"
+    model = build_dmap_model(cfg)
+    x0 = torch.randn(2, 4, 8, 8)
+    t = torch.full((2,), 500.0)
+    y = torch.randint(0, 10, (2,))
+    model(hidden_states=x0, timestep=t, class_labels=y).sample.square().mean().backward()
+
+    families = grad_family_norms(model)
+    # Tied to_k is to_q: unique-parameter global norm must still compose.
+    seen: set[int] = set()
+    unique_sq = 0.0
+    for p in model.parameters():
+        if p.grad is None or id(p) in seen:
+            continue
+        seen.add(id(p))
+        unique_sq += p.grad.detach().float().pow(2).sum().item()
+    composed = sum(v**2 for v in families.values()) ** 0.5
+    assert composed == pytest.approx(unique_sq**0.5, rel=1e-5)
+
+
+def test_logit_probe_matches_dense_fp64_and_is_read_only():
+    torch.manual_seed(0)
+    model = build_model(tiny())
+    model.train()
+    x0 = torch.randn(2, 4, 8, 8)
+    y = torch.randint(0, 10, (2,))
+
+    params_before = {n: p.detach().clone() for n, p in model.named_parameters()}
+
+    stats = attention_logit_probe(model, x0, y, autocast_dtype=torch.float32)
+
+    # Read-only: params untouched, mode restored, no grads created.
+    assert model.training
+    for n, p in model.named_parameters():
+        assert torch.equal(p.detach(), params_before[n]), n
+        assert p.grad is None
+
+    assert stats["max"] > 0.0
+    assert stats["argmax"].startswith("blk")
+    assert len(stats["per_layer"]) == 2
+
+    # Dense fp64 cross-check of one layer using captured-free recomputation:
+    # rebuild the layer input by hooking again, then compare.
+    from diffusers.models.attention_processor import Attention
+
+    captured = {}
+    names = [n for n, m in model.named_modules() if isinstance(m, Attention)]
+    target = names[0]
+    module = dict(model.named_modules())[target]
+    handle = module.register_forward_pre_hook(
+        lambda _m, args: captured.setdefault("x", args[0].detach())
+    )
+    with torch.no_grad():
+        t = torch.full((2,), 500.0)
+        model.eval()
+        model(hidden_states=x0, timestep=t, class_labels=y)
+    handle.remove()
+
+    h = captured["x"].double()
+    q = h @ module.to_q.weight.double().T + module.to_q.bias.double()
+    k = h @ module.to_k.weight.double().T + module.to_k.bias.double()
+    b, n, _ = h.shape
+    heads = module.heads
+    hd = q.shape[-1] // heads
+    q = q.view(b, n, heads, hd).transpose(1, 2)
+    k = k.view(b, n, heads, hd).transpose(1, 2)
+    dense_max = ((q @ k.transpose(-2, -1)) * module.scale).abs().amax().item()
+    assert stats["per_layer"][target] == pytest.approx(dense_max, rel=1e-4)
+
+
+# -- adaLN weight-decay behavior (train.py --wd-ada), pinned here because the
+#    decay maths is probe-adjacent diagnostics territory and needs no GPU.
+
+
+def test_ada_family_selection_matches_train_py_filter():
+    """The name filter train.py uses to build ada_params must select the
+    same tensors the 'ada' family reports -- the decayed set and the
+    monitored set have to be the same set."""
+    model = build_model(tiny())
+    filter_names = {
+        n
+        for n, _ in model.named_parameters()
+        if "norm1" in n or "norm_out" in n or "adaln" in n.lower()
+    }
+    family_names = {
+        n for n, _ in model.named_parameters() if family_of(n) == "ada"
+    }
+    assert filter_names == family_names
+    assert filter_names, "no adaLN parameters found -- naming drifted"
+
+
+def test_decoupled_ada_decay_shrinks_only_ada():
+    torch.manual_seed(0)
+    model = build_model(tiny())
+    lr, wd_ada = 1e-2, 0.5  # exaggerated so one step is measurable
+
+    seen: set[int] = set()
+    ada_params = []
+    for n, p in model.named_parameters():
+        if ("norm1" in n or "norm_out" in n or "adaln" in n.lower()) and id(p) not in seen:
+            seen.add(id(p))
+            ada_params.append(p)
+
+    before = {n: p.detach().clone() for n, p in model.named_parameters()}
+    decay = 1.0 - lr * wd_ada
+    with torch.no_grad():
+        torch._foreach_mul_(ada_params, decay)
+
+    for n, p in model.named_parameters():
+        if family_of(n) == "ada":
+            assert torch.allclose(p.detach(), before[n] * decay), n
+        else:
+            assert torch.equal(p.detach(), before[n]), n
+```
+
 ### `tests/test_stability.py`
 
 ```python
@@ -7386,25 +10083,30 @@ ditflex.attention.reference_self_attention -- explicit matmuls and an
 explicit softmax in fp64, built from the same weights. If the Flex path
 matches that, it matches the math.
 
-Checks, in order:
+Since the 344K migration the gate runs EVERY check in BOTH configurations:
+without qk-norm (the pre-migration baseline) and with qk-norm attached
+using NON-TRIVIAL weights (1 + 0.1*noise -- ones-weights would make a
+dropped norm invisible). The fp64 reference applies the identical
+normalization from the same weights.
+
+Checks, per configuration:
   1. scale        -- attn.scale equals what the processor passes to Flex
   2. forward fp32 -- flex vs fp64 reference, rel tol 1e-4
   3. forward bf16 -- flex vs fp64 reference, rel tol 2e-2
                      (bf16 has ~8 mantissa bits; tighter is not meaningful)
   4. score_mod wiring -- a constant-zero score_mod must produce uniform
-     attention and therefore a measurably different output. An identity
-     comparison alone CANNOT catch a bug where score_mod is silently
-     dropped, because identity == no-mod. This check can.
-  5. gradients fp32 -- flex backward vs autograd through the reference
-  6. (--compile) the compiled Flex path vs the same reference
+     attention and therefore a measurably different output
+  5. norm liveness (qk-norm config only) -- with-norm output must differ
+     from without-norm output on the same weights/input
+  6. gradients fp32 -- flex backward vs autograd through the reference,
+     including the norm weights when present
+  7. (--compile) the compiled Flex path vs the same reference
 
-If this fails, nothing downstream is interpretable: a training curve that
-differs from the DiT/SiT baseline could be the score_mod or could be the
-plumbing, and you will not be able to tell which.
+If this fails, nothing downstream is interpretable.
 
 Run:
-    python scripts/verify_identity.py
-    python scripts/verify_identity.py --compile
+    python tests/verify_identity.py
+    python tests/verify_identity.py --compile
 
 Exit code 0 on pass, 1 on failure.
 """
@@ -7418,6 +10120,7 @@ import torch
 from diffusers.models.attention_processor import Attention
 
 from ditflex.attention import (
+    QK_NORM_EPS,
     FlexSelfAttnProcessor,
     IdentityFlexSelfAttnProcessor,
     reference_self_attention,
@@ -7434,7 +10137,16 @@ BATCH = 4
 REL_TOL = {torch.float32: 1e-4, torch.bfloat16: 2e-2}
 
 
-def build_attention(device: torch.device, dtype: torch.dtype) -> Attention:
+def attach_qk_norms(attn: Attention, device, dtype, seed: int = 7) -> None:
+    g = torch.Generator().manual_seed(seed)
+    for name in ("norm_q", "norm_k"):
+        norm = torch.nn.RMSNorm(HEAD_DIM, eps=QK_NORM_EPS)
+        with torch.no_grad():
+            norm.weight.add_(0.1 * torch.randn(HEAD_DIM, generator=g))
+        setattr(attn, name, norm.to(device=device, dtype=dtype))
+
+
+def build_attention(device, dtype, qk_norm: bool) -> Attention:
     attn = Attention(
         query_dim=DIM,
         heads=HEADS,
@@ -7444,6 +10156,8 @@ def build_attention(device: torch.device, dtype: torch.dtype) -> Attention:
         out_bias=True,
     )
     attn = attn.to(device=device, dtype=dtype).eval()
+    if qk_norm:
+        attach_qk_norms(attn, device, dtype)
     for p in attn.parameters():
         p.requires_grad_(False)
     return attn
@@ -7452,11 +10166,6 @@ def build_attention(device: torch.device, dtype: torch.dtype) -> Attention:
 def compare(
     name: str, got: torch.Tensor, ref: torch.Tensor, rtol: float, atol: float = 1e-8
 ) -> bool:
-    """Combined |a-b| <= atol + rtol*|ref| criterion (numpy/torch allclose
-    style). The atol term matters for quantities that are mathematically
-    zero -- e.g. d/d(to_k.bias), which vanishes exactly because softmax is
-    shift-invariant -- where a pure relative test divides rounding noise by
-    rounding noise and fails spuriously."""
     got64, ref64 = got.double(), ref.double()
     max_abs = (got64 - ref64).abs().max().item()
     denom = ref64.abs().max().item()
@@ -7464,29 +10173,21 @@ def compare(
     max_rel = max_abs / (denom + 1e-12)
     status = "PASS" if ok else "FAIL"
     print(
-        f"  [{status}] {name:<30} max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  "
+        f"  [{status}] {name:<34} max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  "
         f"rtol={rtol:.1e} atol={atol:.1e}"
     )
     return ok
 
 
 def check_scale(attn: Attention) -> bool:
-    """The processor passes scale=attn.scale explicitly, so the only thing to
-    verify is that the module's scale is the expected 1/sqrt(head_dim) for
-    this config (scale_qk=True). A surprise here means the module was built
-    differently than the DiT-L/2 recipe assumes."""
     expected = HEAD_DIM ** -0.5
     ok = abs(attn.scale - expected) < 1e-9
     status = "PASS" if ok else "FAIL"
-    print(f"  [{status}] {'scale':<30} attn.scale={attn.scale:.8f}  expected={expected:.8f}")
+    print(f"  [{status}] {'scale':<34} attn.scale={attn.scale:.8f}  expected={expected:.8f}")
     return ok
 
 
 def check_score_mod_wiring(attn: Attention, x: torch.Tensor, identity_out: torch.Tensor) -> bool:
-    """score_mod that zeroes every score -> uniform attention. If the output
-    does not change, score_mod is not wired through and the swappable
-    component is not swappable."""
-
     def zero_score(score, b, h, q_idx, kv_idx):
         return score * 0.0
 
@@ -7497,10 +10198,85 @@ def check_score_mod_wiring(attn: Attention, x: torch.Tensor, identity_out: torch
     diff = (uniform_out.double() - identity_out.double()).abs().max().item()
     ok = diff > 1e-3
     status = "PASS" if ok else "FAIL"
-    print(f"  [{status}] {'score_mod wiring':<30} |uniform - identity|_max={diff:.3e} (must be > 1e-3)")
-    if not ok:
-        print("         -> score_mod appears to be silently ignored by the Flex call.")
+    print(f"  [{status}] {'score_mod wiring':<34} |uniform - identity|_max={diff:.3e} (> 1e-3)")
     return ok
+
+
+def run_configuration(device, qk_norm: bool, compile_check: bool) -> bool:
+    tag = "qk-norm" if qk_norm else "plain"
+    all_ok = True
+
+    plain_outputs: dict[torch.dtype, torch.Tensor] = {}
+    for dtype in (torch.float32, torch.bfloat16):
+        print(f"[{tag}] dtype = {dtype}")
+        torch.manual_seed(0)
+        attn = build_attention(device, dtype, qk_norm)
+        x = torch.randn(BATCH, SEQ_LEN, DIM, device=device, dtype=dtype)
+
+        all_ok &= check_scale(attn)
+
+        with torch.no_grad():
+            ref = reference_self_attention(attn, x, dtype=torch.float64)
+
+        attn.set_processor(IdentityFlexSelfAttnProcessor())
+        with torch.no_grad():
+            flex_out = attn(x)
+
+        if flex_out.shape != ref.shape or not torch.isfinite(flex_out).all():
+            print("  [FAIL] shape or finiteness")
+            all_ok = False
+
+        all_ok &= compare("flex vs fp64 reference", flex_out, ref, REL_TOL[dtype])
+        all_ok &= check_score_mod_wiring(attn, x, flex_out)
+
+        # Norm liveness: same weights and input, norms removed, output must move.
+        if qk_norm and dtype is torch.float32:
+            attn.norm_q, attn.norm_k = None, None
+            attn.set_processor(IdentityFlexSelfAttnProcessor())
+            with torch.no_grad():
+                unnormed = attn(x)
+            diff = (unnormed.double() - flex_out.double()).abs().max().item()
+            ok = diff > 1e-3
+            print(f"  [{'PASS' if ok else 'FAIL'}] {'qk-norm liveness':<34} "
+                  f"|normed - plain|_max={diff:.3e} (> 1e-3)")
+            all_ok &= ok
+            attach_qk_norms(attn, device, dtype)
+
+        if compile_check:
+            attn.set_processor(IdentityFlexSelfAttnProcessor())
+            compiled = torch.compile(attn)
+            with torch.no_grad():
+                out_c = compiled(x)
+            all_ok &= compare("compiled flex vs reference", out_c, ref, REL_TOL[dtype])
+
+        plain_outputs[dtype] = flex_out
+        print()
+
+    # Gradient check (fp32), including norm weights when present.
+    print(f"[{tag}] gradient check (fp32)")
+    attn = build_attention(device, torch.float32, qk_norm)
+    for p in attn.parameters():
+        p.requires_grad_(True)
+    x = torch.randn(BATCH, SEQ_LEN, DIM, device=device, dtype=torch.float32)
+
+    attn.zero_grad(set_to_none=True)
+    reference_self_attention(attn, x).square().mean().backward()
+    ref_grads = {
+        n: p.grad.detach().clone() for n, p in attn.named_parameters() if p.grad is not None
+    }
+    if qk_norm and not any("norm_q" in n for n in ref_grads):
+        print("  [FAIL] reference produced no gradient for norm_q")
+        all_ok = False
+
+    attn.zero_grad(set_to_none=True)
+    attn.set_processor(IdentityFlexSelfAttnProcessor())
+    attn(x).square().mean().backward()
+
+    for name, param in attn.named_parameters():
+        if name in ref_grads:
+            all_ok &= compare(f"grad {name}", param.grad, ref_grads[name], 1e-4)
+    print()
+    return all_ok
 
 
 def main() -> int:
@@ -7513,8 +10289,6 @@ def main() -> int:
         print("CUDA is required: the Flex kernels under test are the GPU ones.")
         return 1
 
-    # fp32 means fp32: no TF32 in the path under test, or the fp32 tolerance
-    # is meaningless.
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.set_float32_matmul_precision("highest")
 
@@ -7525,65 +10299,12 @@ def main() -> int:
     print(f"shape [B={BATCH}, N={SEQ_LEN}, C={DIM}]  heads={HEADS} head_dim={HEAD_DIM}\n")
 
     all_ok = True
+    for qk_norm in (False, True):
+        all_ok &= run_configuration(device, qk_norm, args.compile)
 
-    for dtype in (torch.float32, torch.bfloat16):
-        print(f"dtype = {dtype}")
-        attn = build_attention(device, dtype)
-        x = torch.randn(BATCH, SEQ_LEN, DIM, device=device, dtype=dtype)
-
-        all_ok &= check_scale(attn)
-
-        with torch.no_grad():
-            ref = reference_self_attention(attn, x, dtype=torch.float64)
-
-        attn.set_processor(IdentityFlexSelfAttnProcessor())
-        with torch.no_grad():
-            flex_out = attn(x)
-
-        if flex_out.shape != ref.shape:
-            print(f"  [FAIL] shape mismatch {tuple(flex_out.shape)} vs {tuple(ref.shape)}")
-            all_ok = False
-        if not torch.isfinite(flex_out).all():
-            print("  [FAIL] non-finite values in flex output")
-            all_ok = False
-
-        all_ok &= compare("flex vs fp64 reference", flex_out, ref, REL_TOL[dtype])
-        all_ok &= check_score_mod_wiring(attn, x, flex_out)
-
-        if args.compile:
-            attn.set_processor(IdentityFlexSelfAttnProcessor())
-            compiled = torch.compile(attn)
-            with torch.no_grad():
-                out_c = compiled(x)
-            all_ok &= compare("compiled flex vs reference", out_c, ref, REL_TOL[dtype])
-
-        print()
-
-    # Forward agreement does not guarantee backward agreement. Compare the
-    # Flex backward against autograd through the explicit-math reference,
-    # in fp32, on the same parameters.
-    print("gradient check (fp32)")
-    attn = build_attention(device, torch.float32)
-    for p in attn.parameters():
-        p.requires_grad_(True)
-    x = torch.randn(BATCH, SEQ_LEN, DIM, device=device, dtype=torch.float32)
-
-    attn.zero_grad(set_to_none=True)
-    reference_self_attention(attn, x).square().mean().backward()
-    ref_grads = {n: p.grad.detach().clone() for n, p in attn.named_parameters() if p.grad is not None}
-
-    attn.zero_grad(set_to_none=True)
-    attn.set_processor(IdentityFlexSelfAttnProcessor())
-    attn(x).square().mean().backward()
-
-    for name, param in attn.named_parameters():
-        if name not in ref_grads:
-            continue
-        all_ok &= compare(f"grad {name}", param.grad, ref_grads[name], 1e-4)
-
-    print()
     if all_ok:
-        print("ALL CHECKS PASSED -- the Flex path computes the math, and score_mod is live.")
+        print("ALL CHECKS PASSED -- Flex computes the math in BOTH configurations, "
+              "score_mod and qk-norm are live.")
         return 0
     print("FAILURES ABOVE -- do not proceed to training.")
     return 1
@@ -7774,6 +10495,13 @@ GPU_KIND = os.environ.get("MODAL_GPU", "B300")
 GPU_COUNT = int(os.environ.get("MODAL_GPUS", "2"))
 TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu129")
 
+# PCIe-only cards (RTX workstation/consumer) have P2P disabled at the driver
+# level; NCCL can hang probing for it instead of falling back. Disable it
+# there ONLY -- on SXM (B200/B300) these same paths are NVLink, and turning
+# them off forces the all-reduce through host memory.
+_PCIE_ONLY = "RTX" in GPU_KIND.upper() or "PRO-6000" in GPU_KIND.upper()
+_NCCL_ENV = {"NCCL_P2P_DISABLE": "1", "NCCL_IB_DISABLE": "1"} if _PCIE_ONLY else {}
+
 _BUDGET = int(os.environ.get("MODAL_TRAIN_SECONDS", "14400"))
 TIMEOUT_CEILING = _BUDGET + 3600
 
@@ -7799,11 +10527,15 @@ image = (
 
 app = modal.App("ditflex-train-dmap", image=image)
 
-
 @app.function(
     gpu=f"{GPU_KIND}:{GPU_COUNT}",
+    cpu=8.0,
     timeout=TIMEOUT_CEILING,
-    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
+    secrets=[modal.Secret.from_dict({
+        "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
+        "NCCL_DEBUG": "INFO",
+        **_NCCL_ENV,
+    })],
 )
 def train(
     train_seconds: int = 14400,

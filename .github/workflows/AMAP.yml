@@ -17,9 +17,9 @@ on:
         options: [tf32, highest, bf16]
         default: tf32
       stage:
-        description: "smoke (load+patch+forward) or finetune"
+        description: "smoke (load+patch+forward) / sample / finetune"
         type: choice
-        options: [smoke, finetune]
+        options: [smoke, sample, finetune]
         default: smoke
       steps:
         description: "finetune steps"
@@ -29,6 +29,22 @@ on:
         description: "finetune LR"
         type: string
         default: "0.00001"
+      sample_every:
+        description: "sample every N finetune steps (0 = only at end)"
+        type: string
+        default: "0"
+      sample_steps:
+        description: "ODE sampling steps"
+        type: string
+        default: "50"
+      cfg_scale:
+        description: "classifier-free guidance scale"
+        type: string
+        default: "4.0"
+      from_repo:
+        description: "load finetuned AMAP weights from this HF repo (sample stage)"
+        type: string
+        default: ""
       latents_repo:
         description: "your HF latents dataset (required for finetune)"
         type: string
@@ -67,6 +83,10 @@ jobs:
             --steps "${{ inputs.steps }}" \
             --lr "${{ inputs.lr }}" \
             --precision "${{ inputs.precision }}" \
+            --sample-every "${{ inputs.sample_every }}" \
+            --sample-steps "${{ inputs.sample_steps }}" \
+            --cfg-scale "${{ inputs.cfg_scale }}" \
+            --from-repo "${{ inputs.from_repo }}" \
             --latents-repo "${{ inputs.latents_repo }}" \
             --push-repo "${{ inputs.push_repo }}" \
             ${{ inputs.qk_rmsnorm == 'true' && '--qk-rmsnorm' || '--no-qk-rmsnorm' }} \

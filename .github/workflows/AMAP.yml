@@ -33,6 +33,10 @@ on:
         description: "push a checkpoint every N steps"
         type: string
         default: "10000"
+      max_shards:
+        description: "latent shards to load (0 = all 32)"
+        type: string
+        default: "0"
       sample_every:
         description: "preview grid every N finetune steps (0 = only at end)"
         type: string
@@ -90,6 +94,7 @@ jobs:
             --sample-steps "${{ inputs.sample_steps }}" \
             --cfg-scale "${{ inputs.cfg_scale }}" \
             --save-every "${{ inputs.save_every }}" \
+            --max-shards "${{ inputs.max_shards }}" \
             --latents-repo "${{ inputs.latents_repo }}" \
             --push-repo "${{ inputs.push_repo }}" \
             ${{ inputs.qk_rmsnorm == 'true' && '--qk-rmsnorm' || '--no-qk-rmsnorm' }} \

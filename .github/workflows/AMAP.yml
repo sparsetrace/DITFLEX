@@ -6,6 +6,11 @@ name: AMAP
 on:
   workflow_dispatch:
     inputs:
+      gpu:
+        description: "Modal GPU"
+        type: choice
+        options: [B200, H200, H100, A100-80GB]
+        default: B200
       stage:
         description: "smoke (load+patch+forward) or finetune"
         type: choice
@@ -50,6 +55,7 @@ jobs:
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          AMAP_GPU: ${{ inputs.gpu }}
         run: |
           modal run AMAP.py \
             --stage "${{ inputs.stage }}" \

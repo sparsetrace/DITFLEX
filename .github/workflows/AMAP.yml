@@ -54,9 +54,9 @@ on:
         type: string
         default: "sparsetrace/dlatentzz"
       push_repo:
-        description: "HF repo to push the AMAP checkpoint to (finetune only)"
+        description: "HF repo to push checkpoints/samples to (must be writable)"
         type: string
-        default: "sparsetrace/AMAP"
+        default: "jcandane/AMAP"
       qk_rmsnorm:
         description: "per-head RMSNorm on q,k (stabiliser, off by default)"
         type: boolean

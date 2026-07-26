@@ -227,28 +227,21 @@ def resolve_checkpoint_step(repo: str, step) -> int | None:
 
 
 def load_dmap_checkpoint(dev, repo: str, step="latest", weights: str = "ema"):
-    """Build SiT-XL/2 + DMAP and load a finetuned checkpoint (or base+DMAP if
-    step is 'base'/None). weights: 'ema' or 'model'. Returns (model, info)."""
-    import json
-    import torch
-    from huggingface_hub import hf_hub_download
-    from safetensors.torch import load_file
-    from dmap_attention import apply_dmap, DMAPConfig
+    """Build SiT-XL/2, FOLD qkv->wmv (DMAP production form), and load a finetuned
+    checkpoint (or base+DMAP if step is 'base'/None). Returns (model, info)."""
+    from dmap_attention import install_folded_dmap, DMAPConfig
 
     resolved = resolve_checkpoint_step(repo, step)
     model = build_sit_xl2().to(dev)
 
     if resolved is None:
-        apply_dmap(model, DMAPConfig())
+        install_folded_dmap(model, DMAPConfig(), fold_weights=True)   # base SiT, folded
         return model, {"repo": repo, "step": "base", "weights": "base"}
 
-    cfg_dict, _, _ = None, None, None
-    cfg_dict = fetch_checkpoint(repo, resolved)[0]
-    apply_dmap(model, make_dmap_config(cfg_dict))   # before load (adds params if any)
-
-    fname = "ema.safetensors" if weights == "ema" else "model.safetensors"
-    sd = load_file(hf_hub_download(repo, f"{folder}/{fname}"))
-    missing, unexpected = model.load_state_dict(sd, strict=False)
+    cfg_dict, model_sd, ema_sd = fetch_checkpoint(repo, resolved)
+    install_folded_dmap(model, make_dmap_config(cfg_dict), fold_weights=False)  # wmv shells
+    sd = ema_sd if weights == "ema" else model_sd
+    _, unexpected = model.load_state_dict(sd, strict=False)
     assert not unexpected, f"unexpected keys: {unexpected[:5]}"
     model = model.to(dev)
     return model, {"repo": repo, "step": resolved, "weights": weights, "config": cfg_dict}

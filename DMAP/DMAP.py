@@ -8,13 +8,16 @@ flux, R≡0): logit_ij = −½‖μ_i − μ_j‖², μ = (q+k)/√2.
     modal run DMAP/DMAP.py --stage finetune --steps 21000 --save-every 10000
 
 Checkpoint resolution for finetune (resume=auto):
-    1. DMAP's own latest in --push-repo (jcandane/DMAP)  -> resume it
-    2. else AMAP's latest in --amap-repo (jcandane/AMAP)  -> WARM-START (step 0)
-    3. else base SiT-XL/2                                 -> fresh
+    1. DMAP's own latest in --push-repo (jcandane/DMAP)  -> resume (folded)
+    2. else AMAP's latest in --amap-repo (jcandane/AMAP)  -> WARM-START + FOLD (step 0)
+    3. else base SiT-XL/2                                 -> fresh + FOLD
 
-`--steps N` trains N MORE steps from the resolved start. DMAP reuses the SiT qkv
-(no surgery), so AMAP weights load directly as a warm start. Shared helpers:
-dmap_common.py; operator: dmap_attention.py.
+At step 0 we FOLD W_Q,W_K -> W_M = (W_Q+W_K)/√2 and drop W_N: the fused qkv
+[3d,d] becomes wmv [2d,d], removing ~⅓ of the attention-projection params +
+optimizer state. Exact for DMAP (q,k never appear apart). `--sample-at-start`
+captures a grid on the folded weights before step 1 (the "before"). `--steps N`
+trains N more steps. Folded checkpoints are DMAP-only. Helpers: dmap_common.py;
+operator + fold: dmap_attention.py.
 """
 
 from __future__ import annotations
@@ -58,10 +61,10 @@ GPU = os.environ.get("DMAP_GPU", "B200")
 def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
         latents_repo: str, qk_rmsnorm: bool, learn_logit_scale: bool, precision: str,
         sample_every: int, sample_steps: int, cfg_scale: float, save_every: int,
-        max_shards: int, resume: str):
+        max_shards: int, resume: str, sample_at_start: bool):
     import contextlib, json, tempfile, torch
     import dmap_common as C
-    from dmap_attention import apply_dmap, DMAPConfig
+    from dmap_attention import install_folded_dmap, DMAPConfig
 
     if precision == "tf32":
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -86,38 +89,51 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
     x = torch.randn(2, 4, 32, 32, device=dev)
     t = torch.rand(2, device=dev)
     y = torch.randint(0, 1000, (2,), device=dev)
-    with torch.no_grad(), amp:
-        std_out = model(x, t, y)
 
-    # ---- checkpoint resolution: DMAP own -> AMAP warm-start -> base ----
-    start_step, resume_sds, warm = 0, None, None
+    # ---- checkpoint resolution: DMAP(folded) own -> AMAP warm-start -> base ----
+    start_step, warm, folded_sd, ema_sd = 0, None, None, None
     eff_qk_rmsnorm, eff_lls = qk_rmsnorm, learn_logit_scale
     if stage == "finetune" and resume != "never":
         s = C.latest_checkpoint_step(push_repo)
         if s is not None:
-            ckcfg, m_sd, e_sd = C.fetch_checkpoint(push_repo, s)
-            start_step, resume_sds = s, (m_sd, e_sd)
+            ckcfg, folded_sd, ema_sd = C.fetch_checkpoint(push_repo, s)   # folded format
+            start_step = s
             eff_qk_rmsnorm = bool(ckcfg.get("qk_rmsnorm", False))
             eff_lls = bool(ckcfg.get("learn_logit_scale", False))
-            print(f"[dmap] RESUMING DMAP from {push_repo}/checkpoints/step_{s:07d}")
+            print(f"[dmap] RESUMING DMAP (folded) from {push_repo}/checkpoints/step_{s:07d}")
         else:
             a = C.latest_checkpoint_step(amap_repo)
             if a is not None:
-                _, m_sd, e_sd = C.fetch_checkpoint(amap_repo, a)
-                start_step, resume_sds = 0, (m_sd, e_sd)
+                _, am_sd, _ = C.fetch_checkpoint(amap_repo, a)
+                _, unexp = model.load_state_dict(am_sd, strict=False)   # AMAP qkv -> model (pre-fold)
                 warm = f"{amap_repo}/checkpoints/step_{a:07d}"
-                print(f"[dmap] no DMAP checkpoint — WARM-STARTING from AMAP {warm} (step reset to 0)")
+                print(f"[dmap] no DMAP checkpoint — WARM-STARTING from AMAP {warm}, "
+                      f"folding W_Q,W_K->W_M (step reset to 0)")
+                if unexp:
+                    print(f"[dmap] (ignoring {len(unexp)} AMAP-only key(s), e.g. {unexp[:2]})")
             elif resume == "must":
                 raise SystemExit(f"[dmap] resume=must but no DMAP ({push_repo}) "
                                  f"or AMAP ({amap_repo}) checkpoint found")
             else:
-                print(f"[dmap] no DMAP or AMAP checkpoint — fresh start from base SiT")
+                print(f"[dmap] no DMAP or AMAP checkpoint — fresh start from base SiT, folding")
 
-    n_attn = apply_dmap(model, DMAPConfig(qk_rmsnorm=eff_qk_rmsnorm, learn_logit_scale=eff_lls))
+    with torch.no_grad(), amp:
+        std_out = model(x, t, y)          # standard attention on the pre-fold weights
+
+    # FOLD W_Q,W_K -> W_M (drop W_N). Exact for DMAP; ~1/3 fewer attn-proj params.
+    dcfg = DMAPConfig(qk_rmsnorm=eff_qk_rmsnorm, learn_logit_scale=eff_lls)
+    n_attn = install_folded_dmap(model, dcfg, fold_weights=True)
+    n_folded = sum(p.numel() for p in model.parameters())
+    if folded_sd is not None:             # DMAP resume: load trained folded weights
+        _, unexp = model.load_state_dict(folded_sd, strict=False)
+        assert not unexp, f"unexpected folded keys on resume: {unexp[:5]}"
+
     with torch.no_grad(), amp:
         dmap_out = model(x, t, y)
     shift = (dmap_out - std_out).flatten().norm() / std_out.flatten().norm()
-    print(f"[dmap] SiT-XL/2 params={n_params/1e6:.1f}M  patched_attn={n_attn}  precision={precision}")
+    saved = 100.0 * (n_params - n_folded) / n_params
+    print(f"[dmap] SiT-XL/2 {n_params/1e6:.1f}M -> {n_folded/1e6:.1f}M folded "
+          f"(−{saved:.1f}%, W_N dropped)  attn={n_attn}  precision={precision}")
     print(f"[dmap] qk_rmsnorm={eff_qk_rmsnorm} learn_logit_scale={eff_lls}  "
           f"rel-shift vs standard attn = {shift.item():.3f}")
 
@@ -143,21 +159,16 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
     print(f"[dmap] latents resident: {len(store):,}  "
           f"labels [{int(store.labels.min())},{int(store.labels.max())}]  from {latents_repo}")
 
-    # load resumed / warm-start weights (strict=False: AMAP source may carry
-    # AMAP-only keys; EMA keys are intersected)
-    if resume_sds is not None:
-        m_sd, e_sd = resume_sds
-        _, unexpected = model.load_state_dict(m_sd, strict=False)
-        if unexpected:
-            print(f"[dmap] ignoring {len(unexpected)} source-only key(s) (e.g. {unexpected[:2]})")
+    # model weights are already loaded + folded above. EMA:
     ema = C.EMA(model, decay=0.9999)
-    if resume_sds is not None:
+    if ema_sd is not None:                 # DMAP folded resume carries a folded EMA
         shadow = ema.state_dict()
-        for kk, vv in resume_sds[1].items():
+        for kk, vv in ema_sd.items():
             if kk in shadow:
                 shadow[kk] = vv.to(dev).float()
-        src = f"AMAP warm-start ({warm})" if warm else f"DMAP @ step {start_step:,}"
-        print(f"[dmap] loaded model+EMA from {src} (optimizer reinitialized)")
+        print(f"[dmap] loaded folded EMA @ step {start_step:,} (optimizer reinitialized)")
+    elif warm:
+        print(f"[dmap] EMA snapshot from AMAP warm-start (folded); optimizer fresh")
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     bs = 64
     grids: list[tuple[str, bytes]] = []
@@ -171,8 +182,9 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
             save_file({k: v.contiguous() for k, v in ema.state_dict().items()},
                       f"{d}/ema.safetensors")
             json.dump(
-                {"step": step, "qk_mode": "dmap", "variant": "coupled",
-                 "operator": "mahalanobis: -1/2||mu_i-mu_j||^2, mu=(q+k)/sqrt2, R=0",
+                {"step": step, "qk_mode": "dmap", "variant": "folded",
+                 "operator": "mahalanobis: -1/2||mu_i-mu_j||^2, mu=R·W_M, W_M=(W_Q+W_K)/sqrt2, R=0",
+                 "folded": True, "attn_proj": "wmv [2d,d] (W_N dropped)",
                  "base": C.SIT_CKPT, "conditional": True, "warm_start_from": warm,
                  "qk_rmsnorm": eff_qk_rmsnorm, "learn_logit_scale": eff_lls,
                  "precision": precision, "lr": lr,
@@ -199,6 +211,8 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
         print(f"[dmap] steps={steps} <= 0; nothing to train — sampling current weights.")
     else:
         print(f"[dmap] training {steps:,} more steps: {start_step:,} -> {end_step:,}")
+    if sample_at_start:
+        preview(f"step{start_step:07d}_start")   # before any optimizer step
     model.train()
     for step in range(start_step + 1, end_step + 1):
         x1, yy = store.batch(step, 0, bs, base_seed=0)
@@ -239,12 +253,13 @@ def main(
     save_every: int = 10000,
     max_shards: int = 0,
     resume: str = "auto",
+    sample_at_start: bool = False,   # render a grid before step 1 (before/after)
 ):
     if stage == "finetune" and not latents_repo:
         raise SystemExit("finetune needs --latents-repo <your-hf-latents-dataset>")
     grids = run.remote(stage, steps, lr, push_repo, amap_repo, latents_repo, qk_rmsnorm,
                        learn_logit_scale, precision, sample_every, sample_steps,
-                       cfg_scale, save_every, max_shards, resume)
+                       cfg_scale, save_every, max_shards, resume, sample_at_start)
     from pathlib import Path
     out_dir = Path(__file__).parent / "samples"
     out_dir.mkdir(exist_ok=True)

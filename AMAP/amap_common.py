@@ -176,24 +176,47 @@ def sample_grid(model, dev, out_path, num_steps=50, cfg_scale=4.0, amp=None):
         return out_path, f.read()
 
 
+def latest_checkpoint_step(repo: str) -> int | None:
+    """Max checkpoint step in <repo>/checkpoints/step_*, or None if there are
+    none / repo is unreachable. Never raises."""
+    from huggingface_hub import HfApi
+    try:
+        files = HfApi().list_repo_files(repo)
+    except Exception:
+        return None
+    found = []
+    for f in files:
+        if f.startswith("checkpoints/step_"):
+            try:
+                found.append(int(f.split("/")[1].split("_")[1]))
+            except (IndexError, ValueError):
+                pass
+    return max(found) if found else None
+
+
+def fetch_checkpoint(repo: str, step: int):
+    """Download a checkpoint's config + weights. Returns (cfg_dict, model_sd, ema_sd)."""
+    import json
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+
+    folder = f"checkpoints/step_{step:07d}"
+    cfg = json.load(open(hf_hub_download(repo, f"{folder}/amap_config.json")))
+    model_sd = load_file(hf_hub_download(repo, f"{folder}/model.safetensors"))
+    ema_sd = load_file(hf_hub_download(repo, f"{folder}/ema.safetensors"))
+    return cfg, model_sd, ema_sd
+
+
 def resolve_checkpoint_step(repo: str, step) -> int | None:
     """Return an int step for a repo checkpoint. step may be an int, a numeric
     string, 'latest', or 'base'. 'base'/None -> None (un-finetuned base+AMAP)."""
     if step in (None, "base", ""):
         return None
     if step == "latest":
-        from huggingface_hub import HfApi
-        api = HfApi()
-        found = []
-        for f in api.list_repo_files(repo):
-            if f.startswith("checkpoints/step_"):
-                try:
-                    found.append(int(f.split("/")[1].split("_")[1]))
-                except (IndexError, ValueError):
-                    pass
-        if not found:
+        s = latest_checkpoint_step(repo)
+        if s is None:
             raise FileNotFoundError(f"{repo} has no checkpoints/step_* folders")
-        return max(found)
+        return s
     return int(step)
 
 

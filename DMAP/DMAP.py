@@ -61,7 +61,7 @@ GPU = os.environ.get("DMAP_GPU", "H200")
 def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
         latents_repo: str, qk_rmsnorm: bool, learn_logit_scale: bool, precision: str,
         sample_every: int, sample_steps: int, cfg_scale: float, save_every: int,
-        max_shards: int, resume: str, sample_at_start: bool, fold_on_resume: bool):
+        max_shards: int, resume: str):
     import contextlib, json, tempfile, torch
     import dmap_common as C
     from dmap_attention import install_folded_dmap, DMAPConfig
@@ -128,24 +128,16 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
     if folded_sd is not None:             # DMAP resume: load trained folded weights
         is_coupled = any(k.endswith(".qkv.weight") for k in folded_sd)
         if is_coupled:
-            if fold_on_resume:
-                from dmap_attention import fold_state_dict
-                folded_sd = fold_state_dict(folded_sd)
-                if ema_sd is not None:
-                    ema_sd = fold_state_dict(ema_sd)
-                print("[dmap] resume checkpoint is COUPLED (qkv) — folding it to wmv "
-                      "(--fold-on-resume)")
-            else:
-                raise SystemExit(
-                    f"[dmap] {push_repo}/checkpoints/step_{start_step:07d} is a COUPLED "
-                    f"(qkv) checkpoint; this is the FOLDED program and can't resume it as-is.\n"
-                    f"       Likely a stale/redirected repo. Fix one of:\n"
-                    f"         • delete/rename that repo (or a fresh --push-repo) so DMAP "
-                    f"warm-starts from AMAP,\n"
-                    f"         • or pass --fold-on-resume to convert it to folded and continue.")
+            # folded-only program: a coupled (qkv) checkpoint is unambiguous —
+            # just fold it and continue, no question asked.
+            from dmap_attention import fold_state_dict
+            folded_sd = fold_state_dict(folded_sd)
+            if ema_sd is not None:
+                ema_sd = fold_state_dict(ema_sd)
+            print("[dmap] resume checkpoint was COUPLED (qkv) — auto-folded to wmv")
         _, unexp = model.load_state_dict(folded_sd, strict=False)
         if unexp:
-            raise SystemExit(f"[dmap] unexpected keys resuming folded checkpoint: {unexp[:5]}")
+            raise SystemExit(f"[dmap] unexpected keys resuming checkpoint: {unexp[:5]}")
 
     with torch.no_grad(), amp:
         dmap_out = model(x, t, y)
@@ -275,15 +267,12 @@ def main(
     save_every: int = 10000,
     max_shards: int = 0,
     resume: str = "auto",
-    sample_at_start: bool = True,    # snapshot step 0 before training (the "before")
-    fold_on_resume: bool = False,    # convert a coupled (qkv) checkpoint to folded and continue
 ):
     if stage == "finetune" and not latents_repo:
         raise SystemExit("finetune needs --latents-repo <your-hf-latents-dataset>")
     grids = run.remote(stage, steps, lr, push_repo, amap_repo, latents_repo, qk_rmsnorm,
                        learn_logit_scale, precision, sample_every, sample_steps,
-                       cfg_scale, save_every, max_shards, resume, sample_at_start,
-                       fold_on_resume)
+                       cfg_scale, save_every, max_shards, resume)
     from pathlib import Path
     out_dir = Path(__file__).parent / "samples"
     out_dir.mkdir(exist_ok=True)

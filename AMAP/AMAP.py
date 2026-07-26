@@ -24,16 +24,21 @@ from __future__ import annotations
 import modal
 
 # --- image: SiT deps + AMAP; clone the official repo for models.py/download.py
+# B200 is Blackwell (sm_100) -> needs torch built against CUDA 12.8 (cu128).
+# torch/vision come from the pytorch cu128 index; everything else from PyPI.
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
     .pip_install(
-        "torch==2.5.1",
+        "torch==2.7.1",
+        "torchvision==0.22.1",
+        index_url="https://download.pytorch.org/whl/cu128",
+    )
+    .pip_install(
         "timm==1.0.19",
         "numpy<2",
         "huggingface_hub==0.26.2",
         "safetensors==0.4.5",
-        "torchvision==0.20.1",
     )
     .run_commands("git clone --depth 1 https://github.com/willisma/SiT /root/SiT")
     # AMAP modules travel with the job so we don't depend on the SiT checkout
@@ -41,6 +46,9 @@ image = (
 )
 
 app = modal.App("ditflex-amap")
+
+# persist the 2.7 GB SiT checkpoint across runs (find_model writes ./pretrained_models)
+ckpt_vol = modal.Volume.from_name("sit-ckpts", create_if_missing=True)
 
 SIT_CKPT = "SiT-XL-2-256x256.pt"     # official 7M-step SiT-XL/2 (find_model)
 HF_SECRET = modal.Secret.from_name("HF_TOKEN")   # provides HF_TOKEN env var
@@ -85,16 +93,19 @@ def _load_latents(repo: str, max_shards: int | None = None):
     return x.reshape(-1, 4, 32, 32)
 
 
-@app.function(image=image, gpu=GPU, secrets=[HF_SECRET], timeout=60 * 60)
+@app.function(image=image, gpu=GPU, secrets=[HF_SECRET], timeout=60 * 60,
+              volumes={"/cache": ckpt_vol})
 def run(stage: str, steps: int, lr: float, push_repo: str,
         latents_repo: str, qk_rmsnorm: bool, learn_logit_scale: bool):
-    import torch, torch.nn.functional as F
+    import os, torch, torch.nn.functional as F
     from amap_attention import apply_amap, AMAPConfig
 
+    os.chdir("/cache")   # find_model writes ./pretrained_models -> persisted volume
     dev = "cuda"
     torch.manual_seed(0)
 
     model = _build_sit_xl2().to(dev)
+    ckpt_vol.commit()    # persist the downloaded checkpoint for next run
     n_params = sum(p.numel() for p in model.parameters())
 
     # ---- baseline (standard attention) logit stats for comparison ----

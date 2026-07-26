@@ -103,6 +103,21 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
         return []
 
     # ---- finetune: official SiT flow-matching (transport.training_losses) ----
+    # PREFLIGHT: verify we can actually write checkpoints BEFORE spending compute.
+    # (Reading dlatentzz needs only read access; creating <push_repo> needs write
+    # rights in that namespace — catch a 403 in seconds, not after 10k steps.)
+    from huggingface_hub import HfApi
+    try:
+        HfApi().create_repo(push_repo, exist_ok=True)
+    except Exception as e:
+        raise SystemExit(
+            f"[amap] cannot write to '{push_repo}': {e}\n"
+            f"       The Modal HF_TOKEN needs create/write rights in that namespace. "
+            f"Use your own namespace (e.g. --push-repo jcandane/AMAP) or a token with "
+            f"org-write access."
+        )
+    print(f"[amap] push target OK: {push_repo}")
+
     C.sit_path()
     from transport import create_transport
     transport = create_transport("Linear", "velocity")
@@ -140,7 +155,13 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
         _, png = C.sample_grid(model, dev, path, sample_steps, cfg_scale, amp)
         ckpt_vol.commit()
         grids.append((tag, png))
-        print(f"[amap] preview grid '{tag}' ({len(png)//1024} KiB)")
+        # push immediately (crash-resilient) — do NOT rely on the end-of-run return
+        try:
+            HfApi().upload_file(path_or_fileobj=path,
+                                path_in_repo=f"samples/amap_{tag}.png", repo_id=push_repo)
+            print(f"[amap] preview grid '{tag}' -> {push_repo}/samples/ ({len(png)//1024} KiB)")
+        except Exception as e:
+            print(f"[amap] preview '{tag}' rendered but upload failed (non-fatal): {e!r}")
 
     model.train()
     for step in range(1, steps + 1):
@@ -171,7 +192,7 @@ def main(
     stage: str = "smoke",
     steps: int = 500,
     lr: float = 1e-5,
-    push_repo: str = "sparsetrace/AMAP",
+    push_repo: str = "jcandane/AMAP",
     latents_repo: str = "sparsetrace/dlatentzz",
     qk_rmsnorm: bool = False,
     learn_logit_scale: bool = False,

@@ -17,9 +17,9 @@ on:
         options: [tf32, highest, bf16]
         default: tf32
       stage:
-        description: "smoke (load+patch+forward) / sample / finetune"
+        description: "smoke (load+patch+forward) or finetune"
         type: choice
-        options: [smoke, sample, finetune]
+        options: [smoke, finetune]
         default: smoke
       steps:
         description: "finetune steps"
@@ -29,8 +29,12 @@ on:
         description: "finetune LR"
         type: string
         default: "0.00001"
+      save_every:
+        description: "push a checkpoint every N steps"
+        type: string
+        default: "10000"
       sample_every:
-        description: "sample every N finetune steps (0 = only at end)"
+        description: "preview grid every N finetune steps (0 = only at end)"
         type: string
         default: "0"
       sample_steps:
@@ -41,10 +45,6 @@ on:
         description: "classifier-free guidance scale"
         type: string
         default: "4.0"
-      from_repo:
-        description: "load finetuned AMAP weights from this HF repo (sample stage)"
-        type: string
-        default: ""
       latents_repo:
         description: "your HF latents dataset (required for finetune)"
         type: string
@@ -61,6 +61,9 @@ on:
         description: "per-head learnable logit scale (stabiliser, off by default)"
         type: boolean
         default: false
+
+permissions:
+  contents: write   # commit sample grids back into the repo
 
 jobs:
   amap:
@@ -86,8 +89,17 @@ jobs:
             --sample-every "${{ inputs.sample_every }}" \
             --sample-steps "${{ inputs.sample_steps }}" \
             --cfg-scale "${{ inputs.cfg_scale }}" \
-            --from-repo "${{ inputs.from_repo }}" \
+            --save-every "${{ inputs.save_every }}" \
             --latents-repo "${{ inputs.latents_repo }}" \
             --push-repo "${{ inputs.push_repo }}" \
             ${{ inputs.qk_rmsnorm == 'true' && '--qk-rmsnorm' || '--no-qk-rmsnorm' }} \
             ${{ inputs.learn_logit_scale == 'true' && '--learn-logit-scale' || '--no-learn-logit-scale' }}
+      - name: Commit sample grids
+        if: inputs.stage != 'smoke'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add AMAP/samples/*.png
+          git diff --cached --quiet && echo "no new grids" && exit 0
+          git commit -m "AMAP: sample grids [skip ci]"
+          git push

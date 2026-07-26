@@ -1,0 +1,82 @@
+name: MAPtest
+
+# Manual dispatch: FID across SiT-XL/2, AMAP, and DMAP against one shared
+# reference. Writes MAPtest/fid_results.json and commits it back to the repo.
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "kind[:repo[:step[:weights]]], comma-separated"
+        type: string
+        default: "sit,amap:jcandane/AMAP,dmap:jcandane/DMAP"
+      num_samples:
+        description: "images per model (50000 = convention; 10000 = quick internal)"
+        type: string
+        default: "50000"
+      cfg_scale:
+        description: "classifier-free guidance scale (same for all models)"
+        type: string
+        default: "1.5"
+      sample_steps:
+        description: "ODE sampling steps"
+        type: string
+        default: "50"
+      ref_mode:
+        description: "reference: 'latents' (dlatentzz, self-consistent) or via ref_stats_url"
+        type: choice
+        options: [latents, url]
+        default: latents
+      ref_stats_url:
+        description: "ADM VIRTUAL_imagenet256_labeled.npz for publication-comparable FID (ref_mode=url)"
+        type: string
+        default: ""
+      latents_repo:
+        description: "HF latents dataset for ref_mode=latents"
+        type: string
+        default: "sparsetrace/dlatentzz"
+      gpu:
+        description: "Modal GPU"
+        type: choice
+        options: [H200, H100, B200, A100-80GB]
+        default: H200
+      seed:
+        description: "seed"
+        type: string
+        default: "0"
+
+permissions:
+  contents: write   # commit fid_results.json
+
+jobs:
+  fid:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install modal
+      - name: modal run MAPtest
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MAPTEST_GPU: ${{ inputs.gpu }}
+        run: |
+          modal run MAPtest/maptest_fid.py \
+            --models "${{ inputs.models }}" \
+            --num-samples "${{ inputs.num_samples }}" \
+            --cfg-scale "${{ inputs.cfg_scale }}" \
+            --sample-steps "${{ inputs.sample_steps }}" \
+            --ref-mode "${{ inputs.ref_mode }}" \
+            --ref-stats-url "${{ inputs.ref_stats_url }}" \
+            --latents-repo "${{ inputs.latents_repo }}" \
+            --seed "${{ inputs.seed }}"
+      - name: Commit results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add MAPtest/fid_results.json
+          git diff --cached --quiet && echo "no change" && exit 0
+          git commit -m "MAPtest: FID results [skip ci]"
+          git push

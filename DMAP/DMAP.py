@@ -81,6 +81,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
     os.makedirs("/cache/samples", exist_ok=True)
     dev = "cuda"
     torch.manual_seed(0)
+    print("[dmap] build: fold + warm-start + UNCONDITIONAL step-0 snapshot")
 
     model = C.build_sit_xl2().to(dev)
     ckpt_vol.commit()
@@ -229,8 +230,11 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
         print(f"[dmap] steps={steps} <= 0; nothing to train — sampling current weights.")
     else:
         print(f"[dmap] training {steps:,} more steps: {start_step:,} -> {end_step:,}")
-    if sample_at_start:
-        preview(f"step{start_step:07d}_start")   # before any optimizer step (the "before")
+    # step-0 "before" snapshot — ALWAYS (unconditional), never fatal
+    try:
+        preview(f"step{start_step:07d}_start")
+    except Exception as e:
+        print(f"[dmap] step-0 snapshot failed (non-fatal): {e!r}")
     model.train()
     for step in range(start_step + 1, end_step + 1):
         x1, yy = store.batch(step, 0, bs, base_seed=0)

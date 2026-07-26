@@ -98,9 +98,24 @@ def _load_latents(repo: str, max_shards: int | None = None):
 @app.function(image=image, gpu=GPU, secrets=[HF_SECRET], timeout=60 * 60,
               volumes={"/cache": ckpt_vol})
 def run(stage: str, steps: int, lr: float, push_repo: str,
-        latents_repo: str, qk_rmsnorm: bool, learn_logit_scale: bool):
-    import os, torch, torch.nn.functional as F
+        latents_repo: str, qk_rmsnorm: bool, learn_logit_scale: bool,
+        precision: str):
+    import os, contextlib, torch, torch.nn.functional as F
     from amap_attention import apply_amap, AMAPConfig
+
+    # Precision. Default tf32 matches the ditflex amap chain (fp32 activations,
+    # TF32 tensor-core matmuls). PyTorch's own default is "highest" = plain fp32,
+    # TF32 OFF — slower on B200 and different numerics from the real chain.
+    if precision == "tf32":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    elif precision == "highest":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    elif precision != "bf16":
+        raise ValueError(f"precision must be tf32|highest|bf16, got {precision!r}")
+    amp = (torch.autocast("cuda", dtype=torch.bfloat16)
+           if precision == "bf16" else contextlib.nullcontext())
 
     os.chdir("/cache")   # find_model writes ./pretrained_models -> persisted volume
     dev = "cuda"
@@ -115,17 +130,17 @@ def run(stage: str, steps: int, lr: float, push_repo: str,
     x = torch.randn(B, C, 32, 32, device=dev)
     t = torch.rand(B, device=dev)
     y = torch.randint(0, 1000, (B,), device=dev)
-    with torch.no_grad():
+    with torch.no_grad(), amp:
         std_out = model(x, t, y)
 
     # ---- apply AMAP (coupled) ----
     cfg = AMAPConfig(qk_rmsnorm=qk_rmsnorm, learn_logit_scale=learn_logit_scale)
     n_attn = apply_amap(model, cfg)
-    with torch.no_grad():
+    with torch.no_grad(), amp:
         amap_out = model(x, t, y)
 
     shift = (amap_out - std_out).flatten().norm() / std_out.flatten().norm()
-    print(f"[amap] SiT-XL/2 params={n_params/1e6:.1f}M  patched_attn={n_attn}")
+    print(f"[amap] SiT-XL/2 params={n_params/1e6:.1f}M  patched_attn={n_attn}  precision={precision}")
     print(f"[amap] qk_rmsnorm={qk_rmsnorm} learn_logit_scale={learn_logit_scale}")
     print(f"[amap] output finite={torch.isfinite(amap_out).all().item()}  "
           f"rel-shift vs standard attn = {shift.item():.3f}")
@@ -149,8 +164,9 @@ def run(stage: str, steps: int, lr: float, push_repo: str,
         xt = (1 - tt[:, None, None, None]) * x0 + tt[:, None, None, None] * x1
         target = x1 - x0                               # linear-path velocity
         yy = torch.randint(0, 1000, (bs,), device=dev)
-        pred = model(xt, tt, yy)[:, :4]                # velocity channels
-        loss = F.mse_loss(pred, target)
+        with amp:
+            pred = model(xt, tt, yy)[:, :4]                # velocity channels
+            loss = F.mse_loss(pred, target)
         opt.zero_grad(); loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         opt.step()
@@ -169,7 +185,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str,
             json.dump(
                 {"qk_mode": "amap", "variant": "coupled", "base": SIT_CKPT,
                  "qk_rmsnorm": qk_rmsnorm, "learn_logit_scale": learn_logit_scale,
-                 "finetune_steps": steps, "lr": lr},
+                 "precision": precision, "finetune_steps": steps, "lr": lr},
                 open(os.path.join(d, "amap_config.json"), "w"), indent=2,
             )
             api.upload_folder(folder_path=d, repo_id=push_repo)
@@ -185,7 +201,9 @@ def main(
     latents_repo: str = "sparsetrace/dlatentzz",
     qk_rmsnorm: bool = False,
     learn_logit_scale: bool = False,
+    precision: str = "tf32",
 ):
     if stage == "finetune" and not latents_repo:
         raise SystemExit("finetune needs --latents-repo <your-hf-latents-dataset>")
-    run.remote(stage, steps, lr, push_repo, latents_repo, qk_rmsnorm, learn_logit_scale)
+    run.remote(stage, steps, lr, push_repo, latents_repo,
+               qk_rmsnorm, learn_logit_scale, precision)

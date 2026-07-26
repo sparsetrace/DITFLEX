@@ -21,6 +21,8 @@ as-is and checkpoint keys are unchanged.
 
 from __future__ import annotations
 
+import os
+
 import modal
 
 # --- image: SiT deps + AMAP; clone the official repo for models.py/download.py
@@ -52,7 +54,7 @@ ckpt_vol = modal.Volume.from_name("sit-ckpts", create_if_missing=True)
 
 SIT_CKPT = "SiT-XL-2-256x256.pt"     # official 7M-step SiT-XL/2 (find_model)
 HF_SECRET = modal.Secret.from_name("HF_TOKEN")   # provides HF_TOKEN env var
-GPU = "B200"
+GPU = os.environ.get("AMAP_GPU", "B200")   # override per-run: AMAP_GPU=H200 modal run ...
 
 
 def _build_sit_xl2():

@@ -11,6 +11,11 @@ on:
         type: choice
         options: [B200, H200, H100, A100-80GB]
         default: B200
+      precision:
+        description: "matmul precision (tf32 matches the ditflex chain)"
+        type: choice
+        options: [tf32, highest, bf16]
+        default: tf32
       stage:
         description: "smoke (load+patch+forward) or finetune"
         type: choice
@@ -61,6 +66,7 @@ jobs:
             --stage "${{ inputs.stage }}" \
             --steps "${{ inputs.steps }}" \
             --lr "${{ inputs.lr }}" \
+            --precision "${{ inputs.precision }}" \
             --latents-repo "${{ inputs.latents_repo }}" \
             --push-repo "${{ inputs.push_repo }}" \
             ${{ inputs.qk_rmsnorm == 'true' && '--qk-rmsnorm' || '--no-qk-rmsnorm' }} \

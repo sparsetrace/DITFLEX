@@ -53,7 +53,7 @@ app = modal.App("ditflex-dmap")
 ckpt_vol = modal.Volume.from_name("sit-ckpts", create_if_missing=True)
 
 HF_SECRET = modal.Secret.from_name("HF_TOKEN")
-GPU = os.environ.get("DMAP_GPU", "B200")
+GPU = os.environ.get("DMAP_GPU", "H200")
 
 
 @app.function(image=image, gpu=GPU, secrets=[HF_SECRET], timeout=6 * 60 * 60,
@@ -229,7 +229,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
         print(f"[dmap] steps={steps} <= 0; nothing to train — sampling current weights.")
     else:
         print(f"[dmap] training {steps:,} more steps: {start_step:,} -> {end_step:,}")
-    if sample_at_start or sample_every > 0:
+    if sample_at_start:
         preview(f"step{start_step:07d}_start")   # before any optimizer step (the "before")
     model.train()
     for step in range(start_step + 1, end_step + 1):
@@ -256,7 +256,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
 
 @app.local_entrypoint()
 def main(
-    stage: str = "smoke",
+    stage: str = "finetune",
     steps: int = 500,
     lr: float = 1e-5,
     push_repo: str = "jcandane/DMAP",
@@ -271,7 +271,7 @@ def main(
     save_every: int = 10000,
     max_shards: int = 0,
     resume: str = "auto",
-    sample_at_start: bool = False,   # render a grid before step 1 (before/after)
+    sample_at_start: bool = True,    # snapshot step 0 before training (the "before")
     fold_on_resume: bool = False,    # convert a coupled (qkv) checkpoint to folded and continue
 ):
     if stage == "finetune" and not latents_repo:

@@ -56,7 +56,8 @@ GPU = os.environ.get("AMAP_GPU", "B200")
               volumes={"/cache": ckpt_vol})
 def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
         qk_rmsnorm: bool, learn_logit_scale: bool, precision: str,
-        sample_every: int, sample_steps: int, cfg_scale: float, save_every: int):
+        sample_every: int, sample_steps: int, cfg_scale: float, save_every: int,
+        max_shards: int):
     import contextlib, json, tempfile, torch
     import amap_common as C
     from amap_attention import apply_amap, AMAPConfig
@@ -105,7 +106,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
     from transport import create_transport
     transport = create_transport("Linear", "velocity")
 
-    lat, labels = C.load_latents(latents_repo, max_shards=2)
+    lat, labels = C.load_latents(latents_repo, max_shards=(max_shards or None))
     lat = lat.to(dev)
     if labels is None:
         print("[amap][warn] no labels in latents repo -> UNCONDITIONAL finetune "
@@ -186,12 +187,13 @@ def main(
     sample_steps: int = 50,
     cfg_scale: float = 4.0,
     save_every: int = 10000,
+    max_shards: int = 0,   # 0 = all shards
 ):
     if stage == "finetune" and not latents_repo:
         raise SystemExit("finetune needs --latents-repo <your-hf-latents-dataset>")
     grids = run.remote(stage, steps, lr, push_repo, latents_repo, qk_rmsnorm,
                        learn_logit_scale, precision, sample_every, sample_steps,
-                       cfg_scale, save_every)
+                       cfg_scale, save_every, max_shards)
     from pathlib import Path
     out_dir = Path(__file__).parent / "samples"
     out_dir.mkdir(exist_ok=True)

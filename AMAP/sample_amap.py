@@ -37,6 +37,7 @@ image = (
         "diffusers==0.31.0",
         "accelerate==1.1.1",
         "pillow",
+        "torchdiffeq==0.2.5",   # SiT transport ODE/SDE integrators
     )
     .env({"HF_HOME": "/cache/hf"})
     .run_commands("git clone --depth 1 https://github.com/willisma/SiT /root/SiT")

@@ -9,8 +9,8 @@ on:
       gpu:
         description: "Modal GPU"
         type: choice
-        options: [B200, H200, H100, A100-80GB]
-        default: B200
+        options: [H200, B200, H100, A100-80GB]
+        default: H200
       precision:
         description: "matmul precision (tf32 matches the ditflex chain)"
         type: choice
@@ -19,8 +19,8 @@ on:
       stage:
         description: "smoke (load+patch+forward) or finetune"
         type: choice
-        options: [smoke, finetune]
-        default: smoke
+        options: [finetune, smoke]
+        default: finetune
       steps:
         description: "N steps to train THIS run (added on top of any resumed step)"
         type: string
@@ -42,6 +42,14 @@ on:
         type: choice
         options: [auto, never, must]
         default: auto
+      sample_at_start:
+        description: "snapshot step 0 before training (the before grid)"
+        type: boolean
+        default: true
+      fold_on_resume:
+        description: "convert a coupled (qkv) checkpoint to folded and continue"
+        type: boolean
+        default: false
       sample_every:
         description: "preview grid every N finetune steps (0 = only at end)"
         type: string
@@ -105,6 +113,8 @@ jobs:
             --save-every "${{ inputs.save_every }}" \
             --max-shards "${{ inputs.max_shards }}" \
             --resume "${{ inputs.resume }}" \
+            ${{ inputs.sample_at_start == 'true' && '--sample-at-start' || '--no-sample-at-start' }} \
+            ${{ inputs.fold_on_resume == 'true' && '--fold-on-resume' || '--no-fold-on-resume' }} \
             --latents-repo "${{ inputs.latents_repo }}" \
             --push-repo "${{ inputs.push_repo }}" \
             --amap-repo "${{ inputs.amap_repo }}" \

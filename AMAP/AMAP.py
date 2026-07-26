@@ -1,24 +1,20 @@
 """
-AMAP.py — Modal ephemeral entrypoint for the AMAP experiment.
+AMAP.py — Modal ephemeral finetune of AMAP-on-SiT-XL/2.
 
     modal run AMAP/AMAP.py --stage smoke
-    modal run AMAP/AMAP.py --stage sample
-    modal run AMAP/AMAP.py --stage finetune --steps 2000 --sample-every 500
+    modal run AMAP/AMAP.py --stage finetune --steps 50000 \
+        --save-every 10000 --sample-every 10000
 
-Stage `smoke`   : build SiT-XL/2, load the official 7M checkpoint, apply AMAP
-                  (coupled), forward pass, report logit-scale shift vs standard
-                  attention. Nothing trained or pushed.
-Stage `sample`  : build + AMAP (or load a finetuned AMAP repo via --from-repo),
-                  generate an image grid (official SiT transport ODE + SD-VAE),
-                  save to the volume and push to --push-repo/samples/.
-Stage `finetune`: official SiT flow-matching finetune on your latents
-                  (transport.training_losses — linear path, velocity, t∈[0,1],
-                  NOT the x1000 convention of the ditflex DiT-L/2 objective),
-                  sampling every --sample-every steps, then push the checkpoint.
+Stage `smoke`   : build SiT-XL/2, load the 7M checkpoint, apply AMAP (coupled),
+                  forward pass, report logit-scale shift vs standard attention.
+Stage `finetune`: official SiT flow-matching finetune (transport.training_losses)
+                  on your latents, with an EMA, periodic checkpoints pushed to
+                  --push-repo/checkpoints/step_*, and preview grids committed by
+                  the workflow. Sampling of arbitrary checkpoints lives in the
+                  separate sample_amap.py program.
 
-Self-contained ephemeral job. The long transactional finetune belongs in
-run/modal_train.py with qk_mode='amap' (see AMAP/README.md). The AMAP operator
-is a swapped forward reusing qkv, so the SiT state_dict loads as-is.
+The AMAP operator is a swapped forward reusing qkv (no surgery), so the SiT
+state_dict loads as-is. Shared build/EMA/sample helpers: amap_common.py.
 """
 
 from __future__ import annotations
@@ -27,8 +23,6 @@ import os
 
 import modal
 
-# --- image: SiT deps + AMAP; clone the official repo for models/transport/download
-# B200 is Blackwell (sm_100) -> torch built against CUDA 12.8 (cu128).
 image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install("git")
@@ -42,114 +36,31 @@ image = (
         "numpy<2",
         "huggingface_hub==0.26.2",
         "safetensors==0.4.5",
-        "diffusers==0.31.0",   # AutoencoderKL (SD-VAE) for decoding samples
+        "diffusers==0.31.0",
         "accelerate==1.1.1",
+        "pillow",
     )
-    .env({"HF_HOME": "/cache/hf"})   # persist VAE + hub cache on the volume
+    .env({"HF_HOME": "/cache/hf"})
     .run_commands("git clone --depth 1 https://github.com/willisma/SiT /root/SiT")
-    .add_local_python_source("amap_attention")
+    .add_local_python_source("amap_attention", "amap_common")
 )
 
 app = modal.App("ditflex-amap")
-
-# persist the 2.7 GB SiT checkpoint + VAE across runs
 ckpt_vol = modal.Volume.from_name("sit-ckpts", create_if_missing=True)
 
-SIT_CKPT = "SiT-XL-2-256x256.pt"     # official 7M-step SiT-XL/2 (find_model)
-HF_SECRET = modal.Secret.from_name("HF_TOKEN")   # provides HF_TOKEN env var
-GPU = os.environ.get("AMAP_GPU", "B200")   # override per-run: AMAP_GPU=H200 modal run ...
-
-# Classic SiT demo classes for the sample grid (golden retriever, etc.)
-SAMPLE_LABELS = [207, 360, 387, 974, 88, 979, 417, 279]
+HF_SECRET = modal.Secret.from_name("HF_TOKEN")
+GPU = os.environ.get("AMAP_GPU", "B200")
 
 
-def _sit_path():
-    import sys
-    if "/root/SiT" not in sys.path:
-        sys.path.insert(0, "/root/SiT")
-
-
-def _build_sit_xl2():
-    """SiT-XL/2 with the official architecture, weights from the 7M checkpoint."""
-    _sit_path()
-    from models import SiT_XL_2
-    from download import find_model
-
-    model = SiT_XL_2(input_size=32, in_channels=4)   # learn_sigma=True
-    state = find_model(SIT_CKPT)                      # -> ./pretrained_models
-    missing, unexpected = model.load_state_dict(state, strict=True)
-    assert not missing and not unexpected, (missing, unexpected)
-    return model
-
-
-def _load_latents(repo: str, max_shards: int | None = None):
-    """dlatentzz-style latents: safetensors shards [N,4096] bf16, 0.18215 applied.
-    Returns (latents [M,4,32,32] float, labels [M] long or None if absent)."""
-    import torch
-    from huggingface_hub import HfApi, hf_hub_download
-    from safetensors.torch import load_file
-
-    api = HfApi()
-    all_files = api.list_repo_files(repo, repo_type="dataset")
-    shards = sorted(f for f in all_files if f.endswith(".safetensors")
-                    and "label" not in f.lower())
-    shards = shards[: max_shards or len(shards)]
-    chunks = []
-    for f in shards:
-        d = load_file(hf_hub_download(repo, f, repo_type="dataset"))
-        chunks.append((next(iter(d.values())) if len(d) == 1 else d[sorted(d)[0]]).float())
-    x = torch.cat(chunks, 0)
-    std = x.std().item()
-    assert 0.7 < std < 1.4, f"latent std {std:.3f}: expected ≈1.0 (0.18215 applied)"
-    lat = x.reshape(-1, 4, 32, 32)
-
-    # Optional labels: pair by index if the repo ships a labels file.
-    labels = None
-    label_files = [f for f in all_files if "label" in f.lower() and f.endswith(".safetensors")]
-    if label_files:
-        d = load_file(hf_hub_download(repo, sorted(label_files)[0], repo_type="dataset"))
-        labels = (next(iter(d.values())) if len(d) == 1 else d[sorted(d)[0]]).long()[: lat.shape[0]]
-    return lat, labels
-
-
-def _sample_grid(model, dev, out_path, num_steps, cfg_scale, amp):
-    """Official SiT ODE sample + SD-VAE decode -> saved grid PNG. Returns path."""
-    _sit_path()
-    import torch
-    from transport import create_transport, Sampler
-    from diffusers.models import AutoencoderKL
-    from torchvision.utils import save_image
-
-    transport = create_transport("Linear", "velocity")
-    sample_fn = Sampler(transport).sample_ode(num_steps=num_steps)
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse").to(dev)
-
-    n = len(SAMPLE_LABELS)
-    z = torch.randn(n, 4, 32, 32, device=dev)
-    y = torch.tensor(SAMPLE_LABELS, device=dev)
-    # classifier-free guidance: duplicate with null class
-    z = torch.cat([z, z], 0)
-    y = torch.cat([y, torch.tensor([1000] * n, device=dev)], 0)
-
-    model.eval()
-    with torch.no_grad(), amp:
-        samples = sample_fn(z, model.forward_with_cfg, y=y, cfg_scale=cfg_scale)[-1]
-        samples, _ = samples.chunk(2, dim=0)
-        imgs = vae.decode(samples / 0.18215).sample
-    model.train()
-    save_image(imgs, out_path, nrow=4, normalize=True, value_range=(-1, 1))
-    return out_path
-
-
-@app.function(image=image, gpu=GPU, secrets=[HF_SECRET], timeout=2 * 60 * 60,
+@app.function(image=image, gpu=GPU, secrets=[HF_SECRET], timeout=6 * 60 * 60,
               volumes={"/cache": ckpt_vol})
 def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
         qk_rmsnorm: bool, learn_logit_scale: bool, precision: str,
-        sample_every: int, sample_steps: int, cfg_scale: float, from_repo: str):
+        sample_every: int, sample_steps: int, cfg_scale: float, save_every: int):
     import contextlib, json, tempfile, torch
+    import amap_common as C
     from amap_attention import apply_amap, AMAPConfig
 
-    # precision (default tf32 matches the ditflex chain; torch default is fp32/no-tf32)
     if precision == "tf32":
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -166,75 +77,77 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
     dev = "cuda"
     torch.manual_seed(0)
 
-    model = _build_sit_xl2().to(dev)
+    model = C.build_sit_xl2().to(dev)
     ckpt_vol.commit()
     n_params = sum(p.numel() for p in model.parameters())
 
-    # baseline logit stats
+    # logit-shift diagnostic (standard vs AMAP on the same random input)
     x = torch.randn(2, 4, 32, 32, device=dev)
     t = torch.rand(2, device=dev)
     y = torch.randint(0, 1000, (2,), device=dev)
     with torch.no_grad(), amp:
         std_out = model(x, t, y)
-
-    cfg = AMAPConfig(qk_rmsnorm=qk_rmsnorm, learn_logit_scale=learn_logit_scale)
-    n_attn = apply_amap(model, cfg)
-
-    # optionally load a previously-finetuned AMAP checkpoint (for `sample`)
-    if from_repo:
-        from huggingface_hub import hf_hub_download
-        from safetensors.torch import load_file
-        sd = load_file(hf_hub_download(from_repo, "amap_sit_xl2.safetensors"))
-        model.load_state_dict(sd, strict=False)
-        print(f"[amap] loaded finetuned weights from {from_repo}")
-
+    amap_cfg = AMAPConfig(qk_rmsnorm=qk_rmsnorm, learn_logit_scale=learn_logit_scale)
+    n_attn = apply_amap(model, amap_cfg)
     with torch.no_grad(), amp:
         amap_out = model(x, t, y)
     shift = (amap_out - std_out).flatten().norm() / std_out.flatten().norm()
     print(f"[amap] SiT-XL/2 params={n_params/1e6:.1f}M  patched_attn={n_attn}  precision={precision}")
-    print(f"[amap] qk_rmsnorm={qk_rmsnorm} learn_logit_scale={learn_logit_scale}")
-    print(f"[amap] output finite={torch.isfinite(amap_out).all().item()}  "
+    print(f"[amap] qk_rmsnorm={qk_rmsnorm} learn_logit_scale={learn_logit_scale}  "
           f"rel-shift vs standard attn = {shift.item():.3f}")
-
-    def do_sample(tag):
-        path = f"/cache/samples/amap_{tag}.png"
-        _sample_grid(model, dev, path, sample_steps, cfg_scale, amp)
-        ckpt_vol.commit()
-        if push_repo:
-            from huggingface_hub import HfApi
-            api = HfApi(); api.create_repo(push_repo, exist_ok=True)
-            api.upload_file(path_or_fileobj=path, path_in_repo=f"samples/amap_{tag}.png",
-                            repo_id=push_repo)
-        print(f"[amap] sample grid -> {path}" + (f" and {push_repo}/samples/" if push_repo else ""))
-        return path
 
     if stage == "smoke":
         print("[amap] smoke OK — nothing trained, nothing pushed.")
-        return
-    if stage == "sample":
-        do_sample("current")
-        return
+        return []
 
     # ---- finetune: official SiT flow-matching (transport.training_losses) ----
-    _sit_path()
+    C.sit_path()
     from transport import create_transport
     transport = create_transport("Linear", "velocity")
 
-    lat, labels = _load_latents(latents_repo, max_shards=2)
+    lat, labels = C.load_latents(latents_repo, max_shards=2)
     lat = lat.to(dev)
     if labels is None:
-        print("[amap][warn] no labels file in latents repo -> UNCONDITIONAL finetune "
-              "(null class). Real class-conditional finetune uses ditflex LatentStore "
-              "in the supervisor.")
+        print("[amap][warn] no labels in latents repo -> UNCONDITIONAL finetune "
+              "(null class). Class-conditional runs use ditflex LatentStore.")
     else:
         labels = labels.to(dev)
         print(f"[amap] paired {labels.shape[0]:,} labels with latents")
     print(f"[amap] latents {tuple(lat.shape)} from {latents_repo}")
 
+    ema = C.EMA(model, decay=0.9999)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     bs = 64
+    grids: list[tuple[str, bytes]] = []
+
+    def save_ckpt(step):
+        from huggingface_hub import HfApi
+        from safetensors.torch import save_file
+        api = HfApi(); api.create_repo(push_repo, exist_ok=True)
+        with tempfile.TemporaryDirectory() as d:
+            save_file(model.state_dict(), f"{d}/model.safetensors")
+            save_file({k: v.contiguous() for k, v in ema.state_dict().items()},
+                      f"{d}/ema.safetensors")
+            json.dump(
+                {"step": step, "qk_mode": "amap", "variant": "coupled",
+                 "base": C.SIT_CKPT, "conditional": labels is not None,
+                 "qk_rmsnorm": qk_rmsnorm, "learn_logit_scale": learn_logit_scale,
+                 "precision": precision, "lr": lr,
+                 "objective": "SiT transport Linear/velocity (t in [0,1])"},
+                open(f"{d}/amap_config.json", "w"), indent=2)
+            api.upload_folder(folder_path=d, repo_id=push_repo,
+                              path_in_repo=f"checkpoints/step_{step:07d}")
+        print(f"[amap] saved checkpoint step {step:,} -> {push_repo}/checkpoints/step_{step:07d}")
+
+    def preview(tag):
+        path = f"/cache/samples/amap_{tag}.png"
+        _, png = C.sample_grid(model, dev, path, sample_steps, cfg_scale, amp)
+        ckpt_vol.commit()
+        grids.append((tag, png))
+        print(f"[amap] preview grid '{tag}' ({len(png)//1024} KiB)")
+
     model.train()
-    for step in range(steps):
+    for step in range(1, steps + 1):
         idx = torch.randint(0, lat.shape[0], (bs,), device=dev)
         x1 = lat[idx]
         yy = labels[idx] if labels is not None else torch.full((bs,), 1000, device=dev)
@@ -242,31 +155,21 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
             loss = transport.training_losses(model, x1, dict(y=yy))["loss"].mean()
         opt.zero_grad(); loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-        opt.step()
-        if step % max(1, steps // 20) == 0 or step == steps - 1:
-            print(f"  step {step:5d}  loss {loss.item():.4f}  grad {gnorm.item():.2f}")
-        if sample_every > 0 and step > 0 and step % sample_every == 0:
-            do_sample(f"step{step}")
+        opt.step(); ema.update(model)
 
-    do_sample("final")
+        if step % max(1, steps // 20) == 0 or step == 1:
+            print(f"  step {step:6d}  loss {loss.item():.4f}  grad {gnorm.item():.2f}")
+        if save_every > 0 and step % save_every == 0:
+            save_ckpt(step)
+        if sample_every > 0 and step % sample_every == 0:
+            preview(f"step{step:07d}")
 
-    # ---- push AMAP checkpoint ----
-    if push_repo:
-        from huggingface_hub import HfApi
-        from safetensors.torch import save_file
-        api = HfApi(); api.create_repo(push_repo, exist_ok=True)
-        with tempfile.TemporaryDirectory() as d:
-            save_file(model.state_dict(), os.path.join(d, "amap_sit_xl2.safetensors"))
-            json.dump(
-                {"qk_mode": "amap", "variant": "coupled", "base": SIT_CKPT,
-                 "objective": "SiT transport Linear/velocity (t in [0,1])",
-                 "conditional": labels is not None,
-                 "qk_rmsnorm": qk_rmsnorm, "learn_logit_scale": learn_logit_scale,
-                 "precision": precision, "finetune_steps": steps, "lr": lr},
-                open(os.path.join(d, "amap_config.json"), "w"), indent=2,
-            )
-            api.upload_folder(folder_path=d, repo_id=push_repo)
-        print(f"[amap] pushed checkpoint to {push_repo}")
+    # final checkpoint + preview (avoid duplicating an exact multiple)
+    if save_every <= 0 or steps % save_every != 0:
+        save_ckpt(steps)
+    if sample_every <= 0 or steps % sample_every != 0:
+        preview(f"step{steps:07d}")
+    return grids
 
 
 @app.local_entrypoint()
@@ -282,10 +185,17 @@ def main(
     sample_every: int = 0,
     sample_steps: int = 50,
     cfg_scale: float = 4.0,
-    from_repo: str = "",
+    save_every: int = 10000,
 ):
     if stage == "finetune" and not latents_repo:
         raise SystemExit("finetune needs --latents-repo <your-hf-latents-dataset>")
-    run.remote(stage, steps, lr, push_repo, latents_repo, qk_rmsnorm,
-               learn_logit_scale, precision, sample_every, sample_steps,
-               cfg_scale, from_repo)
+    grids = run.remote(stage, steps, lr, push_repo, latents_repo, qk_rmsnorm,
+                       learn_logit_scale, precision, sample_every, sample_steps,
+                       cfg_scale, save_every)
+    from pathlib import Path
+    out_dir = Path(__file__).parent / "samples"
+    out_dir.mkdir(exist_ok=True)
+    for tag, png in (grids or []):
+        p = out_dir / f"amap_{tag}.png"
+        p.write_bytes(png)
+        print(f"[amap] wrote {p}")

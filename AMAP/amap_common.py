@@ -76,33 +76,59 @@ class EMA:
         return self.shadow
 
 
-def load_latents(repo: str, max_shards: int | None = None):
-    """dlatentzz-style latents: shards [N,4096] bf16, 0.18215 applied.
-    Returns (latents [M,4,32,32] float, labels [M] long or None)."""
-    import torch
-    from huggingface_hub import HfApi, hf_hub_download
-    from safetensors.torch import load_file
+def _batch_seed(base_seed: int, global_step: int, rank: int) -> int:
+    """Mirrors ditflex.latents.batch_seed: pure, stateless (step, rank) seed."""
+    return (((base_seed + 1) * 1_000_000_007 + global_step) * 8192 + rank) % (2**63 - 1)
 
-    api = HfApi()
-    all_files = api.list_repo_files(repo, repo_type="dataset")
-    shards = sorted(f for f in all_files if f.endswith(".safetensors")
-                    and "label" not in f.lower())
-    shards = shards[: max_shards or len(shards)]
-    chunks = []
-    for f in shards:
-        d = load_file(hf_hub_download(repo, f, repo_type="dataset"))
-        chunks.append((next(iter(d.values())) if len(d) == 1 else d[sorted(d)[0]]).float())
-    x = torch.cat(chunks, 0)
-    std = x.std().item()
-    assert 0.7 < std < 1.4, f"latent std {std:.3f}: expected ≈1.0 (0.18215 applied)"
-    lat = x.reshape(-1, 4, 32, 32)
 
-    labels = None
-    label_files = [f for f in all_files if "label" in f.lower() and f.endswith(".safetensors")]
-    if label_files:
-        d = load_file(hf_hub_download(repo, sorted(label_files)[0], repo_type="dataset"))
-        labels = (next(iter(d.values())) if len(d) == 1 else d[sorted(d)[0]]).long()[: lat.shape[0]]
-    return lat, labels
+class LatentStore:
+    """Compact port of ditflex.latents.LatentStore for the ephemeral finetune.
+
+    Each dlatentzz shard holds two tensors, 'latents' [N,4096] bf16 (0.18215
+    applied once) and 'labels' [N]. The full tensor stays resident on the GPU;
+    a batch is a deterministic fancy-index, cast to fp32 on the way out."""
+
+    def __init__(self, latents, labels, latent_shape=(4, 32, 32), num_classes=1000):
+        self.latents = latents
+        self.labels = labels.long()
+        self.latent_shape = tuple(latent_shape)
+        sub = latents[: min(len(latents), 8192)].float()
+        std = sub.std().item()
+        assert 0.7 < std < 1.4, (
+            f"latent std {std:.4f}: expected ≈1.0 (0.18215 applied exactly once)")
+        lo, hi = int(self.labels.min()), int(self.labels.max())
+        assert 0 <= lo and hi < num_classes, f"labels [{lo},{hi}] vs num_classes {num_classes}"
+
+    def __len__(self):
+        return self.latents.shape[0]
+
+    def batch(self, global_step, rank, batch_size, base_seed=0):
+        import torch
+        g = torch.Generator().manual_seed(_batch_seed(base_seed, global_step, rank))
+        idx = torch.randint(0, len(self), (batch_size,), generator=g).to(self.latents.device)
+        return self.latents[idx].view(-1, *self.latent_shape).float(), self.labels[idx]
+
+    @classmethod
+    def from_hub(cls, repo_id="sparsetrace/dlatentzz", device="cuda",
+                 max_files=None, num_classes=1000):
+        import torch
+        from huggingface_hub import hf_hub_download, list_repo_files
+        from safetensors import safe_open
+
+        files = sorted(f for f in list_repo_files(repo_id, repo_type="dataset")
+                       if f.endswith(".safetensors"))
+        if not files:
+            raise FileNotFoundError(f"no .safetensors in {repo_id}")
+        files = files[:max_files] if max_files else files
+        lat, lab = [], []
+        for f in files:
+            p = hf_hub_download(repo_id, f, repo_type="dataset")
+            with safe_open(p, framework="pt", device="cpu") as sf:
+                lat.append(sf.get_tensor("latents"))
+                lab.append(sf.get_tensor("labels"))
+        latents = torch.cat(lat, 0).to(device)
+        labels = torch.cat(lab, 0).to(device)
+        return cls(latents, labels, num_classes=num_classes)
 
 
 def sample_grid(model, dev, out_path, num_steps=50, cfg_scale=4.0, amp=None):

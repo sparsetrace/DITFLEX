@@ -106,15 +106,9 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
     from transport import create_transport
     transport = create_transport("Linear", "velocity")
 
-    lat, labels = C.load_latents(latents_repo, max_shards=(max_shards or None))
-    lat = lat.to(dev)
-    if labels is None:
-        print("[amap][warn] no labels in latents repo -> UNCONDITIONAL finetune "
-              "(null class). Class-conditional runs use ditflex LatentStore.")
-    else:
-        labels = labels.to(dev)
-        print(f"[amap] paired {labels.shape[0]:,} labels with latents")
-    print(f"[amap] latents {tuple(lat.shape)} from {latents_repo}")
+    store = C.LatentStore.from_hub(latents_repo, device=dev, max_files=(max_shards or None))
+    print(f"[amap] latents resident: {len(store):,}  "
+          f"labels [{int(store.labels.min())},{int(store.labels.max())}]  from {latents_repo}")
 
     ema = C.EMA(model, decay=0.9999)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
@@ -131,7 +125,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
                       f"{d}/ema.safetensors")
             json.dump(
                 {"step": step, "qk_mode": "amap", "variant": "coupled",
-                 "base": C.SIT_CKPT, "conditional": labels is not None,
+                 "base": C.SIT_CKPT, "conditional": True,
                  "qk_rmsnorm": qk_rmsnorm, "learn_logit_scale": learn_logit_scale,
                  "precision": precision, "lr": lr,
                  "objective": "SiT transport Linear/velocity (t in [0,1])"},
@@ -149,9 +143,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
 
     model.train()
     for step in range(1, steps + 1):
-        idx = torch.randint(0, lat.shape[0], (bs,), device=dev)
-        x1 = lat[idx]
-        yy = labels[idx] if labels is not None else torch.full((bs,), 1000, device=dev)
+        x1, yy = store.batch(step, 0, bs, base_seed=0)
         with amp:
             loss = transport.training_losses(model, x1, dict(y=yy))["loss"].mean()
         opt.zero_grad(); loss.backward()

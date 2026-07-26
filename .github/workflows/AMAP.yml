@@ -22,11 +22,11 @@ on:
       latents_repo:
         description: "your HF latents dataset (required for finetune)"
         type: string
-        default: ""
+        default: "sparsetrace/dlatentzz"
       push_repo:
         description: "HF repo to push the AMAP checkpoint to (finetune only)"
         type: string
-        default: ""
+        default: "sparsetrace/AMAP"
       qk_rmsnorm:
         description: "per-head RMSNorm on q,k (stabiliser, off by default)"
         type: boolean

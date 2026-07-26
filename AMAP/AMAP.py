@@ -43,7 +43,7 @@ image = (
 app = modal.App("ditflex-amap")
 
 SIT_CKPT = "SiT-XL-2-256x256.pt"     # official 7M-step SiT-XL/2 (find_model)
-HF_SECRET = modal.Secret.from_name("huggingface")   # provides HF_TOKEN
+HF_SECRET = modal.Secret.from_name("HF_TOKEN")   # provides HF_TOKEN env var
 GPU = "B200"
 
 
@@ -168,8 +168,8 @@ def main(
     stage: str = "smoke",
     steps: int = 500,
     lr: float = 1e-5,
-    push_repo: str = "",
-    latents_repo: str = "",
+    push_repo: str = "sparsetrace/AMAP",
+    latents_repo: str = "sparsetrace/dlatentzz",
     qk_rmsnorm: bool = False,
     learn_logit_scale: bool = False,
 ):

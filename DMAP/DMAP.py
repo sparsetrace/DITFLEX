@@ -61,7 +61,7 @@ GPU = os.environ.get("DMAP_GPU", "B200")
 def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
         latents_repo: str, qk_rmsnorm: bool, learn_logit_scale: bool, precision: str,
         sample_every: int, sample_steps: int, cfg_scale: float, save_every: int,
-        max_shards: int, resume: str, sample_at_start: bool):
+        max_shards: int, resume: str, sample_at_start: bool, fold_on_resume: bool):
     import contextlib, json, tempfile, torch
     import dmap_common as C
     from dmap_attention import install_folded_dmap, DMAPConfig
@@ -125,8 +125,26 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
     n_attn = install_folded_dmap(model, dcfg, fold_weights=True)
     n_folded = sum(p.numel() for p in model.parameters())
     if folded_sd is not None:             # DMAP resume: load trained folded weights
+        is_coupled = any(k.endswith(".qkv.weight") for k in folded_sd)
+        if is_coupled:
+            if fold_on_resume:
+                from dmap_attention import fold_state_dict
+                folded_sd = fold_state_dict(folded_sd)
+                if ema_sd is not None:
+                    ema_sd = fold_state_dict(ema_sd)
+                print("[dmap] resume checkpoint is COUPLED (qkv) — folding it to wmv "
+                      "(--fold-on-resume)")
+            else:
+                raise SystemExit(
+                    f"[dmap] {push_repo}/checkpoints/step_{start_step:07d} is a COUPLED "
+                    f"(qkv) checkpoint; this is the FOLDED program and can't resume it as-is.\n"
+                    f"       Likely a stale/redirected repo. Fix one of:\n"
+                    f"         • delete/rename that repo (or a fresh --push-repo) so DMAP "
+                    f"warm-starts from AMAP,\n"
+                    f"         • or pass --fold-on-resume to convert it to folded and continue.")
         _, unexp = model.load_state_dict(folded_sd, strict=False)
-        assert not unexp, f"unexpected folded keys on resume: {unexp[:5]}"
+        if unexp:
+            raise SystemExit(f"[dmap] unexpected keys resuming folded checkpoint: {unexp[:5]}")
 
     with torch.no_grad(), amp:
         dmap_out = model(x, t, y)
@@ -211,8 +229,8 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
         print(f"[dmap] steps={steps} <= 0; nothing to train — sampling current weights.")
     else:
         print(f"[dmap] training {steps:,} more steps: {start_step:,} -> {end_step:,}")
-    if sample_at_start:
-        preview(f"step{start_step:07d}_start")   # before any optimizer step
+    if sample_at_start or sample_every > 0:
+        preview(f"step{start_step:07d}_start")   # before any optimizer step (the "before")
     model.train()
     for step in range(start_step + 1, end_step + 1):
         x1, yy = store.batch(step, 0, bs, base_seed=0)
@@ -254,12 +272,14 @@ def main(
     max_shards: int = 0,
     resume: str = "auto",
     sample_at_start: bool = False,   # render a grid before step 1 (before/after)
+    fold_on_resume: bool = False,    # convert a coupled (qkv) checkpoint to folded and continue
 ):
     if stage == "finetune" and not latents_repo:
         raise SystemExit("finetune needs --latents-repo <your-hf-latents-dataset>")
     grids = run.remote(stage, steps, lr, push_repo, amap_repo, latents_repo, qk_rmsnorm,
                        learn_logit_scale, precision, sample_every, sample_steps,
-                       cfg_scale, save_every, max_shards, resume, sample_at_start)
+                       cfg_scale, save_every, max_shards, resume, sample_at_start,
+                       fold_on_resume)
     from pathlib import Path
     out_dir = Path(__file__).parent / "samples"
     out_dir.mkdir(exist_ok=True)

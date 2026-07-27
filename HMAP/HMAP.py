@@ -117,9 +117,19 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
         else:
             a = C.latest_checkpoint_step(amap_repo)
             if a is not None:
-                _, am_sd, _ = C.fetch_checkpoint(amap_repo, a)
+                # warm-start needs only AMAP's WEIGHTS, not its config (HMAP builds
+                # its own). Pull safetensors directly — avoids *_config.json clash.
+                from huggingface_hub import hf_hub_download
+                from safetensors.torch import load_file
+                folder = f"checkpoints/step_{a:07d}"
+                try:
+                    am_sd = load_file(hf_hub_download(amap_repo, f"{folder}/ema.safetensors"))
+                    src = "ema"
+                except Exception:
+                    am_sd = load_file(hf_hub_download(amap_repo, f"{folder}/model.safetensors"))
+                    src = "model"
                 _, unexp = model.load_state_dict(am_sd, strict=False)   # AMAP qkv -> model
-                print(f"[hmap] WARM-START from AMAP {amap_repo}/checkpoints/step_{a:07d} "
+                print(f"[hmap] WARM-START from AMAP {amap_repo}/{folder} ({src}) "
                       f"(hmap_qk will init from these q,k; step reset to 0)")
                 if unexp:
                     print(f"[hmap] (ignoring {len(unexp)} AMAP-only key(s), e.g. {unexp[:2]})")

@@ -5,7 +5,7 @@ No `modal` import here — this is pure library code so it ships cleanly via
 add_local_python_source and imports on the GitHub runner without torch (all
 heavy imports are inside functions).
 
-Checkpoint layout in the Hub repo (e.g. jcandane/FMAP):
+Checkpoint layout in the Hub repo (e.g. sparsetrace/FMAP):
 
     checkpoints/step_0010000/model.safetensors   # raw finetuned weights
     checkpoints/step_0010000/ema.safetensors     # EMA (full state_dict)
@@ -201,13 +201,7 @@ def fetch_checkpoint(repo: str, step: int):
     from safetensors.torch import load_file
 
     folder = f"checkpoints/step_{step:07d}"
-    cfg = None
-    for name in ("fmap_config.json", "amap_config.json"):
-        try:
-            cfg = json.load(open(hf_hub_download(repo, f"{folder}/{name}")))
-            break
-        except Exception:
-            continue
+    cfg = json.load(open(hf_hub_download(repo, f"{folder}/fmap_config.json")))
     model_sd = load_file(hf_hub_download(repo, f"{folder}/model.safetensors"))
     ema_sd = load_file(hf_hub_download(repo, f"{folder}/ema.safetensors"))
     return cfg, model_sd, ema_sd
@@ -215,7 +209,7 @@ def fetch_checkpoint(repo: str, step: int):
 
 def resolve_checkpoint_step(repo: str, step) -> int | None:
     """Return an int step for a repo checkpoint. step may be an int, a numeric
-    string, 'latest', or 'base'. 'base'/None -> None (un-finetuned base+AMAP)."""
+    string, 'latest', or 'base'. 'base'/None -> None (un-finetuned base+FMAP)."""
     if step in (None, "base", ""):
         return None
     if step == "latest":
@@ -227,21 +221,28 @@ def resolve_checkpoint_step(repo: str, step) -> int | None:
 
 
 def load_fmap_checkpoint(dev, repo: str, step="latest", weights: str = "ema"):
-    """Build SiT-XL/2, FOLD qkv->wmv (FMAP production form), and load a finetuned
-    checkpoint (or base+FMAP if step is 'base'/None). Returns (model, info)."""
-    from fmap_attention import install_folded_fmap, FMAPConfig
+    """Build SiT-XL/2 + FMAP and load a finetuned checkpoint (or base+FMAP if
+    step is 'base'/None). weights: 'ema' or 'model'. Returns (model, info)."""
+    import json
+    import torch
+    from huggingface_hub import hf_hub_download
+    from safetensors.torch import load_file
+    from fmap_attention import apply_fmap, FMAPConfig
 
     resolved = resolve_checkpoint_step(repo, step)
     model = build_sit_xl2().to(dev)
 
     if resolved is None:
-        install_folded_fmap(model, FMAPConfig(), fold_weights=True)   # base SiT, folded
-        return model, {"repo": repo, "step": "base", "weights": "base"}
+        apply_fmap(model, FMAPConfig(), lam=1.0)   # base = AMAP endpoint (Λ=1)
+        return model, {"repo": repo, "step": "base", "weights": "base", "lambda": 1.0}
 
-    cfg_dict, model_sd, ema_sd = fetch_checkpoint(repo, resolved)
-    install_folded_fmap(model, make_fmap_config(cfg_dict), fold_weights=False)  # wmv shells
-    sd = ema_sd if weights == "ema" else model_sd
-    _, unexpected = model.load_state_dict(sd, strict=False)
+    folder = f"checkpoints/step_{resolved:07d}"
+    cfg_dict = json.load(open(hf_hub_download(repo, f"{folder}/fmap_config.json")))
+    apply_fmap(model, make_fmap_config(cfg_dict))   # before load (adds params if any)
+
+    fname = "ema.safetensors" if weights == "ema" else "model.safetensors"
+    sd = load_file(hf_hub_download(repo, f"{folder}/{fname}"))
+    missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not unexpected, f"unexpected keys: {unexpected[:5]}"
     model = model.to(dev)
     return model, {"repo": repo, "step": resolved, "weights": weights, "config": cfg_dict}

@@ -1,22 +1,22 @@
 """
-FMAP attention (FOLDED variant) — eager, no Flash/Flex (context N≈256).
+FMAP attention (ANNEALED AMAP->DMAP homotopy) — eager, coupled, no fold.
 
-FMAP is the Mahalanobis distance kernel; it uses q,k only through
-μ = (q+k)/√2 = R·W_M, so W_N = (W_Q−W_K)/√2 is dead weight. This folded
-variant discards W_N *structurally*: the fused qkv [3d,d] is replaced by a
-fused wmv [2d,d] = [W_M ; W_V], and the forward projects μ directly.
+FMAP walks adiabatically from AMAP (Λ=1) to DMAP (Λ=0) via a coefficient Λ(step)
+scheduled 1 -> 0. Because AMAP's symmetric sector (½⟨m_i,m_j⟩) and DMAP's
+(the distance kernel ⟨m_i,m_j⟩ − ½‖m_i‖² − ½‖m_j‖²) differ, FMAP interpolates the
+WHOLE operator, L(Λ) = Λ·L_AMAP + (1−Λ)·L_DMAP, so both endpoints are exact:
 
-    μ = R·W_M
-    logit_ij = −½‖μ_i − μ_j‖²   (× d_h^-½)          # ≤ 0, zero diagonal
+    L_AMAP = ½⟨m_i,m_j⟩ + ½(⟨q_i,k_j⟩ − ⟨k_i,q_j⟩)        # symmetric Gram + flux
+    L_DMAP = ⟨m_i,m_j⟩ − ½‖m_i‖² − ½‖m_j‖²                 # distance kernel, no flux
+    L(Λ)   = (1−½Λ)⟨m_i,m_j⟩ − (1−Λ)·½(‖m_i‖²+‖m_j‖²) + ½Λ(⟨q_i,k_j⟩−⟨k_i,q_j⟩)
 
-vs the coupled FMAP: identical operator and identical logits, but ~⅓ fewer
-attention-projection params (and optimizer state), because W_N is gone rather
-than computed-and-discarded each forward. The fold W_M = (W_Q+W_K)/√2 is EXACT
-for FMAP (the loss never depended on W_N), so folding at step 0 loses no
-reachable solution. It is a one-way door: a folded checkpoint can no longer
-become AMAP or standard attention (those need q,k apart).
+with m = (q+k)/√2. Λ=1 -> AMAP (sharp), Λ=0 -> DMAP. Coupled (reuses qkv): the
+flux needs q,k apart, so NO fold while Λ>0. Only after Λ reaches 0 could a
+checkpoint be folded to W_M (a separate consolidation step, not done here).
 
-Folded checkpoints carry `attn.wmv.{weight,bias}` instead of `attn.qkv.*`.
+Λ is a per-module scalar set each training step via set_lambda(model, Λ). The
+schedule lambda_at(step, start, end) holds 1 until `start`, decays linearly to 0
+by `end`, then stays 0 (pure DMAP).
 """
 
 from __future__ import annotations
@@ -34,32 +34,55 @@ INV_SQRT2 = 1.0 / math.sqrt(2.0)
 
 @dataclass
 class FMAPConfig:
-    qk_rmsnorm: bool = False          # per-head RMSNorm on μ
-    learn_logit_scale: bool = False   # per-head learnable multiplier, init 1
+    qk_rmsnorm: bool = False
+    learn_logit_scale: bool = False
     eps: float = 1e-6
 
 
-def _is_attention(module: nn.Module) -> bool:
-    return hasattr(module, "num_heads") and hasattr(module, "scale") and (
-        hasattr(module, "qkv") or hasattr(module, "wmv"))
+def lambda_at(step: int, start: int, end: int) -> float:
+    """Adiabatic schedule: 1.0 for step<=start, linear 1->0 over (start,end),
+    0.0 for step>=end (pure DMAP)."""
+    if end <= start:
+        return 0.0 if step >= end else 1.0
+    if step <= start:
+        return 1.0
+    if step >= end:
+        return 0.0
+    return 1.0 - (step - start) / (end - start)
 
 
-def _folded_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """Eager folded-FMAP attention: project μ,v from wmv; distance kernel."""
+def set_lambda(model: nn.Module, lam: float) -> None:
+    for m in model.modules():
+        if hasattr(m, "_fmap"):
+            m._lambda = float(lam)
+
+
+def _fmap_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
     B, N, C = x.shape
     H = self.num_heads
     Dh = C // H
 
-    wmv = self.wmv(x).reshape(B, N, 2, H, Dh).permute(2, 0, 3, 1, 4)
-    mu, v = wmv.unbind(0)                          # each (B, H, N, Dh)
+    qkv = self.qkv(x).reshape(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
+    q, k, v = qkv.unbind(0)
+    if hasattr(self, "q_norm"):
+        q, k = self.q_norm(q), self.k_norm(k)
 
     cfg: FMAPConfig = self._fmap
     if cfg.qk_rmsnorm:
-        mu = F.rms_norm(mu, (Dh,), eps=cfg.eps)
+        q = F.rms_norm(q, (Dh,), eps=cfg.eps)
+        k = F.rms_norm(k, (Dh,), eps=cfg.eps)
 
-    gram = mu @ mu.transpose(-2, -1)
-    dsq = (mu * mu).sum(-1)
-    logits = gram - 0.5 * dsq[..., :, None] - 0.5 * dsq[..., None, :]
+    lam = float(getattr(self, "_lambda", 1.0))
+    m = (q + k) * INV_SQRT2
+    gram = m @ m.transpose(-2, -1)
+
+    logits = (1.0 - 0.5 * lam) * gram                      # Gram coeff: ½(AMAP)->1(DMAP)
+    if lam < 1.0:                                          # DMAP diagonal terms
+        dsq = (m * m).sum(-1)
+        logits = logits - (1.0 - lam) * 0.5 * (dsq[..., :, None] + dsq[..., None, :])
+    if lam > 0.0:                                          # AMAP flux
+        qk = q @ k.transpose(-2, -1)
+        logits = logits + 0.5 * lam * (qk - qk.transpose(-2, -1))
     logits = logits * self.scale
     if cfg.learn_logit_scale:
         logits = logits * self._fmap_logit_scale.view(1, H, 1, 1)
@@ -67,122 +90,76 @@ def _folded_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
     attn = logits.softmax(dim=-1)
     attn = self.attn_drop(attn) if hasattr(self, "attn_drop") else attn
     out = attn @ v
-
     out = out.transpose(1, 2).reshape(B, N, C)
     out = self.proj(out)
     out = self.proj_drop(out) if hasattr(self, "proj_drop") else out
     return out
 
 
-def install_folded_fmap(model: nn.Module, cfg: FMAPConfig | None = None,
-                        fold_weights: bool = True) -> int:
-    """Replace each timm Attention's fused qkv [3d,d] with a fused wmv [2d,d]
-    and bind the folded distance-kernel forward.
+def _is_attention(module: nn.Module) -> bool:
+    return hasattr(module, "qkv") and hasattr(module, "num_heads") and hasattr(module, "scale")
 
-    fold_weights=True  : initialise W_M = (W_Q+W_K)/sqrt2 from the module's
-                         current qkv (model already holds source weights, e.g.
-                         base SiT for a from-scratch FMAP).
-    fold_weights=False : create a correctly-shaped wmv to be filled by
-                         load_state_dict (loading a folded / fold_state_dict()'d
-                         source).
 
-    Returns the number of attention modules folded.
-    """
+def apply_fmap(model: nn.Module, cfg: FMAPConfig | None = None, lam: float = 1.0) -> int:
+    """Patch every timm Attention to the annealed FMAP operator (coupled).
+    Starts at Λ=lam (default 1.0 = AMAP). Returns the count."""
     cfg = cfg or FMAPConfig()
     n = 0
-    for m in model.modules():
-        if not _is_attention(m) or hasattr(m, "wmv"):
+    for module in model.modules():
+        if not _is_attention(module):
             continue
-        d = m.qkv.weight.shape[1]
-        has_bias = m.qkv.bias is not None
-        wmv = nn.Linear(d, 2 * d, bias=has_bias).to(
-            device=m.qkv.weight.device, dtype=m.qkv.weight.dtype)
-        if fold_weights:
-            with torch.no_grad():
-                W = m.qkv.weight
-                Wq, Wk, Wv = W[:d], W[d:2 * d], W[2 * d:]
-                wmv.weight.copy_(torch.cat([(Wq + Wk) * INV_SQRT2, Wv], 0))
-                if has_bias:
-                    b = m.qkv.bias
-                    bq, bk, bv = b[:d], b[d:2 * d], b[2 * d:]
-                    wmv.bias.copy_(torch.cat([(bq + bk) * INV_SQRT2, bv], 0))
-        m.wmv = wmv
-        delattr(m, "qkv")                          # drop W_N direction structurally
-        m._fmap = cfg
-        if cfg.learn_logit_scale and not hasattr(m, "_fmap_logit_scale"):
-            m.register_parameter("_fmap_logit_scale", nn.Parameter(torch.ones(m.num_heads)))
-        m.forward = types.MethodType(_folded_forward, m)
+        module._fmap = cfg
+        module._lambda = float(lam)
+        if cfg.learn_logit_scale and not hasattr(module, "_fmap_logit_scale"):
+            module.register_parameter(
+                "_fmap_logit_scale", nn.Parameter(torch.ones(module.num_heads)))
+        module.forward = types.MethodType(_fmap_forward, module)
         n += 1
     if n == 0:
-        raise ValueError("install_folded_fmap: no attention modules found")
-    model._fmap_folded = True
+        raise ValueError("apply_fmap: found no attention modules")
+    model._fmap_applied = True
     return n
-
-
-def fold_state_dict(sd: dict) -> dict:
-    """Fold a full-qkv state_dict into the folded wmv format:
-        *.attn.qkv.{weight,bias} -> *.attn.wmv.{weight,bias}   (W_M=(W_Q+W_K)/sqrt2)
-    q_norm/k_norm entries are dropped (Identity on the SiT checkpoint); every
-    other tensor is passed through. Use to fold an AMAP checkpoint for warm-start."""
-    import re
-    out = {}
-    rx = re.compile(r"^(?P<attn>.*\.attn)\.qkv\.(?P<kind>weight|bias)$")
-    for k, v in sd.items():
-        m = rx.match(k)
-        if m:
-            attn, kind = m.group("attn"), m.group("kind")
-            if kind == "weight":
-                d = v.shape[1]
-                Wq, Wk, Wv = v[:d], v[d:2 * d], v[2 * d:]
-                out[f"{attn}.wmv.weight"] = torch.cat([(Wq + Wk) * INV_SQRT2, Wv], 0)
-            else:
-                d = v.shape[0] // 3
-                bq, bk, bv = v[:d], v[d:2 * d], v[2 * d:]
-                out[f"{attn}.wmv.bias"] = torch.cat([(bq + bk) * INV_SQRT2, bv], 0)
-            continue
-        if ".attn.q_norm" in k or ".attn.k_norm" in k:
-            continue
-        out[k] = v
-    return out
 
 
 def _selftest() -> None:
     torch.manual_seed(0)
-    B, N, C, H = 2, 7, 16, 4
+    B, N, C, H = 2, 6, 16, 4
     Dh = C // H
     x = torch.randn(B, N, C, dtype=torch.float64)
+    Wq = torch.randn(C, C, dtype=torch.float64)
+    Wk = torch.randn(C, C, dtype=torch.float64)
+    q = (x @ Wq.t()).reshape(B, N, H, Dh).transpose(1, 2)
+    k = (x @ Wk.t()).reshape(B, N, H, Dh).transpose(1, 2)
+    m = (q + k) * INV_SQRT2
 
-    class Attn(nn.Module):
-        def __init__(self, dim, h):
-            super().__init__()
-            self.num_heads = h
-            self.scale = (dim // h) ** -0.5
-            self.qkv = nn.Linear(dim, dim * 3, bias=True).double()
-            self.proj = nn.Linear(dim, dim).double()
+    def L(lam):
+        gram = m @ m.transpose(-2, -1)
+        out = (1.0 - 0.5 * lam) * gram
+        if lam < 1.0:
+            dsq = (m * m).sum(-1)
+            out = out - (1.0 - lam) * 0.5 * (dsq[..., :, None] + dsq[..., None, :])
+        if lam > 0.0:
+            qk = q @ k.transpose(-2, -1)
+            out = out + 0.5 * lam * (qk - qk.transpose(-2, -1))
+        return out
 
-    m = Attn(C, H)
-    W = m.qkv.weight.detach(); b = m.qkv.bias.detach()
-    qkv = (x @ W.t() + b).reshape(B, N, 3, H, Dh).permute(2, 0, 3, 1, 4)
-    q, k, _ = qkv.unbind(0)
-    mu_ref = (q + k) * INV_SQRT2
-    gram = mu_ref @ mu_ref.transpose(-2, -1)
-    dsq = (mu_ref * mu_ref).sum(-1)
-    logit_ref = (gram - 0.5 * dsq[..., :, None] - 0.5 * dsq[..., None, :]) * m.scale
+    # Λ=1 must equal AMAP: ½gram + ½flux
+    qk = q @ k.transpose(-2, -1)
+    amap = 0.5 * (m @ m.transpose(-2, -1)) + 0.5 * (qk - qk.transpose(-2, -1))
+    assert torch.allclose(L(1.0), amap, atol=1e-10), (L(1.0) - amap).abs().max()
 
-    install_folded_fmap(m, FMAPConfig(), fold_weights=True)
-    assert not hasattr(m, "qkv") and hasattr(m, "wmv")
-    wmv = (x @ m.wmv.weight.detach().t() + m.wmv.bias.detach()).reshape(B, N, 2, H, Dh).permute(2, 0, 3, 1, 4)
-    mu_fold, _ = wmv.unbind(0)
-    assert torch.allclose(mu_fold, mu_ref, atol=1e-10), (mu_fold - mu_ref).abs().max()
+    # Λ=0 must equal DMAP: distance kernel = −½‖m_i−m_j‖²
+    diff = m[..., :, None, :] - m[..., None, :, :]
+    dmap = -0.5 * (diff * diff).sum(-1)
+    assert torch.allclose(L(0.0), dmap, atol=1e-10), (L(0.0) - dmap).abs().max()
 
-    sd = {"blocks.0.attn.qkv.weight": W, "blocks.0.attn.qkv.bias": b,
-          "blocks.0.attn.proj.weight": torch.randn(C, C, dtype=torch.float64)}
-    folded = fold_state_dict(sd)
-    assert "blocks.0.attn.wmv.weight" in folded and "blocks.0.attn.qkv.weight" not in folded
-    assert torch.allclose(folded["blocks.0.attn.wmv.weight"], m.wmv.weight.detach(), atol=1e-12)
-    assert m.wmv.weight.shape[0] == 2 * C and W.shape[0] == 3 * C
-    print("selftest OK: fold exact (mu_fold==mu_ref), fold_state_dict matches, "
-          f"attn proj {3*C}->{2*C} rows (1/3 smaller)")
+    # continuity + schedule
+    assert torch.allclose(L(0.5), 0.5 * amap + 0.5 * dmap, atol=1e-10)
+    assert lambda_at(0, 0, 40000) == 1.0
+    assert lambda_at(40000, 0, 40000) == 0.0
+    assert abs(lambda_at(10000, 0, 40000) - 0.75) < 1e-9
+    assert lambda_at(50000, 0, 40000) == 0.0
+    print("selftest OK: L(1)=AMAP, L(0)=DMAP(distance), L(0.5)=midpoint; schedule 1->0")
 
 
 if __name__ == "__main__":

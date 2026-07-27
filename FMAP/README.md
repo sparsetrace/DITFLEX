@@ -1,51 +1,56 @@
-# FMAP  (SiT → DMAP direct)
+# FMAP  (annealed AMAP → DMAP homotopy)
 
-The **SiT2DMAP** arm: fold **base SiT** directly into the Mahalanobis distance
-kernel, no AMAP detour.
+The **annealing arm**: start as AMAP (sharp) and adiabatically walk to DMAP by
+scheduling a coefficient **Λ: 1 → 0**. This measures the antisymmetric flux's
+value *smoothly*, rather than as two separate endpoint models.
 
-**The operator is identical to DMAP** — folded distance kernel, symmetric PSD
-core, no flux (R ≡ 0):
+Because AMAP's symmetric sector (½⟨m_i,m_j⟩) and DMAP's (the distance kernel
+⟨m_i,m_j⟩ − ½‖m_i‖² − ½‖m_j‖²) differ, FMAP interpolates the **whole** operator so
+both endpoints are exact:
 
-    μ = R·W_M,   W_M = (W_Q + W_K)/√2,   logit_ij = −½‖μ_i − μ_j‖²
+    L(Λ) = (1−½Λ)⟨m_i,m_j⟩ − (1−Λ)·½(‖m_i‖²+‖m_j‖²) + ½Λ(⟨q_i,k_j⟩−⟨k_i,q_j⟩)
+    m = (q+k)/√2
 
-The *only* difference from `/DMAP/` is initialisation: DMAP folds from an **AMAP**
-checkpoint (SiT→AMAP→DMAP); FMAP folds from **base SiT** (SiT→DMAP). Same
-equation, no new ansatz — this arm isolates whether the AMAP detour helps.
+    Λ = 1  ->  L = ½⟨m_i,m_j⟩ + ½·flux            = AMAP  (sharp)
+    Λ = 0  ->  L = −½‖m_i−m_j‖²                    = DMAP  (distance kernel)
 
-Note: going SiT→DMAP directly *drops* W_N and the antisymmetric flux together
-(the flux = ½(W_N W_Mᵀ − W_M W_Nᵀ) needs W_N) — it doesn't "cancel" them. FMAP
-answers the empirical question: does the distance kernel reach the same quality
-from base SiT as it does via AMAP, given equal training?
+Coupled (reuses qkv, **no fold** while Λ>0 — the flux needs q,k apart). Λ is a
+per-module scalar set each step from `lambda_at(step, start, end)`: held at 1
+until `anneal_start`, linear to 0 by `anneal_end`, then pure DMAP.
 
-## Files (mirror /DMAP/)
+## Files (borrowed from /AMAP/)
 
-- `fmap_attention.py` — folded distance-kernel op (`install_folded_fmap`,
-  `fold_state_dict`). Self-test verifies the fold is exact, ⅓ smaller attn proj.
-- `fmap_common.py` — shared build/EMA/LatentStore/sample/checkpoint helpers.
-- `FMAP.py` — Modal finetune; resolves FMAP-own checkpoint → else folds base SiT.
-- `sample_fmap.py` — Modal L4 sampler (4×4 grid from any folded FMAP checkpoint).
-
-## Checkpoint resolution (finetune, resume=auto)
-
-1. FMAP's own latest in `--push-repo` (`jcandane/FMAP`, folded) → resume.
-2. else **base SiT-XL/2** → fold, step 0.   (no AMAP)
-
-`--steps N` trains N more steps. Checkpoints carry `attn.wmv.*`, push to
-`jcandane/FMAP`. Step-0 grid is snapshotted unconditionally.
+- `fmap_attention.py` — annealed operator (`apply_fmap`, `set_lambda`,
+  `lambda_at`). Self-test verifies L(1)=AMAP, L(0)=DMAP exactly.
+- `fmap_common.py` — build/EMA/LatentStore/sample/checkpoint (Λ-aware loader).
+- `FMAP.py` — Modal finetune; sets Λ each step, logs it, saves it per checkpoint.
+- `sample_fmap.py` — Modal L4 sampler (sets Λ from the checkpoint config).
 
 ## Run
 
-    modal run FMAP/FMAP.py --stage finetune --steps 50000 --save-every 10000 --sample-every 10000
+    # start from base SiT as AMAP (Λ=1), anneal to pure DMAP by step 40000
+    modal run FMAP/FMAP.py --stage finetune --steps 40000 \
+        --anneal-start 0 --anneal-end 40000 --save-every 10000 --sample-every 10000
+
+- `--anneal-start` : hold Λ=1 (pure AMAP) until this step — set >0 for an AMAP
+  warm-up so it sharpens like AMAP *before* annealing (e.g. 10000).
+- `--anneal-end`   : Λ reaches 0 (pure DMAP) here.
+- `--steps N` is additive; on resume the anneal window is read from the
+  checkpoint so the schedule doesn't jump. Each checkpoint records its Λ.
+
+Sampling a checkpoint uses the Λ it was saved at (0 => pure DMAP):
+
     modal run FMAP/sample_fmap.py --step latest --weights ema
-    modal run FMAP/sample_fmap.py --step base            # base SiT folded, un-healed
 
-## The comparison
+## Reading it
 
-Add FMAP to MAPtest to get the full picture:
+The headline is the **Λ-vs-loss curve** as it anneals. If loss stays flat while
+Λ: 1→0, the flux is unnecessary — pure DMAP is as good as AMAP, smoothly. If
+loss rises as Λ→0, that rise *is* the measured value of the flux. Either way
+it's a stronger statement than comparing the two endpoint models in isolation.
 
-    modal run MAPtest/maptest_fid.py \
-      --models "sit,amap:jcandane/AMAP,dmap:jcandane/DMAP,fmap:jcandane/FMAP"
+## Note
 
-(MAPtest currently loads sit/amap/dmap; adding an `fmap` kind is a one-line
-adapter change — say the word.) FMAP vs DMAP at matched steps = "does the AMAP
-warm-start matter?"; FMAP vs AMAP = "flux vs no-flux, both from SiT."
+FMAP is coupled throughout; it only becomes fold-able (to W_M, dropping W_N)
+*after* Λ reaches exactly 0 — a separate consolidation step, not done here.
+This is a different arm from /DMAP/ (folded, warm-started) and /AMAP/ (Λ≡1).

@@ -1,18 +1,18 @@
 """
-sample_fmap.py — render a 4x4 (16-image) grid from a FMAP checkpoint.
+sample_fmap.py — render a 4x4 (16-image) grid from an FMAP checkpoint.
 
     modal run FMAP/sample_fmap.py                                  # latest ckpt
     modal run FMAP/sample_fmap.py --step 30000                     # a specific step
     modal run FMAP/sample_fmap.py --step base --weights model      # base + FMAP, un-finetuned
     modal run FMAP/sample_fmap.py --repo jcandane/FMAP --weights ema
 
-Loads SiT-XL/2 + FMAP (flags read from the checkpoint's amap_config.json),
+Loads SiT-XL/2 + FMAP (flags read from the checkpoint's fmap_config.json),
 loads the requested weights (EMA by default, matching the ditflex sampler),
 runs the official SiT transport ODE with CFG, decodes with SD-VAE (ft-ema),
-and writes a 4x4 grid PNG that the workflow commits into AMAP/samples/.
+and writes a 4x4 grid PNG that the workflow commits into FMAP/samples/.
 
 Sampling is forward-only, so an L4 is plenty (default). The image matches
-AMAP.py so Modal reuses the cached build.
+FMAP.py so Modal reuses the cached build.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ def sample(repo: str, step: str, weights: str, sample_steps: int,
     print(f"[sample] {info}")
 
     amp = contextlib.nullcontext()
-    path = f"/cache/samples/amap_{tag}.png"
+    path = f"/cache/samples/fmap_{tag}.png"
     _, png = C.sample_grid(model, dev, path, sample_steps, cfg_scale, amp)
     ckpt_vol.commit()
     print(f"[sample] grid rendered: {tag} ({len(png)//1024} KiB)")

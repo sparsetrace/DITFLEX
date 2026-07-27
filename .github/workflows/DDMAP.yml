@@ -1,0 +1,122 @@
+name: DDMAP
+
+# Manual only. Loads the 7M SiT-XL/2, applies DDMAP (coupled), and either
+# smoke-tests it or runs a short flow-matching finetune on your HF latents,
+# all on a Modal B200. The long transactional finetune stays in train.yml.
+on:
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: "Modal GPU"
+        type: choice
+        options: [H200, B200, H100, A100-80GB]
+        default: H200
+      precision:
+        description: "matmul precision (tf32 matches the ditflex chain)"
+        type: choice
+        options: [tf32, highest, bf16]
+        default: tf32
+      stage:
+        description: "smoke (load+patch+forward) or finetune"
+        type: choice
+        options: [finetune, smoke]
+        default: finetune
+      steps:
+        description: "N steps to train THIS run (added on top of any resumed step)"
+        type: string
+        default: "500"
+      lr:
+        description: "finetune LR"
+        type: string
+        default: "0.00001"
+      save_every:
+        description: "push a checkpoint every N steps"
+        type: string
+        default: "10000"
+      max_shards:
+        description: "latent shards to load (0 = all 32)"
+        type: string
+        default: "0"
+      resume:
+        description: "resume from latest checkpoint in push_repo if present"
+        type: choice
+        options: [auto, never, must]
+        default: auto
+      potential:
+        description: "one-body Doob potential φ"
+        type: choice
+        options: [free, dmap, none]
+        default: free
+      sample_every:
+        description: "preview grid every N finetune steps (0 = only at end)"
+        type: string
+        default: "0"
+      sample_steps:
+        description: "ODE sampling steps"
+        type: string
+        default: "50"
+      cfg_scale:
+        description: "classifier-free guidance scale"
+        type: string
+        default: "4.0"
+      latents_repo:
+        description: "your HF latents dataset (required for finetune)"
+        type: string
+        default: "sparsetrace/dlatentzz"
+      push_repo:
+        description: "HF repo to push checkpoints/samples to (must be writable)"
+        type: string
+        default: "jcandane/DDMAP"
+      qk_rmsnorm:
+        description: "per-head RMSNorm on q,k (stabiliser, off by default)"
+        type: boolean
+        default: false
+      learn_logit_scale:
+        description: "per-head learnable logit scale (stabiliser, off by default)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # commit sample grids back into the repo
+
+jobs:
+  ddmap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install modal
+      - name: modal run DDMAP
+        working-directory: DDMAP
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          DDMAP_GPU: ${{ inputs.gpu }}
+        run: |
+          modal run DDMAP.py \
+            --stage "${{ inputs.stage }}" \
+            --steps "${{ inputs.steps }}" \
+            --lr "${{ inputs.lr }}" \
+            --precision "${{ inputs.precision }}" \
+            --sample-every "${{ inputs.sample_every }}" \
+            --sample-steps "${{ inputs.sample_steps }}" \
+            --cfg-scale "${{ inputs.cfg_scale }}" \
+            --save-every "${{ inputs.save_every }}" \
+            --max-shards "${{ inputs.max_shards }}" \
+            --resume "${{ inputs.resume }}" \
+            --potential "${{ inputs.potential }}" \
+            --latents-repo "${{ inputs.latents_repo }}" \
+            --push-repo "${{ inputs.push_repo }}" \
+            ${{ inputs.qk_rmsnorm == 'true' && '--qk-rmsnorm' || '--no-qk-rmsnorm' }} \
+            ${{ inputs.learn_logit_scale == 'true' && '--learn-logit-scale' || '--no-learn-logit-scale' }}
+      - name: Commit sample grids
+        if: inputs.stage != 'smoke'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add DDMAP/samples/*.png
+          git diff --cached --quiet && echo "no new grids" && exit 0
+          git commit -m "DDMAP: sample grids [skip ci]"
+          git push

@@ -54,7 +54,7 @@ GPU = os.environ.get("FMAP_SAMPLE_GPU", "L4")   # sampling is forward-only
 @app.function(image=image, gpu=GPU, secrets=[HF_SECRET], timeout=60 * 60,
               volumes={"/cache": ckpt_vol})
 def sample(repo: str, step: str, weights: str, sample_steps: int,
-           cfg_scale: float) -> tuple[str, bytes]:
+           cfg_scale: float, lam: float) -> tuple[str, bytes]:
     import contextlib, torch
     import fmap_common as C
 
@@ -65,8 +65,14 @@ def sample(repo: str, step: str, weights: str, sample_steps: int,
     dev = "cuda"
 
     model, info = C.load_fmap_checkpoint(dev, repo, step=step, weights=weights)
+    if lam >= 0.0:                                 # override the checkpoint's Λ
+        from fmap_attention import set_lambda
+        set_lambda(model, lam)
+        info["lambda"] = lam
+        print(f"[sample] Λ OVERRIDE -> {lam:.3f}")
     ckpt_vol.commit()   # persist base ckpt + VAE cache
-    tag = f"{repo.split('/')[-1]}_{info['step']}_{info['weights']}"
+    lam_used = info.get("lambda", "?")
+    tag = f"{repo.split('/')[-1]}_{info['step']}_{info['weights']}_L{lam_used}"
     print(f"[sample] {info}")
 
     amp = contextlib.nullcontext()
@@ -84,8 +90,9 @@ def main(
     weights: str = "ema",      # 'ema' | 'model'
     sample_steps: int = 50,
     cfg_scale: float = 4.0,
+    lam: float = -1.0,         # -1 = use checkpoint's Λ; else override (0=DMAP,1=AMAP)
 ):
-    tag, png = sample.remote(repo, step, weights, sample_steps, cfg_scale)
+    tag, png = sample.remote(repo, step, weights, sample_steps, cfg_scale, lam)
     from pathlib import Path
     out_dir = Path(__file__).parent / "samples"
     out_dir.mkdir(exist_ok=True)

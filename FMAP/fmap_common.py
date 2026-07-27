@@ -244,5 +244,11 @@ def load_fmap_checkpoint(dev, repo: str, step="latest", weights: str = "ema"):
     sd = load_file(hf_hub_download(repo, f"{folder}/{fname}"))
     missing, unexpected = model.load_state_dict(sd, strict=False)
     assert not unexpected, f"unexpected keys: {unexpected[:5]}"
+    # set the annealing coefficient this checkpoint was saved at (0 => pure DMAP);
+    # WITHOUT this the operator would default to Λ=1 (AMAP) on DMAP-trained weights.
+    from fmap_attention import set_lambda
+    lam = float(cfg_dict.get("lambda", 0.0))
+    set_lambda(model, lam)
     model = model.to(dev)
-    return model, {"repo": repo, "step": resolved, "weights": weights, "config": cfg_dict}
+    return model, {"repo": repo, "step": resolved, "weights": weights,
+                   "lambda": lam, "config": cfg_dict}

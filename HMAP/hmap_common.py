@@ -201,7 +201,15 @@ def fetch_checkpoint(repo: str, step: int):
     from safetensors.torch import load_file
 
     folder = f"checkpoints/step_{step:07d}"
-    cfg = json.load(open(hf_hub_download(repo, f"{folder}/hmap_config.json")))
+    # tolerate any arm's config filename (hmap_/amap_/dmap_/..._config.json)
+    cfg = {}
+    for name in ("hmap_config.json", "amap_config.json", "dmap_config.json",
+                 "fmap_config.json", "ddmap_config.json", "config.json"):
+        try:
+            cfg = json.load(open(hf_hub_download(repo, f"{folder}/{name}")))
+            break
+        except Exception:
+            continue
     model_sd = load_file(hf_hub_download(repo, f"{folder}/model.safetensors"))
     ema_sd = load_file(hf_hub_download(repo, f"{folder}/ema.safetensors"))
     return cfg, model_sd, ema_sd

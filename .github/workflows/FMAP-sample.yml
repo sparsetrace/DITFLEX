@@ -1,0 +1,73 @@
+name: FMAP-sample
+
+# Manual dispatch: render a 4x4 grid from an FMAP checkpoint and COMMIT the PNG
+# into FMAP/samples/. Sampling is forward-only, so L4 is plenty (~cents/run).
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "FMAP checkpoint repo"
+        type: string
+        default: "jcandane/FMAP"
+      step:
+        description: "checkpoint step (int), 'latest', or 'base'"
+        type: string
+        default: "latest"
+      weights:
+        description: "which weights to sample"
+        type: choice
+        options: [ema, model]
+        default: ema
+      gpu:
+        description: "Modal GPU (L4 is plenty for sampling)"
+        type: choice
+        options: [L4, A10G, H100, B200]
+        default: L4
+      sample_steps:
+        description: "ODE sampling steps"
+        type: string
+        default: "50"
+      cfg_scale:
+        description: "classifier-free guidance scale"
+        type: string
+        default: "4.0"
+      lam:
+        description: "Λ override: -1 = use checkpoint's Λ; else 0=DMAP .. 1=AMAP"
+        type: string
+        default: "-1"
+
+permissions:
+  contents: write
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install modal
+      - name: Render grid on Modal
+        working-directory: FMAP
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          FMAP_SAMPLE_GPU: ${{ inputs.gpu }}
+        run: |
+          modal run sample_fmap.py \
+            --repo "${{ inputs.repo }}" \
+            --step "${{ inputs.step }}" \
+            --weights "${{ inputs.weights }}" \
+            --sample-steps "${{ inputs.sample_steps }}" \
+            --cfg-scale "${{ inputs.cfg_scale }}" \
+            --lam "${{ inputs.lam }}"
+      - name: Commit grid
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add FMAP/samples/*.png
+          git diff --cached --quiet && echo "no new grid" && exit 0
+          git commit -m "FMAP: sample grid [skip ci]"
+          git push

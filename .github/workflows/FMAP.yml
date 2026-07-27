@@ -1,8 +1,8 @@
 name: FMAP
 
-# Manual dispatch: SiT->DMAP direct. Folds base SiT's W_Q,W_K -> W_M (drop W_N)
-# and finetunes the folded Mahalanobis distance kernel on your HF latents.
-# Commits sample grids into FMAP/samples/.
+# Manual only. Loads the 7M SiT-XL/2, applies FMAP (coupled), and either
+# smoke-tests it or runs a short flow-matching finetune on your HF latents,
+# all on a Modal B200. The long transactional finetune stays in train.yml.
 on:
   workflow_dispatch:
     inputs:
@@ -42,6 +42,14 @@ on:
         type: choice
         options: [auto, never, must]
         default: auto
+      anneal_start:
+        description: "hold Λ=1 (AMAP) until this step"
+        type: string
+        default: "0"
+      anneal_end:
+        description: "Λ reaches 0 (pure DMAP) by this step"
+        type: string
+        default: "40000"
       sample_every:
         description: "preview grid every N finetune steps (0 = only at end)"
         type: string
@@ -101,6 +109,8 @@ jobs:
             --save-every "${{ inputs.save_every }}" \
             --max-shards "${{ inputs.max_shards }}" \
             --resume "${{ inputs.resume }}" \
+            --anneal-start "${{ inputs.anneal_start }}" \
+            --anneal-end "${{ inputs.anneal_end }}" \
             --latents-repo "${{ inputs.latents_repo }}" \
             --push-repo "${{ inputs.push_repo }}" \
             ${{ inputs.qk_rmsnorm == 'true' && '--qk-rmsnorm' || '--no-qk-rmsnorm' }} \

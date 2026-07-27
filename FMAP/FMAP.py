@@ -165,6 +165,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
         _, unexpected = model.load_state_dict(model_sd, strict=False)
         assert not unexpected, f"unexpected keys on resume: {unexpected[:5]}"
     ema = C.EMA(model, decay=0.9999)
+    ema_at_zero = False   # EMA is only valid once Λ has stopped moving (Λ=0)
     if resume_sds is not None:
         ema.shadow = {k: v.to(dev).float() for k, v in resume_sds[1].items()}
         print(f"[fmap] resumed model+EMA @ step {start_step:,} (optimizer reinitialized)")
@@ -231,7 +232,17 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
             loss = transport.training_losses(model, x1, dict(y=yy))["loss"].mean()
         opt.zero_grad(); loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-        opt.step(); ema.update(model)
+        opt.step()
+        if lam == 0.0 and not ema_at_zero:
+            # Λ just reached 0: the operator stops moving, so restart the EMA on
+            # the FIXED DMAP operator. The prior EMA smeared across the anneal
+            # (a moving minimum) and is not a valid solution — discard it.
+            ema = C.EMA(model, decay=0.9999)
+            ema_at_zero = True
+            print(f"[fmap] Λ=0 reached at step {step:,}: EMA restarted on the fixed "
+                  f"DMAP operator (previous EMA spanned the anneal and is discarded)")
+        else:
+            ema.update(model)
 
         if step % max(1, steps // 20) == 0 or step == start_step + 1:
             print(f"  step {step:6d}  loss {loss.item():.4f}  grad {gnorm.item():.2f}  Λ={lam:.3f}")

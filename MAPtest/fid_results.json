@@ -1,0 +1,15 @@
+{
+  "config": {
+    "num_samples": 10000,
+    "sample_steps": 50,
+    "cfg_scale": 1.5,
+    "seed": 0,
+    "reference": "VAE-decoded latents from sparsetrace/dlatentzz (NOT publication-comparable)",
+    "gpu": "H200"
+  },
+  "fid": {
+    "sit-7M(full-attn)": 7.6835,
+    "amap@40000-ema": 7.6598,
+    "hmap@35000-ema-a0.88": 266.5595
+  }
+}

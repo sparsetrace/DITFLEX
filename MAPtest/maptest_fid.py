@@ -76,16 +76,19 @@ VAE_SCALE = 0.18215
 # =============================================================================
 def _add_paths():
     import sys
-    for p in ("/repo/AMAP", "/repo/DMAP", "/root/SiT"):
+    for p in ("/repo/AMAP", "/repo/DMAP", "/repo/FMAP", "/repo/HMAP", "/root/SiT"):
         if p not in sys.path:
             sys.path.insert(0, p)
 
 
 def load_model(kind: str, repo: str | None, step: str, weights: str, dev):
-    """Return (model, label). kind in {sit, amap, dmap}.
+    """Return (model, label). kind in {sit, amap, dmap, hmap}.
     sit  -> released SiT-XL/2 7M, full attention (the upper bound).
     amap -> SiT + AMAP (coupled), weights from `repo`.
     dmap -> SiT + folded DMAP, weights from `repo`.
+    hmap -> SiT + HMAP (frozen kinetic + α-homotopy), weights from `repo`.
+            For HMAP the `weights` field may carry an α override as
+            "ema@0.88" or "model@1.0" (else the checkpoint's saved α is used).
     """
     _add_paths()
     kind = kind.lower()
@@ -101,7 +104,16 @@ def load_model(kind: str, repo: str | None, step: str, weights: str, dev):
         import dmap_common as D
         model, info = D.load_dmap_checkpoint(dev, repo, step=step, weights=weights)
         return model.eval(), f"dmap@{info['step']}-{info['weights']}"
-    raise ValueError(f"unknown model kind {kind!r} (expected sit|amap|dmap)")
+    if kind == "hmap":
+        import hmap_common as H
+        # allow "ema@0.88" to pin the homotopy coefficient for sampling
+        w, _, a_str = weights.partition("@")
+        model, info = H.load_hmap_checkpoint(dev, repo, step=step, weights=w or "ema")
+        if a_str:
+            from hmap_attention import set_alpha
+            set_alpha(model, float(a_str)); info["alpha"] = float(a_str)
+        return model.eval(), f"hmap@{info['step']}-{info.get('weights','ema')}-a{info.get('alpha','?')}"
+    raise ValueError(f"unknown model kind {kind!r} (expected sit|amap|dmap|hmap)")
 
 
 def make_sampler(steps: int):

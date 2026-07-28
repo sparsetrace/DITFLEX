@@ -6,9 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       models:
-        description: "kind[:repo[:step[:weights]]], comma-separated"
+        description: "kind[:repo[:step[:weights]]] comma-sep. kinds: sit|amap|dmap|hmap. HMAP α: weights='ema@0.88'"
         type: string
-        default: "sit,amap:jcandane/AMAP,dmap:jcandane/DMAP"
+        default: "sit,amap:jcandane/AMAP:40000:ema,hmap:jcandane/HMAP:35000:ema@0.88"
       num_samples:
         description: "images per model (50000 = convention; 10000 = quick internal)"
         type: string

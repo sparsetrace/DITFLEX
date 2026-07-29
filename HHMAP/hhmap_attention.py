@@ -64,6 +64,8 @@ class HHMAPConfig:
     qk_rmsnorm: bool = False
     learn_logit_scale: bool = False
     wd_rank: int = 0          # 0 => full [C,C] P; r>0 => low-rank P is [C,r]
+    tied_potential: bool = True   # frozen DMAP w=‖m‖² channel (annealed in)
+    free_potential: bool = True   # trainable free W_D φ channel (the experiment)
     eps: float = 1e-6
 
 
@@ -116,16 +118,23 @@ def _hhmap_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
     Wa = q_a @ k_a.transpose(-2, -1)                     # 𝒲 = q_a k_aᵀ
     flux = 0.5 * (Wa - Wa.transpose(-2, -1))             # ½(𝒲−𝒲ᵀ)
 
+    logits = kinetic + (1.0 - a) * flux
+
     # --- FROZEN tied potential: w = ‖m‖² (the DMAP / Coifman–Lafon potential) ---
-    w = (m * m).sum(-1)                                  # w_i = ‖m_i‖²
-    tied = 0.5 * (w[..., :, None] - w[..., None, :])     # ½(w_i − w_j)
+    # Both potentials ride α (so α=0 is exactly AMAP: no potential). Skip the
+    # compute entirely at α=0 since a*(·)=0 there.
+    if cfg.tied_potential and a > 0.0:
+        w = (m * m).sum(-1)                              # w_i = ‖m_i‖²
+        tied = 0.5 * (w[..., :, None] - w[..., None, :]) # ½(w_i − w_j)
+        logits = logits + a * tied
 
     # --- FREE potential: φ = diag(𝓡 W_D 𝓡ᵀ) = rᵀΛr,  r = 𝓡 P (ONLY trainable) ---
-    r = self.wd_proj(x).reshape(B, N, H, Dh).permute(0, 2, 1, 3)   # 𝓡 P, per head
-    phi = (self._wd_lambda.view(1, H, 1, Dh) * (r * r)).sum(-1)    # r_iᵀ Λ r_i
-    free = 0.5 * (phi[..., :, None] - phi[..., None, :])           # ½(φ_i − φ_j)
-
-    logits = kinetic + (1.0 - a) * flux + a * tied + a * free
+    if cfg.free_potential and a > 0.0:
+        rank = getattr(self, "_wd_rank", Dh)
+        r = self.wd_proj(x).reshape(B, N, H, rank).permute(0, 2, 1, 3)  # 𝓡 P, per head
+        phi = (self._wd_lambda.view(1, H, 1, rank) * (r * r)).sum(-1)   # r_iᵀ Λ r_i
+        free = 0.5 * (phi[..., :, None] - phi[..., None, :])            # ½(φ_i − φ_j)
+        logits = logits + a * free
     logits = logits * self.scale
     if cfg.learn_logit_scale:
         logits = logits * self._hhmap_logit_scale.view(1, H, 1, 1)
@@ -173,7 +182,7 @@ def apply_hhmap(model: nn.Module, cfg: HHMAPConfig | None = None, alpha: float =
             module.hmap_qk = qk
 
         # FREE potential head: r = 𝓡 P  (P is [C,C] or low-rank [C, wd_rank·H])
-        if not hasattr(module, "wd_proj"):
+        if cfg.free_potential and not hasattr(module, "wd_proj"):
             rank = cfg.wd_rank if cfg.wd_rank and cfg.wd_rank > 0 else Dh
             out_dim = H * rank
             module.wd_proj = nn.Linear(C, out_dim, bias=False).to(device=dev, dtype=dt)

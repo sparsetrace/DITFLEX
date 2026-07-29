@@ -69,7 +69,8 @@ GPU = os.environ.get("HHMAP_GPU", "H200")
 @app.function(image=image, gpu=GPU, secrets=[HF_SECRET], timeout=6 * 60 * 60,
               volumes={"/cache": ckpt_vol})
 def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
-        qk_rmsnorm: bool, learn_logit_scale: bool, wd_rank: int, precision: str,
+        qk_rmsnorm: bool, learn_logit_scale: bool, wd_rank: int,
+        tied_potential: bool, free_potential: bool, precision: str,
         anneal_start: int, anneal_end: int, amap_repo: str,
         sample_every: int, sample_steps: int, cfg_scale: float, save_every: int,
         max_shards: int, resume: str):
@@ -108,6 +109,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
     # ---- resolution: HHMAP own checkpoint -> else warm-start from AMAP-40k ----
     start_step, resume_sds = 0, None
     eff_qk_rmsnorm, eff_lls, eff_wd_rank = qk_rmsnorm, learn_logit_scale, wd_rank
+    eff_tied, eff_free = tied_potential, free_potential
     warm_qk_from_amap = None   # AMAP's q,k slices to init the FROZEN flux hmap_qk
     if stage == "finetune" and resume != "never":
         s = C.latest_checkpoint_step(push_repo)
@@ -118,6 +120,8 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
             eff_qk_rmsnorm = bool(ckcfg.get("qk_rmsnorm", False))
             eff_lls = bool(ckcfg.get("learn_logit_scale", False))
             eff_wd_rank = int(ckcfg.get("wd_rank", 0))
+            eff_tied = bool(ckcfg.get("tied_potential", True))
+            eff_free = bool(ckcfg.get("free_potential", True))
             if "anneal_start" in ckcfg and "anneal_end" in ckcfg:
                 anneal_start, anneal_end = int(ckcfg["anneal_start"]), int(ckcfg["anneal_end"])
             print(f"[hhmap] RESUMING HHMAP from {push_repo}/checkpoints/step_{s:07d}")
@@ -146,7 +150,8 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
                 print(f"[hhmap] no HHMAP or AMAP checkpoint — base SiT (α=0=AMAP-on-base)")
 
     hhmap_cfg = HHMAPConfig(qk_rmsnorm=eff_qk_rmsnorm, learn_logit_scale=eff_lls,
-                            wd_rank=eff_wd_rank)
+                            wd_rank=eff_wd_rank,
+                            tied_potential=eff_tied, free_potential=eff_free)
     n_attn = apply_hhmap(model, hhmap_cfg, alpha=0.0)  # creates frozen hmap_qk (from qkv) + free W_D
 
     # If warm-started from AMAP, hmap_qk was inited from the BASE qkv inside
@@ -215,7 +220,8 @@ def run(stage: str, steps: int, lr: float, push_repo: str, latents_repo: str,
                  "alpha": _aa(step, anneal_start, anneal_end),
                  "anneal_start": anneal_start, "anneal_end": anneal_end,
                  "warm_start": amap_repo, "trainable": "wd_proj + _wd_lambda only",
-                 "wd_rank": eff_wd_rank, "base": C.SIT_CKPT, "conditional": True,
+                 "wd_rank": eff_wd_rank, "tied_potential": eff_tied,
+                 "free_potential": eff_free, "base": C.SIT_CKPT, "conditional": True,
                  "qk_rmsnorm": eff_qk_rmsnorm, "learn_logit_scale": eff_lls,
                  "precision": precision, "lr": lr,
                  "objective": "SiT transport Linear/velocity (t in [0,1])"},
@@ -303,6 +309,8 @@ def main(
     qk_rmsnorm: bool = False,
     learn_logit_scale: bool = False,
     wd_rank: int = 0,     # 0 = full [C,C] P; r>0 = low-rank r-per-head
+    tied_potential: bool = True,   # frozen DMAP w=‖m‖² channel (annealed in)
+    free_potential: bool = True,   # trainable free W_D channel (the experiment)
     precision: str = "tf32",
     sample_every: int = 0,
     sample_steps: int = 50,
@@ -316,8 +324,12 @@ def main(
 ):
     if stage == "finetune" and not latents_repo:
         raise SystemExit("finetune needs --latents-repo <your-hf-latents-dataset>")
+    if not (tied_potential or free_potential):
+        raise SystemExit("at least one of --tied-potential / --free-potential must be on "
+                         "(else α→1 is bare Gram with no exact sector)")
     grids = run.remote(stage, steps, lr, push_repo, latents_repo, qk_rmsnorm,
-                       learn_logit_scale, wd_rank, precision, anneal_start, anneal_end,
+                       learn_logit_scale, wd_rank, tied_potential, free_potential,
+                       precision, anneal_start, anneal_end,
                        amap_repo, sample_every, sample_steps,
                        cfg_scale, save_every, max_shards, resume)
     from pathlib import Path

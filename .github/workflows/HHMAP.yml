@@ -1,0 +1,144 @@
+name: HHMAP
+
+# Manual dispatch: the two-exact-potential Hodge homotopy. Warm-starts from AMAP,
+# freezes EVERYTHING (kinetic W_M, flux W_Q/W_K, values, decoder, and the tied
+# DMAP w=‖m‖² potential) except a single FREE node potential W_D, and anneals
+# α: 0 (AMAP) -> 1 (DMAP + free potential). Only W_D (wd_proj + _wd_lambda) trains.
+# If the α→1 loss stays flat (vs the original HMAP's rise), the flux's reducible
+# content was pure exact and W_D absorbed the off-diagonal-sourced remainder.
+on:
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: "Modal GPU"
+        type: choice
+        options: [H200, B200, H100, A100-80GB]
+        default: H200
+      precision:
+        description: "matmul precision (tf32 matches the ditflex chain)"
+        type: choice
+        options: [tf32, highest, bf16]
+        default: tf32
+      stage:
+        description: "smoke (load+patch+forward) or finetune"
+        type: choice
+        options: [finetune, smoke]
+        default: finetune
+      steps:
+        description: "N steps to train THIS run (added on top of any resumed step)"
+        type: string
+        default: "500"
+      lr:
+        description: "finetune LR (only W_D trains)"
+        type: string
+        default: "0.00001"
+      save_every:
+        description: "push a checkpoint every N steps"
+        type: string
+        default: "10000"
+      max_shards:
+        description: "latent shards to load (0 = all 32)"
+        type: string
+        default: "0"
+      resume:
+        description: "resume from latest checkpoint in push_repo if present"
+        type: choice
+        options: [auto, never, must]
+        default: auto
+      anneal_start:
+        description: "α held 0 (AMAP) until this step"
+        type: string
+        default: "0"
+      anneal_end:
+        description: "α reaches 1 (DMAP + free potential) by this step"
+        type: string
+        default: "40000"
+      amap_repo:
+        description: "AMAP repo to warm-start from (frozen kinetic + flux init)"
+        type: string
+        default: "jcandane/AMAP"
+      sample_every:
+        description: "preview grid every N finetune steps (0 = only at end)"
+        type: string
+        default: "0"
+      sample_steps:
+        description: "ODE sampling steps"
+        type: string
+        default: "50"
+      cfg_scale:
+        description: "classifier-free guidance scale"
+        type: string
+        default: "4.0"
+      latents_repo:
+        description: "your HF latents dataset (required for finetune)"
+        type: string
+        default: "sparsetrace/dlatentzz"
+      push_repo:
+        description: "HF repo to push checkpoints/samples to (must be writable)"
+        type: string
+        default: "jcandane/HHMAP"
+      tied_potential:
+        description: "include the frozen DMAP w=‖m‖² tied potential (annealed in)"
+        type: boolean
+        default: true
+      free_potential:
+        description: "include the trainable free W_D potential (the experiment)"
+        type: boolean
+        default: true
+      qk_rmsnorm:
+        description: "per-head RMSNorm on q,k (stabiliser, off by default)"
+        type: boolean
+        default: false
+      learn_logit_scale:
+        description: "per-head learnable logit scale (stabiliser, off by default)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # commit sample grids back into the repo
+
+jobs:
+  hhmap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install modal
+      - name: modal run HHMAP
+        working-directory: HHMAP
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          HHMAP_GPU: ${{ inputs.gpu }}
+        run: |
+          modal run HHMAP.py \
+            --stage "${{ inputs.stage }}" \
+            --steps "${{ inputs.steps }}" \
+            --lr "${{ inputs.lr }}" \
+            --precision "${{ inputs.precision }}" \
+            --sample-every "${{ inputs.sample_every }}" \
+            --sample-steps "${{ inputs.sample_steps }}" \
+            --cfg-scale "${{ inputs.cfg_scale }}" \
+            --save-every "${{ inputs.save_every }}" \
+            --max-shards "${{ inputs.max_shards }}" \
+            --resume "${{ inputs.resume }}" \
+            --anneal-start "${{ inputs.anneal_start }}" \
+            --anneal-end "${{ inputs.anneal_end }}" \
+            --amap-repo "${{ inputs.amap_repo }}" \
+            --latents-repo "${{ inputs.latents_repo }}" \
+            --push-repo "${{ inputs.push_repo }}" \
+            ${{ inputs.tied_potential == 'true' && '--tied-potential' || '--no-tied-potential' }} \
+            ${{ inputs.free_potential == 'true' && '--free-potential' || '--no-free-potential' }} \
+            ${{ inputs.qk_rmsnorm == 'true' && '--qk-rmsnorm' || '--no-qk-rmsnorm' }} \
+            ${{ inputs.learn_logit_scale == 'true' && '--learn-logit-scale' || '--no-learn-logit-scale' }}
+      - name: Commit sample grids
+        if: inputs.stage != 'smoke'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add HHMAP/samples/*.png
+          git diff --cached --quiet && echo "no new grids" && exit 0
+          git commit -m "HHMAP: sample grids [skip ci]"
+          git push

@@ -1,23 +1,42 @@
 """
 DMAP.py — Modal ephemeral finetune of DMAP-on-SiT-XL/2.
 
-DMAP = the Mahalanobis distance-kernel half of AMAP (symmetric PSD core, no
-flux, R≡0): logit_ij = −½‖μ_i − μ_j‖², μ = (q+k)/√2.
+DMAP = the symmetric/reversible sector of AMAP: the Mahalanobis distance
+kernel with its metric-induced potential.
+
+    logit_ij = −½‖μ_i − μ_j‖²,  μ = R·W_M,  W_M = (W_Q+W_K)/√2
+             = μ_i·μ_j − ½‖μ_i‖² − ½‖μ_j‖²
+
+The −½‖μ_j‖² column term IS the potential (Coifman–Lafon self-affinity of
+the metric W_M W_Mᵀ); the −½‖μ_i‖² row term is constant per row and dies in
+the row-softmax. The wmv bias shifts μ, hence the potential's center
+(tier-1 linear tilt). No separate potential weight.
+
+FOLD ≡ TIED INIT. Folding W_Q,W_K → W_M is identical to tying W_K = W_Q at
+their √2-normalized average: W_N and the flux Ω are deleted, ~⅓ of the
+attention-projection params + optimizer state removed. NOTE the asymmetry
+with the forward surgery: attention→AMAP *adds* a PSD correction to an
+intact score (near-lossless); AMAP→DMAP *deletes* a sector the trained
+network co-adapted with. Expect a nonzero step-0 wound — measured below
+globally and per block — and a recovery phase. That is the experiment.
+
+Step-0 inference is UNCONDITIONAL: every invocation renders (a) a pre-fold
+grid on the source weights when warm-starting, and (b) a post-fold grid
+before step 1, both tagged with provenance (fromAMAP / fromBASE / resume).
+Smoke renders (b) too (nothing pushed).
 
     modal run DMAP/DMAP.py --stage smoke
-    modal run DMAP/DMAP.py --stage finetune --steps 21000 --save-every 10000
+    modal run DMAP/DMAP.py --stage finetune --steps 100000 --save-every 10000
 
 Checkpoint resolution for finetune (resume=auto):
-    1. DMAP's own latest in --push-repo (jcandane/DMAP)  -> resume (folded)
-    2. else AMAP's latest in --amap-repo (jcandane/AMAP)  -> WARM-START + FOLD (step 0)
-    3. else base SiT-XL/2                                 -> fresh + FOLD
+    1. DMAP's own latest in --push-repo   -> resume (folded)
+    2. else AMAP's latest in --amap-repo  -> WARM-START + FOLD (step 0)
+    3. else base SiT-XL/2                 -> fresh + FOLD
 
-At step 0 we FOLD W_Q,W_K -> W_M = (W_Q+W_K)/√2 and drop W_N: the fused qkv
-[3d,d] becomes wmv [2d,d], removing ~⅓ of the attention-projection params +
-optimizer state. Exact for DMAP (q,k never appear apart). `--sample-at-start`
-captures a grid on the folded weights before step 1 (the "before"). `--steps N`
-trains N more steps. Folded checkpoints are DMAP-only. Helpers: dmap_common.py;
-operator + fold: dmap_attention.py.
+Protocol note: LR default is 1e-4 CONSTANT (DiT/SiT convention) to keep the
+matched comparison with the AMAP arm honest. Change it only in lockstep
+with the AMAP workflow. Helpers: dmap_common.py; operator + fold:
+dmap_attention.py.
 """
 
 from __future__ import annotations
@@ -81,7 +100,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
     os.makedirs("/cache/samples", exist_ok=True)
     dev = "cuda"
     torch.manual_seed(0)
-    print("[dmap] build: fold + warm-start + UNCONDITIONAL step-0 snapshot")
+    print("[dmap] build: fold(=tied W_Q=W_K init) + warm-start + step-0 grids")
 
     model = C.build_sit_xl2().to(dev)
     ckpt_vol.commit()
@@ -90,6 +109,25 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
     x = torch.randn(2, 4, 32, 32, device=dev)
     t = torch.rand(2, device=dev)
     y = torch.randint(0, 1000, (2,), device=dev)
+
+    grids: list[tuple[str, bytes]] = []
+
+    def render(tag, push: bool):
+        """Sample a grid; append to grids; optionally push. Never fatal."""
+        path = f"/cache/samples/dmap_{tag}.png"
+        try:
+            _, png = C.sample_grid(model, dev, path, sample_steps, cfg_scale, amp)
+            ckpt_vol.commit()
+            grids.append((tag, png))
+            print(f"[dmap] grid '{tag}' rendered ({len(png)//1024} KiB)")
+            if push:
+                from huggingface_hub import HfApi
+                HfApi().upload_file(path_or_fileobj=path,
+                                    path_in_repo=f"samples/dmap_{tag}.png",
+                                    repo_id=push_repo)
+                print(f"[dmap] grid '{tag}' -> {push_repo}/samples/")
+        except Exception as e:
+            print(f"[dmap] grid '{tag}' failed (non-fatal): {e!r}")
 
     # ---- checkpoint resolution: DMAP(folded) own -> AMAP warm-start -> base ----
     start_step, warm, folded_sd, ema_sd = 0, None, None, None
@@ -109,7 +147,7 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
                 _, unexp = model.load_state_dict(am_sd, strict=False)   # AMAP qkv -> model (pre-fold)
                 warm = f"{amap_repo}/checkpoints/step_{a:07d}"
                 print(f"[dmap] no DMAP checkpoint — WARM-STARTING from AMAP {warm}, "
-                      f"folding W_Q,W_K->W_M (step reset to 0)")
+                      f"tying/folding W_Q,W_K -> W_M (step reset to 0)")
                 if unexp:
                     print(f"[dmap] (ignoring {len(unexp)} AMAP-only key(s), e.g. {unexp[:2]})")
             elif resume == "must":
@@ -118,18 +156,39 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
             else:
                 print(f"[dmap] no DMAP or AMAP checkpoint — fresh start from base SiT, folding")
 
+    provenance = "resume" if folded_sd is not None else ("fromAMAP" if warm else "fromBASE")
+
+    # ---- pre-fold reference forward + per-block taps (source model) ----
+    per_block_src: dict[str, torch.Tensor] = {}
+    per_block_new: dict[str, torch.Tensor] = {}
+
+    def _tap(store):
+        hooks = []
+        for name, m in model.named_modules():
+            if hasattr(m, "num_heads") and hasattr(m, "scale") and (
+                    hasattr(m, "qkv") or hasattr(m, "wmv")):
+                def h(_m, _i, o, _name=name):
+                    store[_name] = o.detach().float()
+                hooks.append(m.register_forward_hook(h))
+        return hooks
+
+    hooks = _tap(per_block_src)
     with torch.no_grad(), amp:
         std_out = model(x, t, y)          # standard attention on the pre-fold weights
+    for h in hooks:
+        h.remove()
 
-    # FOLD W_Q,W_K -> W_M (drop W_N). Exact for DMAP; ~1/3 fewer attn-proj params.
+    # pre-fold "before" grid on the source weights (only meaningful when not resuming)
+    if stage == "finetune" and folded_sd is None:
+        render(f"prefold_{provenance}_step{start_step:07d}", push=False)
+
+    # ---- FOLD W_Q,W_K -> W_M (drop W_N). Exact fold == tied init. ----
     dcfg = DMAPConfig(qk_rmsnorm=eff_qk_rmsnorm, learn_logit_scale=eff_lls)
     n_attn = install_folded_dmap(model, dcfg, fold_weights=True)
     n_folded = sum(p.numel() for p in model.parameters())
     if folded_sd is not None:             # DMAP resume: load trained folded weights
         is_coupled = any(k.endswith(".qkv.weight") for k in folded_sd)
         if is_coupled:
-            # folded-only program: a coupled (qkv) checkpoint is unambiguous —
-            # just fold it and continue, no question asked.
             from dmap_attention import fold_state_dict
             folded_sd = fold_state_dict(folded_sd)
             if ema_sd is not None:
@@ -139,18 +198,34 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
         if unexp:
             raise SystemExit(f"[dmap] unexpected keys resuming checkpoint: {unexp[:5]}")
 
+    hooks = _tap(per_block_new)
     with torch.no_grad(), amp:
         dmap_out = model(x, t, y)
+    for h in hooks:
+        h.remove()
+
+    # ---- surgery diagnostics: global + per-block rel-shift ----
     shift = (dmap_out - std_out).flatten().norm() / std_out.flatten().norm()
     saved = 100.0 * (n_params - n_folded) / n_params
     print(f"[dmap] SiT-XL/2 {n_params/1e6:.1f}M -> {n_folded/1e6:.1f}M folded "
           f"(−{saved:.1f}%, W_N dropped)  attn={n_attn}  precision={precision}")
-    print(f"[dmap] qk_rmsnorm={eff_qk_rmsnorm} learn_logit_scale={eff_lls}  "
-          f"rel-shift vs standard attn = {shift.item():.3f}")
+    print(f"[dmap] provenance={provenance}  qk_rmsnorm={eff_qk_rmsnorm} "
+          f"learn_logit_scale={eff_lls}")
+    print(f"[dmap] SURGERY WOUND global rel-shift = {shift.item():.4f}")
+    block_shift = {}
+    for name in per_block_src:
+        if name in per_block_new:
+            a_, b_ = per_block_src[name], per_block_new[name]
+            block_shift[name] = ((b_ - a_).norm() / (a_.norm() + 1e-12)).item()
+    if block_shift:
+        worst = sorted(block_shift.items(), key=lambda kv: -kv[1])[:5]
+        print("[dmap] per-block rel-shift (attention outputs, worst 5): "
+              + ", ".join(f"{k.split('.')[-2]}={v:.3f}" for k, v in worst))
 
     if stage == "smoke":
+        render(f"smoke_{provenance}_step{start_step:07d}", push=False)
         print("[dmap] smoke OK — nothing trained, nothing pushed.")
-        return []
+        return grids
 
     # PREFLIGHT: verify write access before spending compute.
     from huggingface_hub import HfApi
@@ -170,9 +245,8 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
     print(f"[dmap] latents resident: {len(store):,}  "
           f"labels [{int(store.labels.min())},{int(store.labels.max())}]  from {latents_repo}")
 
-    # model weights are already loaded + folded above. EMA:
     ema = C.EMA(model, decay=0.9999)
-    if ema_sd is not None:                 # DMAP folded resume carries a folded EMA
+    if ema_sd is not None:
         shadow = ema.state_dict()
         for kk, vv in ema_sd.items():
             if kk in shadow:
@@ -182,7 +256,6 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
         print(f"[dmap] EMA snapshot from AMAP warm-start (folded); optimizer fresh")
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.0)
     bs = 64
-    grids: list[tuple[str, bytes]] = []
 
     def save_ckpt(step):
         from huggingface_hub import HfApi
@@ -194,9 +267,13 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
                       f"{d}/ema.safetensors")
             json.dump(
                 {"step": step, "qk_mode": "dmap", "variant": "folded",
-                 "operator": "mahalanobis: -1/2||mu_i-mu_j||^2, mu=R·W_M, W_M=(W_Q+W_K)/sqrt2, R=0",
+                 "operator": "mahalanobis: -1/2||mu_i-mu_j||^2, mu=R·W_M, "
+                             "W_M=(W_Q+W_K)/sqrt2 (== tied W_Q=W_K); potential = "
+                             "column term 1/2||mu_j||^2 (metric self-affinity)",
                  "folded": True, "attn_proj": "wmv [2d,d] (W_N dropped)",
-                 "base": C.SIT_CKPT, "conditional": True, "warm_start_from": warm,
+                 "base": C.SIT_CKPT, "conditional": True,
+                 "provenance": provenance, "warm_start_from": warm,
+                 "surgery_rel_shift": float(shift.item()),
                  "qk_rmsnorm": eff_qk_rmsnorm, "learn_logit_scale": eff_lls,
                  "precision": precision, "lr": lr,
                  "objective": "SiT transport Linear/velocity (t in [0,1])"},
@@ -205,28 +282,16 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
                               path_in_repo=f"checkpoints/step_{step:07d}")
         print(f"[dmap] saved checkpoint step {step:,} -> {push_repo}/checkpoints/step_{step:07d}")
 
-    def preview(tag):
-        path = f"/cache/samples/dmap_{tag}.png"
-        _, png = C.sample_grid(model, dev, path, sample_steps, cfg_scale, amp)
-        ckpt_vol.commit()
-        grids.append((tag, png))
-        try:
-            HfApi().upload_file(path_or_fileobj=path,
-                                path_in_repo=f"samples/dmap_{tag}.png", repo_id=push_repo)
-            print(f"[dmap] preview grid '{tag}' -> {push_repo}/samples/ ({len(png)//1024} KiB)")
-        except Exception as e:
-            print(f"[dmap] preview '{tag}' rendered but upload failed (non-fatal): {e!r}")
-
     end_step = start_step + steps   # steps = N ADDITIONAL steps
     if steps <= 0:
         print(f"[dmap] steps={steps} <= 0; nothing to train — sampling current weights.")
     else:
-        print(f"[dmap] training {steps:,} more steps: {start_step:,} -> {end_step:,}")
-    # step-0 "before" snapshot — ALWAYS (unconditional), never fatal
-    try:
-        preview(f"step{start_step:07d}_start")
-    except Exception as e:
-        print(f"[dmap] step-0 snapshot failed (non-fatal): {e!r}")
+        print(f"[dmap] training {steps:,} more steps: {start_step:,} -> {end_step:,}  "
+              f"(constant lr={lr:g})")
+
+    # step-0 post-fold snapshot — ALWAYS, provenance-tagged
+    render(f"step{start_step:07d}_{provenance}_postfold", push=True)
+
     model.train()
     for step in range(start_step + 1, end_step + 1):
         x1, yy = store.batch(step, 0, bs, base_seed=0)
@@ -241,12 +306,12 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
         if save_every > 0 and step % save_every == 0:
             save_ckpt(step)
         if sample_every > 0 and step % sample_every == 0:
-            preview(f"step{step:07d}")
+            render(f"step{step:07d}", push=True)
 
     if end_step > start_step and (save_every <= 0 or end_step % save_every != 0):
         save_ckpt(end_step)
     if sample_every <= 0 or end_step % sample_every != 0:
-        preview(f"step{end_step:07d}")
+        render(f"step{end_step:07d}", push=True)
     return grids
 
 
@@ -254,14 +319,14 @@ def run(stage: str, steps: int, lr: float, push_repo: str, amap_repo: str,
 def main(
     stage: str = "finetune",
     steps: int = 500,
-    lr: float = 1e-5,
+    lr: float = 1e-4,                   # PROTOCOL: constant 1e-4, matched with AMAP arm
     push_repo: str = "jcandane/DMAP",
     amap_repo: str = "jcandane/AMAP",   # warm-start source when no DMAP checkpoint
     latents_repo: str = "sparsetrace/dlatentzz",
     qk_rmsnorm: bool = False,
     learn_logit_scale: bool = False,
     precision: str = "tf32",
-    sample_every: int = 0,
+    sample_every: int = 10000,
     sample_steps: int = 50,
     cfg_scale: float = 4.0,
     save_every: int = 10000,

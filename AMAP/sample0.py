@@ -2,18 +2,35 @@
 sample0.py — step-0 sample grids for SiT-XL/2 with NO training.
 
     modal run AMAP/sample0.py --attn standard   # untouched original (baseline)
-    modal run AMAP/sample0.py --attn amap       # AMAP (coupled) grafted, untrained
+    modal run AMAP/sample0.py --attn amap       # AMAP operator grafted, untrained
+    modal run AMAP/sample0.py --attn kinetic    # weights PROJECTED to the PSD
+                                                # cone, untouched standard forward
 
-Builds SiT-XL/2, loads the 7M checkpoint, optionally applies the AMAP
-operator, and renders one sample grid via amap_common.sample_grid — the SAME
-seed / class panel / ODE integrator settings as AMAP.py's finetune previews,
-so the three-way panel (standard step-0, AMAP step-0, AMAP step-N) is
-pixel-comparable. Nothing is trained, no latents are downloaded, no
-push-repo write access is required (the grid upload is best-effort).
+Three arms, same weights, same seed / class panel / ODE settings
+(amap_common.sample_grid), pixel-comparable:
 
-Grids land in <push_repo>/samples/ as {attn}_step0000000.png and are also
-returned to the local entrypoint, which writes them into AMAP/samples/ for
-the workflow's commit step.
+  standard : released checkpoint, released forward. Score = <q_i, k_j>
+             = 1/2<m,m> - 1/2<n,n> + flux   (indefinite kinetic + circulation)
+
+  amap     : operator swap (apply_amap), weights untouched.
+             Score = 1/2<m,m> + flux        (NSD sector removed, flux KEPT)
+
+  kinetic  : WEIGHT surgery, forward untouched. Per attention block the fused
+             qkv rows are edited: W_Q, W_K <- (W_Q + W_K)/2 (biases likewise),
+             so <q'_i, k'_j> = 1/2<m_i, m_j> exactly. Setting W_N = 0 makes W'
+             symmetric, so the flux vanishes WITH the NSD sector: this is the
+             pure PSD metric (DMAP kernel without the Doob tilt), NOT AMAP.
+             Exact in SiT because no RoPE/QK-norm sits between qkv and the
+             score (unlike nanochat).
+
+  standard - kinetic  isolates (NSD sector + flux) jointly;
+  amap - kinetic      isolates the flux alone;
+  standard - amap     isolates the NSD sector alone.
+
+Nothing is trained, no latents are downloaded, no push-repo write access is
+required (grid upload is best-effort). Grids land in <push_repo>/samples/ as
+{attn}_step0000000.png and are returned to the local entrypoint, which writes
+them into AMAP/samples/ for the workflow's commit step.
 """
 
 from __future__ import annotations
@@ -52,6 +69,41 @@ HF_SECRET = modal.Secret.from_name("HF_TOKEN")
 GPU = os.environ.get("AMAP_GPU", "B200")
 
 
+def project_qkv_to_psd_cone(model) -> int:
+    """Weight-space projection to the PSD cone: in every fused qkv Linear,
+    W_Q, W_K <- (W_Q + W_K)/2 (and biases likewise), leaving W_V untouched.
+
+    Under the UNTOUCHED standard forward this yields the score
+    <q'_i, k'_j> = 1/2 <m_i, m_j>  (m = (q+k)/sqrt(2)) exactly: W_N = 0 kills
+    both the NSD sector and (since W' is symmetric) the antisymmetric flux.
+    Averaging whole matrices is per-head correct: head h occupies the same
+    row block in W_Q and W_K, so blockwise and global averaging coincide.
+
+    Returns the number of attention modules projected.
+    """
+    import torch
+    n_proj = 0
+    for name, mod in model.named_modules():
+        qkv = getattr(mod, "qkv", None)
+        if qkv is None or not hasattr(qkv, "weight"):
+            continue
+        W = qkv.weight
+        if W.shape[0] != 3 * W.shape[1]:
+            continue  # not a fused q,k,v projection
+        D = W.shape[1]
+        with torch.no_grad():
+            avg_w = 0.5 * (W[:D] + W[D:2 * D])
+            W[:D].copy_(avg_w)
+            W[D:2 * D].copy_(avg_w)
+            if qkv.bias is not None:
+                b = qkv.bias
+                avg_b = 0.5 * (b[:D] + b[D:2 * D])
+                b[:D].copy_(avg_b)
+                b[D:2 * D].copy_(avg_b)
+        n_proj += 1
+    return n_proj
+
+
 @app.function(image=image, gpu=GPU, secrets=[HF_SECRET], timeout=60 * 60,
               volumes={"/cache": ckpt_vol})
 def run(attn: str, precision: str, sample_steps: int, cfg_scale: float,
@@ -79,29 +131,45 @@ def run(attn: str, precision: str, sample_steps: int, cfg_scale: float,
     ckpt_vol.commit()
     n_params = sum(p.numel() for p in model.parameters())
 
-    if attn == "amap":
+    # Reference forward on the untouched model, for the rel-shift diagnostic
+    # of the modified arms (same diagnostic as AMAP.py's smoke stage).
+    x = torch.randn(2, 4, 32, 32, device=dev)
+    t = torch.rand(2, device=dev)
+    y = torch.randint(0, 1000, (2,), device=dev)
+    with torch.no_grad(), amp:
+        std_out = model(x, t, y)
+
+    if attn == "standard":
+        print("[sample0] untouched SiT-XL/2 — standard attention, no patch, "
+              "no weight edits")
+        tag = "standard"
+
+    elif attn == "amap":
         from amap_attention import apply_amap, AMAPConfig
-        # Keep the standard-forward reference BEFORE patching so the same
-        # rel-shift diagnostic as AMAP.py's smoke stage is reported here too.
-        x = torch.randn(2, 4, 32, 32, device=dev)
-        t = torch.rand(2, device=dev)
-        y = torch.randint(0, 1000, (2,), device=dev)
-        with torch.no_grad(), amp:
-            std_out = model(x, t, y)
         n_attn = apply_amap(model, AMAPConfig(qk_rmsnorm=qk_rmsnorm,
                                               learn_logit_scale=learn_logit_scale))
         with torch.no_grad(), amp:
-            amap_out = model(x, t, y)
-        shift = (amap_out - std_out).flatten().norm() / std_out.flatten().norm()
-        print(f"[sample0] AMAP grafted: patched_attn={n_attn} "
+            out = model(x, t, y)
+        shift = (out - std_out).flatten().norm() / std_out.flatten().norm()
+        print(f"[sample0] AMAP operator grafted: patched_attn={n_attn} "
               f"qk_rmsnorm={qk_rmsnorm} learn_logit_scale={learn_logit_scale} "
               f"rel-shift vs standard = {shift.item():.3f}")
         tag = "amap"
-    elif attn == "standard":
-        print("[sample0] untouched SiT-XL/2 — standard attention, no patch applied")
-        tag = "standard"
+
+    elif attn == "kinetic":
+        n_attn = project_qkv_to_psd_cone(model)
+        assert n_attn > 0, ("no fused qkv Linears found — SiT block structure "
+                            "differs from the expected timm Attention layout")
+        with torch.no_grad(), amp:
+            out = model(x, t, y)
+        shift = (out - std_out).flatten().norm() / std_out.flatten().norm()
+        print(f"[sample0] PSD-cone weight projection: projected_qkv={n_attn} "
+              f"(W_Q = W_K = (W_Q+W_K)/2; forward untouched) "
+              f"rel-shift vs standard = {shift.item():.3f}")
+        tag = "kinetic"
+
     else:
-        raise ValueError(f"attn must be standard|amap, got {attn!r}")
+        raise ValueError(f"attn must be standard|amap|kinetic, got {attn!r}")
 
     print(f"[sample0] SiT-XL/2 params={n_params/1e6:.1f}M  precision={precision}  "
           f"sample_steps={sample_steps}  cfg={cfg_scale}")
@@ -128,13 +196,13 @@ def run(attn: str, precision: str, sample_steps: int, cfg_scale: float,
 
 @app.local_entrypoint()
 def main(
-    attn: str = "standard",     # standard | amap
+    attn: str = "standard",     # standard | amap | kinetic
     precision: str = "tf32",
     sample_steps: int = 50,
     cfg_scale: float = 4.0,
     push_repo: str = "jcandane/AMAP",
-    qk_rmsnorm: bool = False,       # amap only
-    learn_logit_scale: bool = False,  # amap only
+    qk_rmsnorm: bool = False,       # amap arm only
+    learn_logit_scale: bool = False,  # amap arm only
 ):
     grids = run.remote(attn, precision, sample_steps, cfg_scale, push_repo,
                        qk_rmsnorm, learn_logit_scale)

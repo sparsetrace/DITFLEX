@@ -1,8 +1,14 @@
 name: DMAP
 
-# Manual only. Loads the 7M SiT-XL/2, applies AMAP (coupled), and either
-# smoke-tests it or runs a short flow-matching finetune on your HF latents,
-# all on a Modal B200. The long transactional finetune stays in train.yml.
+# Manual only. Loads the 7M-step SiT-XL/2 (or resumes/warm-starts per the
+# resolution chain in DMAP.py), FOLDS W_Q,W_K -> W_M (== tied W_Q=W_K init,
+# W_N and the flux dropped), and either smoke-tests or runs a flow-matching
+# finetune of the FOLDED DMAP model on your HF latents, on a Modal GPU.
+# Step-0 grids (pre-fold and post-fold, provenance-tagged) are rendered
+# unconditionally. The AMAP surgery itself lives in the AMAP workflow.
+#
+# PROTOCOL: lr is constant 1e-4, matched with the AMAP arm. Change only in
+# lockstep across both workflows.
 on:
   workflow_dispatch:
     inputs:
@@ -17,7 +23,7 @@ on:
         options: [tf32, highest, bf16]
         default: tf32
       stage:
-        description: "smoke (load+patch+forward) or finetune"
+        description: "smoke (load+fold+grid) or finetune"
         type: choice
         options: [finetune, smoke]
         default: finetune
@@ -26,9 +32,9 @@ on:
         type: string
         default: "500"
       lr:
-        description: "finetune LR"
+        description: "finetune LR (PROTOCOL: constant 1e-4, matched with AMAP arm)"
         type: string
-        default: "0.00001"
+        default: "0.0001"
       save_every:
         description: "push a checkpoint every N steps"
         type: string
@@ -43,9 +49,9 @@ on:
         options: [auto, never, must]
         default: auto
       sample_every:
-        description: "preview grid every N finetune steps (0 = only at end)"
+        description: "preview grid every N finetune steps (0 = only start+end)"
         type: string
-        default: "0"
+        default: "10000"
       sample_steps:
         description: "ODE sampling steps"
         type: string
@@ -63,15 +69,15 @@ on:
         type: string
         default: "jcandane/DMAP"
       amap_repo:
-        description: "AMAP repo to warm-start from when no DMAP checkpoint exists"
+        description: "AMAP repo to warm-start+fold from when no DMAP checkpoint exists"
         type: string
         default: "jcandane/AMAP"
       qk_rmsnorm:
-        description: "per-head RMSNorm on q,k (stabiliser, off by default)"
+        description: "per-head RMSNorm on mu (stabiliser, off by default)"
         type: boolean
         default: false
       learn_logit_scale:
-        description: "per-head learnable logit scale (stabiliser, off by default)"
+        description: "per-head learnable logit scale (stabiliser; freeze during matched transfer)"
         type: boolean
         default: false
 
@@ -79,7 +85,7 @@ permissions:
   contents: write   # commit sample grids back into the repo
 
 jobs:
-  amap:
+  dmap:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -111,11 +117,10 @@ jobs:
             ${{ inputs.qk_rmsnorm == 'true' && '--qk-rmsnorm' || '--no-qk-rmsnorm' }} \
             ${{ inputs.learn_logit_scale == 'true' && '--learn-logit-scale' || '--no-learn-logit-scale' }}
       - name: Commit sample grids
-        if: inputs.stage != 'smoke'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add DMAP/samples/*.png
+          git add DMAP/samples/*.png || true
           git diff --cached --quiet && echo "no new grids" && exit 0
           git commit -m "DMAP: sample grids [skip ci]"
           git push

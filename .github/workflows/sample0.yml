@@ -1,20 +1,28 @@
 # .github/workflows/sample0.yml
-# Step-0 sample grids, no training: the untouched SiT-XL/2 (standard
-# attention, checkpoint as released) or the AMAP-grafted model at step 0.
-# Same seed / class panel / ODE settings as AMAP.py's finetune previews via
-# amap_common.sample_grid, so the panel
-#     standard step-0  |  amap step-0  |  amap step-N (from train runs)
-# is directly comparable. Grids upload to <push_repo>/samples/ (best-effort)
-# and are committed into AMAP/samples/ in this repo.
-name: sample0 (untouched / AMAP step-0 grids)
+# Step-0 sample grids, no training. Three arms over the SAME released
+# SiT-XL/2 weights, same seed / class panel / ODE settings
+# (amap_common.sample_grid), pixel-comparable:
+#
+#   standard : untouched checkpoint, untouched forward
+#              score = 1/2<m,m> - 1/2<n,n> + flux
+#   amap     : AMAP operator grafted (apply_amap), weights untouched
+#              score = 1/2<m,m> + flux         (NSD removed, flux kept)
+#   kinetic  : weights PROJECTED to the PSD cone (W_Q=W_K=(W_Q+W_K)/2),
+#              forward untouched
+#              score = 1/2<m,m>                (NSD AND flux removed)
+#
+# Grid algebra: standard-kinetic = NSD+flux jointly; amap-kinetic = flux
+# alone; standard-amap = NSD alone. Grids upload to <push_repo>/samples/
+# (best-effort) and are committed into AMAP/samples/ in this repo.
+name: sample0 (standard / amap / kinetic step-0 grids)
 
 on:
   workflow_dispatch:
     inputs:
       attn:
-        description: "Which attention: untouched original or AMAP graft"
+        description: "standard=untouched | amap=operator graft | kinetic=PSD weight projection"
         type: choice
-        options: [standard, amap]
+        options: [standard, amap, kinetic]
         default: standard
       gpu:
         description: "Modal GPU"
@@ -39,11 +47,11 @@ on:
         type: string
         default: "jcandane/AMAP"
       qk_rmsnorm:
-        description: "amap only: per-head RMSNorm on q,k"
+        description: "amap arm only: per-head RMSNorm on q,k"
         type: boolean
         default: false
       learn_logit_scale:
-        description: "amap only: per-head learnable logit scale"
+        description: "amap arm only: per-head learnable logit scale"
         type: boolean
         default: false
 

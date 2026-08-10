@@ -1,0 +1,84 @@
+# .github/workflows/sample0.yml
+# Step-0 sample grids, no training: the untouched SiT-XL/2 (standard
+# attention, checkpoint as released) or the AMAP-grafted model at step 0.
+# Same seed / class panel / ODE settings as AMAP.py's finetune previews via
+# amap_common.sample_grid, so the panel
+#     standard step-0  |  amap step-0  |  amap step-N (from train runs)
+# is directly comparable. Grids upload to <push_repo>/samples/ (best-effort)
+# and are committed into AMAP/samples/ in this repo.
+name: sample0 (untouched / AMAP step-0 grids)
+
+on:
+  workflow_dispatch:
+    inputs:
+      attn:
+        description: "Which attention: untouched original or AMAP graft"
+        type: choice
+        options: [standard, amap]
+        default: standard
+      gpu:
+        description: "Modal GPU"
+        type: choice
+        options: [B200, H200, H100, A100-80GB]
+        default: B200
+      precision:
+        description: "matmul precision (tf32 matches the ditflex chain)"
+        type: choice
+        options: [tf32, highest, bf16]
+        default: tf32
+      sample_steps:
+        description: "ODE sampling steps"
+        type: string
+        default: "50"
+      cfg_scale:
+        description: "classifier-free guidance scale"
+        type: string
+        default: "4.0"
+      push_repo:
+        description: "HF repo for the grid (best-effort upload)"
+        type: string
+        default: "jcandane/AMAP"
+      qk_rmsnorm:
+        description: "amap only: per-head RMSNorm on q,k"
+        type: boolean
+        default: false
+      learn_logit_scale:
+        description: "amap only: per-head learnable logit scale"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # commit sample grids back into the repo
+
+jobs:
+  sample0:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install modal
+      - name: modal run sample0
+        working-directory: AMAP
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          AMAP_GPU: ${{ inputs.gpu }}
+        run: |
+          modal run sample0.py \
+            --attn "${{ inputs.attn }}" \
+            --precision "${{ inputs.precision }}" \
+            --sample-steps "${{ inputs.sample_steps }}" \
+            --cfg-scale "${{ inputs.cfg_scale }}" \
+            --push-repo "${{ inputs.push_repo }}" \
+            ${{ inputs.qk_rmsnorm == 'true' && '--qk-rmsnorm' || '--no-qk-rmsnorm' }} \
+            ${{ inputs.learn_logit_scale == 'true' && '--learn-logit-scale' || '--no-learn-logit-scale' }}
+      - name: Commit sample grids
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add AMAP/samples/*.png
+          git diff --cached --quiet && echo "no new grids" && exit 0
+          git commit -m "sample0: ${{ inputs.attn }} step-0 grid [skip ci]"
+          git push

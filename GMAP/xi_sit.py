@@ -40,8 +40,24 @@ local entrypoint which writes GMAP/samples/ for the workflow's commit step.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import modal
+
+_HERE = Path(__file__).parent
+
+
+def _find_module(name: str) -> str:
+    """Locate a helper module: GMAP/ first, then ../AMAP/ (no copy needed)."""
+    for cand in (_HERE / name, _HERE.parent / "AMAP" / name):
+        if cand.exists():
+            return str(cand)
+    raise FileNotFoundError(
+        f"{name} not found next to xi_sit.py or in ../AMAP/ — "
+        f"GMAP needs gmap_attention.py locally and amap_common.py "
+        f"(local copy or the AMAP/ original)."
+    )
+
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -63,7 +79,8 @@ image = (
     )
     .env({"HF_HOME": "/cache/hf"})
     .run_commands("git clone --depth 1 https://github.com/willisma/SiT /root/SiT")
-    .add_local_python_source("gmap_attention", "amap_common")
+    .add_local_file(_find_module("gmap_attention.py"), "/root/gmap_attention.py")
+    .add_local_file(_find_module("amap_common.py"), "/root/amap_common.py")
 )
 
 app = modal.App("ditflex-gmap")
@@ -102,7 +119,9 @@ def run(base: str, ckpt_repo: str, ckpt_step: str, weights: str,
         sample_steps: int, cfg_scale: float,
         fm_batches: int, fm_bs: int, latents_repo: str, max_shards: int,
         push_repo: str):
-    import contextlib, csv, io, json, torch
+    import contextlib, csv, json, sys, torch
+    if "/root" not in sys.path:
+        sys.path.insert(0, "/root")     # add_local_file mounts land in /root
     import amap_common as C
     from gmap_attention import apply_gmap, GMAPConfig
 

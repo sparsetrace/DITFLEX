@@ -1,0 +1,121 @@
+name: GMAP
+
+# Manual only. Frozen anti-attention (Girsanov) scan on SiT-XL/2: loads one
+# set of weights (released base, or an AMAP finetuned checkpoint), patches the
+# (c_sym, c_flux)-coupled GMAP operator, and sweeps rays through the coupling
+# plane — rendering the fixed pixel-comparable sample grid and a PAIRED frozen
+# flow-matching loss at every point. NOTHING TRAINS.
+#
+#   xi        (2-t, t)  : anti-attention diagonal; t->0 is a literal Girsanov
+#                         annealing to a reversible kernel (no mask in SiT)
+#   fluxcut   (1, t)    : pinned metric, flux -> 0 (frozen coexact dial)
+#   symheat   (c, 1)    : pinned flux, metric coupling 1 -> 2
+#   fluxboost (1, t>1)  : flux over-driven past the trained coupling
+#
+# PREREQUISITE: GMAP/ contains gmap_attention.py, xi_sit.py, and a copy of
+# AMAP/amap_common.py (unchanged — pure library code).
+on:
+  workflow_dispatch:
+    inputs:
+      gpu:
+        description: "Modal GPU"
+        type: choice
+        options: [B200, H200, H100, A100-80GB]
+        default: B200
+      base:
+        description: "Weights + baseline operator: released SiT (standard) or AMAP checkpoint"
+        type: choice
+        options: [standard, amap]
+        default: standard
+      ckpt_repo:
+        description: "AMAP checkpoint repo (base=amap only)"
+        type: string
+        default: "jcandane/AMAP"
+      ckpt_step:
+        description: "AMAP checkpoint step: latest | base | <int> (base=amap only)"
+        type: string
+        default: "latest"
+      weights:
+        description: "ema or model weights (base=amap only)"
+        type: choice
+        options: [ema, model]
+        default: ema
+      rays:
+        description: "comma list: xi,fluxcut,symheat,fluxboost"
+        type: string
+        default: "xi,fluxcut,symheat,fluxboost"
+      spacing:
+        description: "coupling spacing along each ray (0.25 -> ~17 grids; 0.1 -> ~40)"
+        type: string
+        default: "0.25"
+      precision:
+        description: "matmul precision (tf32 matches the ditflex chain)"
+        type: choice
+        options: [tf32, highest, bf16]
+        default: tf32
+      sample_steps:
+        description: "ODE sampling steps per grid"
+        type: string
+        default: "50"
+      cfg_scale:
+        description: "classifier-free guidance scale"
+        type: string
+        default: "4.0"
+      fm_batches:
+        description: "paired FM-loss batches per point (0 = grids only)"
+        type: string
+        default: "4"
+      max_shards:
+        description: "latent shards for the FM column (1 is plenty)"
+        type: string
+        default: "1"
+      latents_repo:
+        description: "HF latents dataset for the FM column"
+        type: string
+        default: "sparsetrace/dlatentzz"
+      push_repo:
+        description: "HF repo for grids (samples/gmap/) and the scan table (probes/)"
+        type: string
+        default: "jcandane/AMAP"
+
+permissions:
+  contents: write   # commit sample grids back into the repo
+
+jobs:
+  gmap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install modal
+      - name: modal run GMAP xi scan
+        working-directory: GMAP
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          AMAP_GPU: ${{ inputs.gpu }}
+        run: |
+          modal run xi_sit.py \
+            --base "${{ inputs.base }}" \
+            --ckpt-repo "${{ inputs.ckpt_repo }}" \
+            --ckpt-step "${{ inputs.ckpt_step }}" \
+            --weights "${{ inputs.weights }}" \
+            --rays "${{ inputs.rays }}" \
+            --spacing "${{ inputs.spacing }}" \
+            --precision "${{ inputs.precision }}" \
+            --sample-steps "${{ inputs.sample_steps }}" \
+            --cfg-scale "${{ inputs.cfg_scale }}" \
+            --fm-batches "${{ inputs.fm_batches }}" \
+            --max-shards "${{ inputs.max_shards }}" \
+            --latents-repo "${{ inputs.latents_repo }}" \
+            --push-repo "${{ inputs.push_repo }}"
+      - name: Commit sample grids
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add GMAP/samples/*.png
+          git diff --cached --quiet && echo "no new grids" && exit 0
+          git commit -m "GMAP: xi-scan grids [skip ci]"
+          git push

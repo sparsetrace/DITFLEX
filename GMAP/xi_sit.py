@@ -189,9 +189,15 @@ def run(base: str, ckpt_repo: str, ckpt_step: str, weights: str,
         out11 = model(x, t0, y0)
     if base == "standard":
         shift = (out11 - ref_out).flatten().norm() / ref_out.flatten().norm()
+        # The released forward uses fused SDPA; GMAP is eager matmul+softmax.
+        # Identical math on different kernels drifts ~1e-4..1e-3 relative
+        # under tf32 across 28 blocks. An operator-level error (wrong scale
+        # or sector coefficient) would be O(1). Threshold set accordingly.
         print(f"[gmap] (1,1) vs released forward rel-shift = {shift.item():.2e} "
-              f"(must be ~0: GMAP standard at (1,1) IS standard attention)")
-        assert shift.item() < 1e-4, "GMAP (1,1) failed to reproduce standard attention"
+              f"(eager-vs-SDPA kernel rounding; operator errors would be O(1))")
+        assert shift.item() < 5e-3, (
+            f"GMAP (1,1) rel-shift {shift.item():.3e} exceeds the kernel-"
+            f"rounding envelope — this indicates a real operator mismatch")
     else:
         print("[gmap] (1,1) is the AMAP operator on these weights (baseline arm)")
 

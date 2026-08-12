@@ -249,12 +249,63 @@ def load_checkpoint(repo: str, device):
     raw_cfg = json.loads(cfg_file.read_text())
     known = {f.name for f in dataclasses.fields(ModelConfig)}
     model_cfg, score, where = _find_model_cfg(raw_cfg, known)
-    if model_cfg is None or score < 3:
+
+    # `amap_config.json` / `dmap_config.json` are conversion metadata in the
+    # structured checkpoints, not necessarily a serialized ModelConfig.  The
+    # converted models retain the repository's canonical SiT backbone, so use
+    # the dataclass defaults as that backbone and overlay every compatible
+    # field supplied by the checkpoint metadata.  Generic configs with a real
+    # ModelConfig-like block still take the original path below.
+    structured_name = cfg_file.name.lower() in {"amap_config.json", "dmap_config.json"}
+    if score >= 3:
+        cfg_kwargs = {k: v for k, v in model_cfg.items() if k in known}
+        cfg = ModelConfig(**cfg_kwargs)
+        print(f"[fid] model config from {cfg_file.name}:{where} ({score}/{len(known)} fields)")
+    elif structured_name:
+        try:
+            default_cfg = ModelConfig()
+        except TypeError as exc:
+            raise KeyError(
+                f"{cfg_file.name} is structured conversion metadata ({score}/{len(known)} ModelConfig fields), "
+                "but ModelConfig() has no usable defaults for reconstructing the SiT backbone. "
+                f"Constructor error: {exc}"
+            ) from exc
+
+        cfg_kwargs = dataclasses.asdict(default_cfg)
+
+        # Collect compatible fields anywhere in the metadata.  This is more
+        # permissive than requiring a particular nesting convention, while the
+        # state-dict checks below guard against silently constructing the wrong
+        # architecture.
+        found = {}
+        stack = [raw_cfg]
+        while stack:
+            obj = stack.pop()
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    if k in known and not isinstance(v, (dict, list)):
+                        found[k] = v
+                    elif isinstance(v, (dict, list)):
+                        stack.append(v)
+            elif isinstance(obj, list):
+                stack.extend(v for v in obj if isinstance(v, (dict, list)))
+        cfg_kwargs.update(found)
+
+        # The filename is authoritative for the structured attention family.
+        # AMAP uses the ordinary builder with qk_mode='amap'; DMAP uses its
+        # dedicated tied-Q/K builder.
+        if "qk_mode" in known:
+            cfg_kwargs["qk_mode"] = "amap" if cfg_file.name.lower().startswith("amap_") else "dmap"
+        cfg = ModelConfig(**{k: v for k, v in cfg_kwargs.items() if k in known})
+        print(
+            f"[fid] {cfg_file.name}: structured metadata ({score}/{len(known)} direct ModelConfig fields); "
+            f"using canonical ModelConfig defaults + {len(found)} compatible checkpoint override(s)"
+        )
+    else:
         raise KeyError(
             f"{cfg_file.name}: no ModelConfig-like block found (best match {score}/{len(known)})"
         )
-    cfg = ModelConfig(**{k: v for k, v in model_cfg.items() if k in known})
-    print(f"[fid] model config from {cfg_file.name}:{where} ({score}/{len(known)} fields)")
+
     print(f"[fid] cfg: qk_mode={getattr(cfg, 'qk_mode', None)} num_classes={cfg.num_classes}")
 
     wfile = next((base / n for n in EMA_NAMES if (base / n).exists()), None)
@@ -295,8 +346,10 @@ def load_checkpoint(repo: str, device):
             print(f"[fid] missing[:8] = {other_missing[:8]}")
         if unexpected:
             print(f"[fid] unexpected[:8] = {unexpected[:8]}")
-        if len(other_missing) > 10:
-            raise RuntimeError("too many missing keys -- wrong weights file or config")
+        if len(other_missing) > 10 or len(unexpected) > 10:
+            raise RuntimeError(
+                "too many state-dict mismatches -- reconstructed backbone/config does not match checkpoint"
+            )
 
     return model.to(device).eval(), cfg, "ditflex"
 

@@ -494,7 +494,7 @@ def bootstrap_fid(features, mu_ref, sigma_ref, *, observed_score: float, reps: i
     cpu=8.0,
     memory=32768,   # latent store is ~10 GiB in CPU RAM during reference pass
     timeout=TIMEOUT,
-    secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
+    secrets=[modal.Secret.from_local_environ(["HF_TOKEN"])],
 )
 def evaluate(
     repos: str = "jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000",

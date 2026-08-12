@@ -1,84 +1,78 @@
 name: fid
 
-# Manual dispatch: compute FID for one or more checkpoint repos and COMMIT
-# evaluation/fid_results.json back into this repo. Non-detached (the job
-# needs the result back to commit it).
+# Manual FID-50k evaluation of one or more DAC/SiT arms.
+# The arms are evaluated SEQUENTIALLY on one Modal GPU so peak GPU usage stays low.
+# Default model specs:
+#   official-sit                                  official Xie et al. SiT-XL/2
+#   jcandane/AMAP@latest                          newest AMAP checkpoints/step_*
+#   jcandane/DMAP@checkpoints/step_0080000        pinned DMAP 80k checkpoint
 #
-# GPU SIZING -- read before dispatching.
-#   The sampling workflow uses L4 because a 4x4 grid is ~1,600 forward
-#   passes. FID at 50k samples x 50 Euler steps x 2 (CFG) is ~5,000,000
-#   forward passes -- roughly 3,000x more work. Extrapolating from this
-#   model's measured training throughput that is order-of-an-hour on a
-#   B200/H100 and order-of-a-DAY on an L4. Do not use L4 here except for a
-#   num_samples=1000 smoke test.
-#
-# WHAT MAKES THE NUMBER MEANINGFUL
-#   * reference stats: ADM's VIRTUAL_imagenet256_labeled.npz for numbers
-#     comparable to published DiT/SiT; ref_mode=latents for a self-consistent
-#     dmap-vs-amap comparison that is NOT comparable to published figures.
-#   * num_samples: FID is biased upward at small N and the bias does not
-#     cancel between models unless N matches. 50k is the convention.
-#   * identical sampler settings across chains, or you measure the sampler.
-#   * EMA weights (see the ADAPTER section of modal_fid.py).
+# Paper recommendation:
+#   N=50,000, identical sampler/CFG/seed, EMA weights, and the same reference stats.
+#   bootstrap_reps=100 is a reasonable final run; use 5-10 only for a smoke test.
 
 on:
   workflow_dispatch:
     inputs:
       repos:
-        description: "Comma-separated checkpoint repos (compare arms in ONE dispatch so settings match)"
+        description: "Comma-separated arms; evaluated sequentially on one GPU"
         required: false
-        default: "sparsetrace/ditflex-L2-flow,sparsetrace/ditflex-L2-flow-dmap"
+        default: "official-sit,jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000"
       gpu:
-        description: "GPU kind. H100/B200 for real runs; L4 only for a 1000-sample smoke test."
+        description: "Modal GPU. A10 is the low-cost default; increase if runtime is excessive."
         required: false
-        default: "H100"
+        default: "A10"
       num_samples:
-        description: "Samples per chain (50000 = convention, 10000 = internal comparison, 1000 = smoke test)"
+        description: "Samples per arm (50000 = paper FID-50k; 1000 = smoke test)"
         required: false
         default: "50000"
       batch_size:
-        description: "Sampling batch size (64 fits comfortably on 80GB; drop to 16 on L4)"
+        description: "Sampling batch size. 16 is conservative for a 24GB A10."
         required: false
-        default: "64"
+        default: "16"
       sample_steps:
-        description: "Euler steps (must match across compared chains)"
+        description: "Euler/ODE steps; held identical across all arms"
         required: false
         default: "50"
       cfg_scale:
-        description: "CFG scale. NOTE: published DiT/SiT FID uses 1.5; the 4.0 used for pretty grids inflates FID badly."
+        description: "Classifier-free guidance scale; held identical across all arms"
         required: false
         default: "1.5"
+      bootstrap_reps:
+        description: "Bootstrap replicates for FID uncertainty (100 final; 5-10 smoke test; 0 disables)"
+        required: false
+        default: "100"
       ref_stats_url:
-        description: "URL of a precomputed reference .npz (mu/sigma). Leave empty to use ref_mode."
+        description: "Precomputed ImageNet-256 reference .npz (mu/sigma). Preferred for headline FID."
         required: false
         default: ""
       ref_mode:
-        description: "Fallback when ref_stats_url is empty: 'latents' = stats from your own VAE-decoded latents"
+        description: "Fallback if ref_stats_url is empty: latents"
         required: false
         default: "latents"
       latents_repo:
-        description: "HF dataset repo with the SD-VAE latents. REQUIRED unless ref_stats_url is set. Decoded with the same VAE as the samples, so the comparison isolates the generative model (but is not comparable to published FID)."
+        description: "HF dataset repo with SD-VAE latents; required for ref_mode=latents"
         required: false
         default: "sparsetrace/dlatentzz"
       objective:
-        description: "flow (SiT / rectified flow) or ddpm (DiT). Must match how the chain was trained."
+        description: "flow for SiT/AMAP/DMAP"
         required: false
         default: "flow"
       seed:
-        description: "Base seed for class assignment and noise. Varied per batch internally; hold fixed across chains."
+        description: "Base seed; kept fixed across arms"
         required: false
         default: "0"
       fid_seconds:
-        description: "Modal timeout in seconds (50k samples needs hours)"
+        description: "Modal timeout seconds. A10 + three FID-50k arms may need a long timeout."
         required: false
-        default: "14400"
+        default: "86400"
 
 permissions:
-  contents: write   # required to push fid_results.json
+  contents: write
 
 jobs:
   fid:
-    name: "fid · ${{ inputs.repos }} · N=${{ inputs.num_samples }} · ${{ inputs.gpu }}"
+    name: "fid · N=${{ inputs.num_samples }} · ${{ inputs.gpu }}"
     runs-on: ubuntu-latest
 
     steps:
@@ -92,9 +86,6 @@ jobs:
 
       - name: Install Modal
         run: |
-          # huggingface_hub is needed LOCALLY so Modal can deserialize remote
-          # exceptions raised inside HF calls. Without it every such failure
-          # surfaces as an opaque "Could not deserialize remote exception".
           pip install 'modal<1.5' huggingface_hub
           modal --version
 
@@ -110,11 +101,14 @@ jobs:
           if [ -z "${{ inputs.ref_stats_url }}" ] && \
              [ "${{ inputs.ref_mode }}" = "latents" ] && \
              [ -z "${{ inputs.latents_repo }}" ]; then
-            echo "::error::ref_mode=latents requires latents_repo (HF dataset repo with the SD-VAE latents)."
+            echo "::error::ref_mode=latents requires latents_repo."
             exit 1
           fi
           if [ $(( ${{ inputs.num_samples }} % 1000 )) -ne 0 ]; then
-            echo "::warning::num_samples is not a multiple of 1000; classes cannot be exactly balanced."
+            echo "::warning::num_samples is not a multiple of 1000; ImageNet classes cannot be exactly balanced."
+          fi
+          if [ "${{ inputs.bootstrap_reps }}" -lt 20 ]; then
+            echo "::warning::bootstrap_reps < 20 is suitable only for pipeline testing, not paper uncertainty."
           fi
 
       - name: Compute FID on Modal
@@ -123,18 +117,22 @@ jobs:
           MODAL_GPU: ${{ inputs.gpu }}
           MODAL_FID_SECONDS: ${{ inputs.fid_seconds }}
         run: |
-          echo "gpu=${MODAL_GPU} N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }}"
+          echo "gpu=${MODAL_GPU} N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }} bootstrap=${{ inputs.bootstrap_reps }}"
           modal run evaluation/modal_fid.py \
             --repos "${{ inputs.repos }}" \
             --num-samples "${{ inputs.num_samples }}" \
             --batch-size "${{ inputs.batch_size }}" \
             --sample-steps "${{ inputs.sample_steps }}" \
             --cfg-scale "${{ inputs.cfg_scale }}" \
+            --bootstrap-reps "${{ inputs.bootstrap_reps }}" \
             --ref-stats-url "${{ inputs.ref_stats_url }}" \
             --ref-mode "${{ inputs.ref_mode }}" \
             --objective "${{ inputs.objective }}" \
             --latents-repo "${{ inputs.latents_repo }}" \
             --seed "${{ inputs.seed }}"
+
+      - name: Show results
+        run: cat evaluation/fid_results.json
 
       - name: Commit results
         run: |
@@ -142,5 +140,5 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add evaluation/fid_results.json
           git diff --cached --quiet && echo "no change" && exit 0
-          git commit -m "fid: N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }} [skip ci]"
+          git commit -m "fid: N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }} bootstrap=${{ inputs.bootstrap_reps }} [skip ci]"
           git push

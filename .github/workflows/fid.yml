@@ -19,17 +19,17 @@ on:
         required: false
         default: "official-sit,jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000"
       gpu:
-        description: "Modal GPU. A10 is the low-cost default; increase if runtime is excessive."
+        description: "Modal GPU. H100 recommended for the final 50k three-arm evaluation."
         required: false
-        default: "A10"
+        default: "H100"
       num_samples:
         description: "Samples per arm (50000 = paper FID-50k; 1000 = smoke test)"
         required: false
         default: "50000"
       batch_size:
-        description: "Sampling batch size. 16 is conservative for a 24GB A10."
+        description: "Sampling batch size. 64 is the H100 default; reduce to 32 if a checkpoint OOMs."
         required: false
-        default: "16"
+        default: "64"
       sample_steps:
         description: "Euler/ODE steps; held identical across all arms"
         required: false
@@ -42,6 +42,10 @@ on:
         description: "Bootstrap replicates for FID uncertainty (100 final; 5-10 smoke test; 0 disables)"
         required: false
         default: "100"
+      inference_precision:
+        description: "Generative-model inference precision: bf16 (recommended on H100), fp16, or fp32"
+        required: false
+        default: "bf16"
       ref_stats_url:
         description: "Precomputed ImageNet-256 reference .npz (mu/sigma). Preferred for headline FID."
         required: false
@@ -63,9 +67,9 @@ on:
         required: false
         default: "0"
       fid_seconds:
-        description: "Modal timeout seconds. A10 + three FID-50k arms may need a long timeout."
+        description: "Modal timeout seconds for the sequential three-arm H100 run."
         required: false
-        default: "86400"
+        default: "28800"
 
 permissions:
   contents: write
@@ -117,7 +121,7 @@ jobs:
           MODAL_GPU: ${{ inputs.gpu }}
           MODAL_FID_SECONDS: ${{ inputs.fid_seconds }}
         run: |
-          echo "gpu=${MODAL_GPU} N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }} bootstrap=${{ inputs.bootstrap_reps }}"
+          echo "gpu=${MODAL_GPU} N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }} bootstrap=${{ inputs.bootstrap_reps }} precision=${{ inputs.inference_precision }}"
           modal run evaluation/modal_fid.py \
             --repos "${{ inputs.repos }}" \
             --num-samples "${{ inputs.num_samples }}" \
@@ -125,6 +129,7 @@ jobs:
             --sample-steps "${{ inputs.sample_steps }}" \
             --cfg-scale "${{ inputs.cfg_scale }}" \
             --bootstrap-reps "${{ inputs.bootstrap_reps }}" \
+            --inference-precision "${{ inputs.inference_precision }}" \
             --ref-stats-url "${{ inputs.ref_stats_url }}" \
             --ref-mode "${{ inputs.ref_mode }}" \
             --objective "${{ inputs.objective }}" \

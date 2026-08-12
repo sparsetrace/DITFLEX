@@ -5,8 +5,14 @@ Frechet distance against reference statistics. Images are never written to
 disk; only the 2048-d features are retained (50k x 2048 fp32 = 410 MB).
 
 RUN:
-    modal run evaluation/modal_fid.py --repos "sparsetrace/ditflex-L2-flow-dmap" \
-        --num-samples 50000 --ref-stats-url <url-or-empty>
+    modal run evaluation/modal_fid.py \
+        --repos "org/sit-regular,org/sit-amap,org/sit-dmap" \
+        --num-samples 50000 --bootstrap-reps 100 \
+        --ref-stats-url <ADM-imagenet256-stats-url>
+
+Output for each model includes the ordinary FID-50k plus bootstrap uncertainty:
+    FID = 2.63 +/- 0.08 (95% bootstrap-normal CI)
+The JSON also retains bootstrap standard error and percentile CI endpoints.
 
 =============================================================================
 THREE THINGS THAT DECIDE WHETHER YOUR NUMBER MEANS ANYTHING
@@ -41,7 +47,7 @@ from pathlib import Path
 import modal
 
 REPO_ROOT = Path(__file__).parent.parent
-GPU_KIND = os.environ.get("MODAL_GPU", "H100")
+GPU_KIND = os.environ.get("MODAL_GPU", "A10")
 TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
 
 # 50k samples x 50 Euler steps x 2 (CFG) = 5e6 forward passes. Budget hours,
@@ -69,7 +75,10 @@ image = (
         "pytorch-fid>=0.3.0",   # canonical ported InceptionV3 weights
         "pillow",
         "tqdm",
+        "torchdiffeq>=0.2.4",
+        "timm>=1.0",
     )
+    .run_commands("git clone --depth 1 https://github.com/willisma/SiT.git /opt/SiT")
     .add_local_dir(
         REPO_ROOT,
         remote_path="/repo",
@@ -109,13 +118,70 @@ def _find_model_cfg(obj, known: set):
     return best, best_score, best_path
 
 
-def load_checkpoint(repo: str, device):
-    """Return (model, ModelConfig) with EMA weights loaded, in eval mode.
+def _parse_repo_spec(spec: str):
+    """Parse `repo`, `repo@latest`, or `repo@path/to/checkpoint`.
 
-    Filenames are discovered rather than assumed: the first run prints the
-    repo's file list, so if the guesses below miss, the log tells you exactly
-    what to put in CFG_NAMES / EMA_NAMES / RAW_NAMES.
+    `@latest` selects the numerically largest checkpoints/step_XXXXXXXX folder
+    without assuming that the repository root itself contains the newest weights.
     """
+    import re
+    from huggingface_hub import HfApi
+
+    if "@" not in spec:
+        return spec, None
+    repo_id, selector = spec.split("@", 1)
+    selector = selector.strip().strip("/")
+    if selector != "latest":
+        return repo_id, selector or None
+
+    files = HfApi().list_repo_files(repo_id=repo_id, repo_type="model")
+    steps = []
+    for name in files:
+        m = re.match(r"^checkpoints/(step_(\d+))(/|$)", name)
+        if m:
+            steps.append((int(m.group(2)), f"checkpoints/{m.group(1)}"))
+    if not steps:
+        print(f"[fid] {repo_id}@latest: no checkpoints/step_* folders; using repo root")
+        return repo_id, None
+    step, subfolder = max(steps)
+    print(f"[fid] {repo_id}@latest -> {subfolder} (step={step:,})")
+    return repo_id, subfolder
+
+
+def _load_official_sit(device):
+    """Load the official Xie et al. SiT-XL/2 ImageNet-256 checkpoint."""
+    import sys
+    from types import SimpleNamespace
+
+    sys.path.insert(0, "/opt/SiT")
+    from download import find_model
+    from models import SiT_models
+
+    model = SiT_models["SiT-XL/2"](
+        input_size=32,
+        num_classes=1000,
+        learn_sigma=True,
+    ).to(device)
+    state = find_model("SiT-XL-2-256x256.pt")
+    model.load_state_dict(state, strict=True)
+    model.eval()
+    cfg = SimpleNamespace(num_classes=1000, qk_mode="regular", backend="official_sit")
+    print("[fid] loaded official willisma/SiT SiT-XL/2 ImageNet-256 checkpoint")
+    return model, cfg, "official_sit"
+
+
+def load_checkpoint(repo: str, device):
+    """Return (model, config-like object, backend) with evaluation weights loaded.
+
+    Specs:
+      * official-sit
+      * jcandane/AMAP@latest
+      * jcandane/DMAP@checkpoints/step_0080000
+      * any ordinary ditflex Hugging Face repo
+    """
+    if repo.lower() in {"official-sit", "sit-official", "xie-sit", "sit-xl/2"}:
+        return _load_official_sit(device)
+
     import dataclasses
     import json
     import sys
@@ -128,124 +194,119 @@ def load_checkpoint(repo: str, device):
     from ditflex.diffusion_model import build_dmap_model
     from ditflex.model import build_model
 
-    CFG_NAMES = ("state.json", "config.json", "model_config.json",
-                 "ditflex_config.json")
+    repo_id, subfolder = _parse_repo_spec(repo)
+    CFG_NAMES = ("state.json", "config.json", "model_config.json", "ditflex_config.json")
     EMA_NAMES = ("ema.safetensors", "ema_model.safetensors", "model_ema.safetensors")
-    RAW_NAMES = ("model.safetensors", "diffusion_pytorch_model.safetensors",
-                 "pytorch_model.safetensors")
+    RAW_NAMES = ("model.safetensors", "diffusion_pytorch_model.safetensors", "pytorch_model.safetensors")
 
-    # Skip archive/ (duplicate older checkpoints), samples/ (PNGs) and
-    # optim.safetensors (~2x model size, Adam moments) -- none are needed here.
+    allow_patterns = None
+    if subfolder:
+        allow_patterns = [f"{subfolder}/*"]
     path = Path(snapshot_download(
-        repo_id=repo, repo_type="model",
-        ignore_patterns=["archive/*", "samples/*", "optim.safetensors"],
+        repo_id=repo_id,
+        repo_type="model",
+        allow_patterns=allow_patterns,
+        ignore_patterns=["archive/*", "samples/*", "**/optim.safetensors"],
     ))
+    base = path / subfolder if subfolder else path
     listing = sorted(p.relative_to(path).as_posix() for p in path.rglob("*") if p.is_file())
-    print(f"[fid] {repo} contains: {listing}")
+    print(f"[fid] {repo}: selected {base.relative_to(path) if base != path else '<root>'}")
+    print(f"[fid] downloaded files: {listing}")
 
-    # ---- config ----
-    cfg_file = next((path / n for n in CFG_NAMES if (path / n).exists()), None)
+    cfg_file = next((base / n for n in CFG_NAMES if (base / n).exists()), None)
     if cfg_file is None:
         raise FileNotFoundError(
-            f"no config json among {CFG_NAMES}; repo has {listing}. "
-            f"Add the correct name to CFG_NAMES."
+            f"no config json among {CFG_NAMES} in selected checkpoint {base}; files={listing}"
         )
     raw_cfg = json.loads(cfg_file.read_text())
     known = {f.name for f in dataclasses.fields(ModelConfig)}
     model_cfg, score, where = _find_model_cfg(raw_cfg, known)
     if model_cfg is None or score < 3:
         raise KeyError(
-            f"{cfg_file.name}: no ModelConfig-like block found (best match had "
-            f"{score} of {len(known)} fields). Top-level keys: {sorted(raw_cfg)}"
+            f"{cfg_file.name}: no ModelConfig-like block found (best match {score}/{len(known)})"
         )
-    print(f"[fid] model config from {cfg_file.name}:{where} "
-          f"({score}/{len(known)} fields present)")
     cfg = ModelConfig(**{k: v for k, v in model_cfg.items() if k in known})
-    print(f"[fid] cfg: qk_mode={cfg.qk_mode} qk_norm={cfg.qk_norm} "
-          f"dmap_alpha={cfg.dmap_alpha} num_classes={cfg.num_classes}")
+    print(f"[fid] model config from {cfg_file.name}:{where} ({score}/{len(known)} fields)")
+    print(f"[fid] cfg: qk_mode={getattr(cfg, 'qk_mode', None)} num_classes={cfg.num_classes}")
 
-    # ---- weights: EMA strongly preferred ----
-    wfile = next((path / n for n in EMA_NAMES if (path / n).exists()), None)
+    wfile = next((base / n for n in EMA_NAMES if (base / n).exists()), None)
     used_ema = wfile is not None
     if wfile is None:
-        wfile = next((path / n for n in RAW_NAMES if (path / n).exists()), None)
+        wfile = next((base / n for n in RAW_NAMES if (base / n).exists()), None)
     if wfile is None:
-        raise FileNotFoundError(
-            f"no weights among {EMA_NAMES + RAW_NAMES}; repo has {listing}."
-        )
+        raise FileNotFoundError(f"no evaluation weights among {EMA_NAMES + RAW_NAMES} in {base}")
     state = load_file(str(wfile))
-    if not used_ema:                                  # EMA may live inside the same file
-        if any(k.startswith("ema.") for k in state):
-            state = {k[4:]: v for k, v in state.items() if k.startswith("ema.")}
-            used_ema = True
-    if used_ema:
-        print(f"[fid] weights: {wfile.name} (EMA)")
-    else:
-        print(f"[fid] *** WARNING: {wfile.name} looks like RAW weights, not EMA.  ***")
-        print("[fid] *** Under constant-LR the raw weights orbit the minimum while ***")
-        print("[fid] *** the EMA sits in it; FID will be inflated. Check the repo.  ***")
+    if not used_ema and any(k.startswith("ema.") for k in state):
+        state = {k[4:]: v for k, v in state.items() if k.startswith("ema.")}
+        used_ema = True
+    print(f"[fid] weights: {wfile.relative_to(path)} ({'EMA' if used_ema else 'RAW'})")
+    if not used_ema:
+        print("[fid] WARNING: checkpoint does not look like EMA weights; verify before paper reporting")
 
-    # ---- build + load ----
-    model = build_dmap_model(cfg) if cfg.qk_mode == "dmap" else build_model(cfg)
+    qk_mode = str(getattr(cfg, "qk_mode", "regular")).lower()
+    if qk_mode == "dmap":
+        model = build_dmap_model(cfg)
+        builder = "build_dmap_model"
+    else:
+        model = build_model(cfg)
+        builder = "build_model"
+    print(f"[fid] architecture dispatch: qk_mode={qk_mode!r} -> {builder}")
     missing, unexpected = model.load_state_dict(state, strict=False)
 
-    # DMAP ties W_K to W_Q, so no separate W_K was ever trained and the
-    # checkpoint has no to_k tensors -- 2 per block is EXPECTED here, not a
-    # fault. Only non-to_k gaps indicate a wrong file or config.
     tied_k = [k for k in missing if ".to_k." in k]
     other_missing = [k for k in missing if ".to_k." not in k]
-
+    if tied_k and qk_mode != "dmap":
+        raise RuntimeError(
+            f"{len(tied_k)} to_k tensors missing but qk_mode={qk_mode!r}; wrong checkpoint/config?"
+        )
     if tied_k:
-        if cfg.qk_mode != "dmap":
-            raise RuntimeError(
-                f"{len(tied_k)} to_k tensors missing but qk_mode={cfg.qk_mode!r} "
-                f"-- an amap checkpoint must carry W_K. Wrong weights file?"
-            )
-        print(f"[fid] {len(tied_k)} to_k tensors absent -- expected for "
-              f"qk_mode=dmap (W_K tied to W_Q)")
-        # Verify the built model really ties them. If to_k is a separate,
-        # untrained module the processor MUST never read it, or we would be
-        # sampling with a randomly initialised W_K and see no error.
-        try:
-            a = model.transformer_blocks[0].attn1
-            aliased = (a.to_k is a.to_q) or (
-                a.to_k.weight.data_ptr() == a.to_q.weight.data_ptr())
-            if aliased:
-                print("[fid] to_k aliases to_q -- tying confirmed at the module level")
-            else:
-                print("[fid] NOTE: to_k is a separate module left at init; the dmap "
-                      "processor is expected to ignore it (see build_dmap_model). "
-                      "If samples look like noise, this is the first thing to check.")
-        except AttributeError as e:
-            print(f"[fid] could not inspect attn tying ({e})")
-
+        print(f"[fid] {len(tied_k)} to_k tensors absent -- expected for DMAP")
     if other_missing or unexpected:
-        print(f"[fid] load_state_dict: {len(other_missing)} unexpected-missing, "
-              f"{len(unexpected)} unexpected")
+        print(f"[fid] load_state_dict: {len(other_missing)} other missing, {len(unexpected)} unexpected")
         if other_missing:
-            print(f"[fid]   missing[:5]    = {other_missing[:5]}")
+            print(f"[fid] missing[:8] = {other_missing[:8]}")
         if unexpected:
-            print(f"[fid]   unexpected[:5] = {unexpected[:5]}")
+            print(f"[fid] unexpected[:8] = {unexpected[:8]}")
         if len(other_missing) > 10:
             raise RuntimeError("too many missing keys -- wrong weights file or config")
 
-    return model.to(device).eval(), cfg
+    return model.to(device).eval(), cfg, "ditflex"
 
 
 def sample_latents(model, labels, *, steps: int, cfg_scale: float, cfg,
-                   device, objective: str, seed: int):
-    """Return [B,4,32,32] scaled latents using the SAME sampler as sample.py.
-
-    NOTE the per-batch `seed`. sample_flow/sample_ddim seed their initial noise
-    from this argument (default FIXED_SEED), so calling them with a constant
-    seed would draw every batch from the same noise tensors: diversity would
-    collapse and FID would be badly inflated, with no error raised anywhere.
-    """
+                   device, objective: str, seed: int, backend: str):
+    """Return [B,4,32,32] scaled latents under a common 50-step Euler/CFG protocol."""
+    import torch
     import sys
+
+    if backend == "official_sit":
+        if objective != "flow":
+            raise ValueError("official-sit adapter currently supports objective='flow' only")
+        sys.path.insert(0, "/opt/SiT")
+        from transport import create_transport, Sampler
+
+        # Official SiT defaults: Linear path, velocity prediction.  We choose
+        # Euler with `steps` so the baseline matches the custom chains' step count.
+        transport = create_transport("Linear", "velocity", None, None, None)
+        sample_fn = Sampler(transport).sample_ode(
+            sampling_method="euler",
+            num_steps=steps,
+            atol=1e-6,
+            rtol=1e-3,
+            reverse=False,
+        )
+        g = torch.Generator(device=device).manual_seed(seed)
+        z = torch.randn((len(labels), 4, 32, 32), generator=g, device=device)
+        y = labels.to(device)
+        z = torch.cat([z, z], dim=0)
+        y_null = torch.full_like(y, 1000)
+        y_cfg = torch.cat([y, y_null], dim=0)
+        out = sample_fn(z, model.forward_with_cfg, y=y_cfg, cfg_scale=cfg_scale)[-1]
+        out, _ = out.chunk(2, dim=0)
+        return out
 
     sys.path.insert(0, "/repo/src")
     from ditflex.sample import sample_ddim, sample_flow
-
     sampler = sample_flow if objective == "flow" else sample_ddim
     return sampler(
         model, labels.cpu(),
@@ -345,6 +406,63 @@ def _stats(features):
     return mu, sigma
 
 
+def bootstrap_fid(features, mu_ref, sigma_ref, *, reps: int, seed: int,
+                  ref_features=None, confidence: float = 0.95):
+    """Bootstrap sampling uncertainty of an FID estimate.
+
+    If ref_features is None, the reference statistics are treated as fixed
+    (the right choice for published/precomputed ADM ImageNet statistics).
+    If ref_features is supplied, both generated and reference samples are
+    independently bootstrapped (the right choice for ref_mode='latents').
+
+    Returns the bootstrap standard error, a symmetric normal-approximation
+    half-width (z * SE), and the percentile interval.  The matrix square root
+    makes this CPU-expensive: 100+ reps are preferable for paper numbers; use
+    10-20 only as a pipeline smoke test.
+    """
+    import numpy as np
+
+    if reps <= 0:
+        return None
+    if reps < 20:
+        print(f"[fid] WARNING: bootstrap_reps={reps} is too small for a stable 95% CI")
+
+    rng = np.random.default_rng(seed)
+    n = features.shape[0]
+    nr = None if ref_features is None else ref_features.shape[0]
+    values = np.empty(reps, dtype=np.float64)
+
+    for b in range(reps):
+        ig = rng.integers(0, n, size=n)
+        mu_g, sigma_g = _stats(features[ig])
+        if ref_features is None:
+            mu_r, sigma_r = mu_ref, sigma_ref
+        else:
+            ir = rng.integers(0, nr, size=nr)
+            mu_r, sigma_r = _stats(ref_features[ir])
+        values[b] = frechet_distance(mu_g, sigma_g, mu_r, sigma_r)
+        if (b + 1) % max(1, reps // 10) == 0 or b + 1 == reps:
+            print(f"[fid] bootstrap {b + 1}/{reps}")
+
+    alpha = 1.0 - confidence
+    lo, hi = np.quantile(values, [alpha / 2.0, 1.0 - alpha / 2.0])
+    se = values.std(ddof=1) if reps > 1 else 0.0
+    # 1.95996 is the two-sided 95% standard-normal quantile.  Keep this
+    # definition explicit so `FID +/- x` has an unambiguous meaning.
+    z = 1.959963984540054 if abs(confidence - 0.95) < 1e-12 else None
+    if z is None:
+        from scipy.stats import norm
+        z = float(norm.ppf(1.0 - alpha / 2.0))
+    return {
+        "reps": int(reps),
+        "confidence": float(confidence),
+        "std_error": float(se),
+        "normal_half_width": float(z * se),
+        "percentile_low": float(lo),
+        "percentile_high": float(hi),
+    }
+
+
 @app.function(
     gpu=GPU_KIND,
     cpu=8.0,
@@ -353,7 +471,7 @@ def _stats(features):
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
 def evaluate(
-    repos: str = "sparsetrace/ditflex-L2-flow-dmap",
+    repos: str = "official-sit,jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000",
     num_samples: int = 50_000,
     batch_size: int = 64,
     sample_steps: int = 50,
@@ -363,6 +481,7 @@ def evaluate(
     latents_repo: str = "",
     objective: str = "flow",
     seed: int = 0,
+    bootstrap_reps: int = 100,
 ) -> str:
     # Fail before spending GPU time on a misconfigured dispatch.
     if not ref_stats_url and ref_mode == "latents" and not latents_repo:
@@ -422,6 +541,10 @@ def evaluate(
         return inception(img)[0].squeeze(-1).squeeze(-1).cpu().numpy()
 
     # ---- reference statistics -------------------------------------------
+    # Keep reference features only when they are estimated from a finite
+    # latent sample; this lets the bootstrap include reference-side sampling
+    # uncertainty.  Precomputed ADM statistics are treated as fixed.
+    ref_features = None
     if ref_stats_url:
         import urllib.request
         print(f"[fid] downloading reference stats: {ref_stats_url}")
@@ -465,9 +588,10 @@ def evaluate(
             lat = all_lat[sl].to(device=device, dtype=torch.float32)
             feats[i : i + len(sl)] = features_from_latents(lat)
         mu_ref, sigma_ref = _stats(feats)
+        ref_features = feats
         ref_desc = (f"VAE-decoded latents from {latents_repo} "
                     f"(same decoder as generation; NOT comparable to published FID)")
-        del feats, all_lat
+        del all_lat
     else:
         raise ValueError("supply ref_stats_url, or ref_mode='latents' with latents_repo")
 
@@ -477,11 +601,13 @@ def evaluate(
         "cfg_scale": cfg_scale, "seed": seed, "objective": objective,
         "reference": ref_desc,
         "gpu": GPU_KIND,
+        "bootstrap_reps": bootstrap_reps,
+        "bootstrap_confidence": 0.95,
     }, "fid": {}}
 
     for repo in [r.strip() for r in repos.split(",") if r.strip()]:
         print(f"[fid] === {repo} ===")
-        model, cfg = load_checkpoint(repo, device)
+        model, cfg, backend = load_checkpoint(repo, device)
 
         torch.manual_seed(seed)
         # Class-balanced: exactly num_samples/1000 per class, then shuffled.
@@ -496,14 +622,28 @@ def evaluate(
                 lat = sample_latents(
                     model, lab, steps=sample_steps, cfg_scale=cfg_scale,
                     cfg=cfg, device=device, objective=objective,
-                    seed=seed * 1_000_003 + i,
+                    seed=seed * 1_000_003 + i, backend=backend,
                 )
                 feats[i : i + len(lab)] = features_from_latents(lat)
 
         mu, sigma = _stats(feats)
         score = frechet_distance(mu, sigma, mu_ref, sigma_ref)
-        results["fid"][repo] = round(score, 4)
-        print(f"[fid] {repo}: FID = {score:.4f}")
+        boot = bootstrap_fid(
+            feats, mu_ref, sigma_ref, reps=bootstrap_reps,
+            seed=seed + 17_171, ref_features=ref_features, confidence=0.95,
+        )
+        entry = {"score": round(score, 4), "num_samples": num_samples}
+        if boot is not None:
+            entry["bootstrap"] = {k: (round(v, 6) if isinstance(v, float) else v)
+                                  for k, v in boot.items()}
+            pm = boot["normal_half_width"]
+            print(f"[fid] {repo}: FID = {score:.4f} +/- {pm:.4f} "
+                  f"(95% bootstrap-normal CI)")
+            print(f"[fid] {repo}: percentile 95% bootstrap CI = "
+                  f"[{boot['percentile_low']:.4f}, {boot['percentile_high']:.4f}]")
+        else:
+            print(f"[fid] {repo}: FID = {score:.4f} (bootstrap disabled)")
+        results["fid"][repo] = entry
 
         del model, feats
         torch.cuda.empty_cache()
@@ -515,7 +655,7 @@ def evaluate(
 
 @app.local_entrypoint()
 def main(
-    repos: str = "sparsetrace/ditflex-L2-flow-dmap",
+    repos: str = "official-sit,jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000",
     num_samples: int = 50_000,
     batch_size: int = 64,
     sample_steps: int = 50,
@@ -525,12 +665,14 @@ def main(
     latents_repo: str = "",
     objective: str = "flow",
     seed: int = 0,
+    bootstrap_reps: int = 100,
 ):
     payload = evaluate.remote(
         repos=repos, num_samples=num_samples, batch_size=batch_size,
         sample_steps=sample_steps, cfg_scale=cfg_scale,
         ref_stats_url=ref_stats_url, ref_mode=ref_mode,
         latents_repo=latents_repo, objective=objective, seed=seed,
+        bootstrap_reps=bootstrap_reps,
     )
     Path("evaluation").mkdir(exist_ok=True)
     Path("evaluation/fid_results.json").write_text(payload)

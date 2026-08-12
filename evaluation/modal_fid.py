@@ -334,12 +334,21 @@ def load_checkpoint(repo: str, device):
 
     tied_k = [k for k in missing if ".to_k." in k]
     other_missing = [k for k in missing if ".to_k." not in k]
-    if tied_k and qk_mode != "dmap":
+    # Structured AMAP/DMAP checkpoints tie the key projection to the query
+    # projection and therefore intentionally omit standalone ``to_k`` weights.
+    # ``build_model`` may still instantiate dormant ``to_k`` modules for AMAP,
+    # so strict=False reports them as missing even though qk_mode='amap' does
+    # not use them in the structured attention forward pass.
+    tied_qk_modes = {"amap", "dmap"}
+    if tied_k and qk_mode not in tied_qk_modes:
         raise RuntimeError(
             f"{len(tied_k)} to_k tensors missing but qk_mode={qk_mode!r}; wrong checkpoint/config?"
         )
     if tied_k:
-        print(f"[fid] {len(tied_k)} to_k tensors absent -- expected for DMAP")
+        print(
+            f"[fid] {len(tied_k)} to_k tensors absent -- expected for "
+            f"structured qk_mode={qk_mode!r}"
+        )
     if other_missing or unexpected:
         print(f"[fid] load_state_dict: {len(other_missing)} other missing, {len(unexpected)} unexpected")
         if other_missing:

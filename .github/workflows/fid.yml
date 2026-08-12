@@ -1,4 +1,4 @@
-name: fid
+name: fidXX
 
 # Manual FID-50k evaluation of one or more DAC/SiT arms.
 # The arms are evaluated SEQUENTIALLY on one Modal GPU so peak GPU usage stays low.
@@ -17,7 +17,7 @@ on:
       repos:
         description: "Comma-separated arms; evaluated sequentially on one GPU"
         required: false
-        default: "official-sit,jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000"
+        default: "jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000"
       gpu:
         description: "Modal GPU. H100 recommended for the final 50k three-arm evaluation."
         required: false
@@ -122,7 +122,7 @@ jobs:
           MODAL_FID_SECONDS: ${{ inputs.fid_seconds }}
         run: |
           echo "gpu=${MODAL_GPU} N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }} bootstrap=${{ inputs.bootstrap_reps }} precision=${{ inputs.inference_precision }}"
-          modal run evaluation/modal_fid.py \
+          modal run evaluation/modal_fidXX.py \
             --repos "${{ inputs.repos }}" \
             --num-samples "${{ inputs.num_samples }}" \
             --batch-size "${{ inputs.batch_size }}" \
@@ -137,13 +137,13 @@ jobs:
             --seed "${{ inputs.seed }}"
 
       - name: Show results
-        run: cat evaluation/fid_results.json
+        run: cat evaluation/fidXX_results.json
 
       - name: Commit results
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add evaluation/fid_results.json
+          git add evaluation/fidXX_results.json
           git diff --cached --quiet && echo "no change" && exit 0
           git commit -m "fid: N=${{ inputs.num_samples }} cfg=${{ inputs.cfg_scale }} bootstrap=${{ inputs.bootstrap_reps }} [skip ci]"
           git push

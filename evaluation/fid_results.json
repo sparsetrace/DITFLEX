@@ -6,9 +6,39 @@
     "seed": 0,
     "objective": "flow",
     "reference": "VAE-decoded latents from sparsetrace/dlatentzz (same decoder as generation; NOT comparable to published FID)",
-    "gpu": "H100"
+    "gpu": "H100",
+    "bootstrap_reps": 100,
+    "bootstrap_confidence": 0.95,
+    "inference_precision": "bf16"
   },
   "fid": {
-    "sparsetrace/ditflex-L2-flow-dmap": 18.7464
+    "jcandane/AMAP@latest": {
+      "score": 2.9341,
+      "num_samples": 50000,
+      "bootstrap": {
+        "reps": 100,
+        "confidence": 0.95,
+        "std_error": 0.056689,
+        "normal_half_width": 0.111109,
+        "centered_percentile_low": 2.824316,
+        "centered_percentile_high": 3.033122,
+        "bootstrap_mean_raw": 4.3936,
+        "bootstrap_bias_raw": 1.459513
+      }
+    },
+    "jcandane/DMAP@checkpoints/step_0080000": {
+      "score": 8.121,
+      "num_samples": 50000,
+      "bootstrap": {
+        "reps": 100,
+        "confidence": 0.95,
+        "std_error": 0.097667,
+        "normal_half_width": 0.191424,
+        "centered_percentile_low": 7.926026,
+        "centered_percentile_high": 8.281368,
+        "bootstrap_mean_raw": 9.508848,
+        "bootstrap_bias_raw": 1.387847
+      }
+    }
   }
 }

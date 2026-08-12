@@ -47,12 +47,12 @@ from pathlib import Path
 import modal
 
 REPO_ROOT = Path(__file__).parent.parent
-GPU_KIND = os.environ.get("MODAL_GPU", "A10")
+GPU_KIND = os.environ.get("MODAL_GPU", "H100")
 TORCH_INDEX = os.environ.get("TORCH_INDEX", "https://download.pytorch.org/whl/cu128")
 
 # 50k samples x 50 Euler steps x 2 (CFG) = 5e6 forward passes. Budget hours,
 # not minutes, and size the timeout accordingly.
-TIMEOUT = int(os.environ.get("MODAL_FID_SECONDS", "14400"))
+TIMEOUT = int(os.environ.get("MODAL_FID_SECONDS", "28800"))
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -482,6 +482,7 @@ def evaluate(
     objective: str = "flow",
     seed: int = 0,
     bootstrap_reps: int = 100,
+    inference_precision: str = "bf16",
 ) -> str:
     # Fail before spending GPU time on a misconfigured dispatch.
     if not ref_stats_url and ref_mode == "latents" and not latents_repo:
@@ -516,6 +517,15 @@ def evaluate(
 
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    precision = inference_precision.lower()
+    if precision not in {"bf16", "fp16", "fp32"}:
+        raise ValueError("inference_precision must be one of: bf16, fp16, fp32")
+    amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(precision)
+    use_amp = amp_dtype is not None
+    print(f"[fid] model inference precision: {precision} "
+          f"({'autocast' if use_amp else 'full fp32'})")
 
     # ---- Inception (block 3 = 2048-d pool features, the FID standard) ----
     inception = InceptionV3([InceptionV3.BLOCK_INDEX_BY_DIM[2048]]).to(device).eval()
@@ -603,6 +613,7 @@ def evaluate(
         "gpu": GPU_KIND,
         "bootstrap_reps": bootstrap_reps,
         "bootstrap_confidence": 0.95,
+        "inference_precision": precision,
     }, "fid": {}}
 
     for repo in [r.strip() for r in repos.split(",") if r.strip()]:
@@ -617,13 +628,16 @@ def evaluate(
         feats = np.empty((num_samples, 2048), dtype=np.float32)
         for i in tqdm(range(0, num_samples, batch_size), desc=repo.split("/")[-1]):
             lab = labels_all[i : i + batch_size]
-            with torch.no_grad():
-                # Per-batch seed -- see the note in sample_latents().
-                lat = sample_latents(
-                    model, lab, steps=sample_steps, cfg_scale=cfg_scale,
-                    cfg=cfg, device=device, objective=objective,
-                    seed=seed * 1_000_003 + i, backend=backend,
-                )
+            with torch.inference_mode():
+                # Run only the generative model under AMP.  Keep VAE/Inception/FID
+                # feature extraction in FP32 for a stable, standard FID pipeline.
+                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                    lat = sample_latents(
+                        model, lab, steps=sample_steps, cfg_scale=cfg_scale,
+                        cfg=cfg, device=device, objective=objective,
+                        seed=seed * 1_000_003 + i, backend=backend,
+                    )
+                lat = lat.float()
                 feats[i : i + len(lab)] = features_from_latents(lat)
 
         mu, sigma = _stats(feats)
@@ -666,13 +680,14 @@ def main(
     objective: str = "flow",
     seed: int = 0,
     bootstrap_reps: int = 100,
+    inference_precision: str = "bf16",
 ):
     payload = evaluate.remote(
         repos=repos, num_samples=num_samples, batch_size=batch_size,
         sample_steps=sample_steps, cfg_scale=cfg_scale,
         ref_stats_url=ref_stats_url, ref_mode=ref_mode,
         latents_repo=latents_repo, objective=objective, seed=seed,
-        bootstrap_reps=bootstrap_reps,
+        bootstrap_reps=bootstrap_reps, inference_precision=inference_precision,
     )
     Path("evaluation").mkdir(exist_ok=True)
     Path("evaluation/fid_results.json").write_text(payload)

@@ -56,7 +56,7 @@ TIMEOUT = int(os.environ.get("MODAL_FID_SECONDS", "28800"))
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("git")
+    .apt_install("git", "curl", "ca-certificates")
     # torchvision MUST come from the same index as torch: pytorch-fid pulls it
     # in, and a PyPI CPU wheel against a CUDA torch fails with
     # "operator torchvision::nms does not exist".
@@ -77,6 +77,17 @@ image = (
         "tqdm",
         "torchdiffeq>=0.2.4",
         "timm>=1.0",
+    )
+    # Pre-cache the canonical pytorch-fid Inception weights during the image
+    # build. Runtime downloads from GitHub are occasionally reset, which can
+    # otherwise kill a long FID job before model evaluation starts.
+    .run_commands(
+        "mkdir -p /root/.cache/torch/hub/checkpoints && "
+        "curl -fL --retry 12 --retry-delay 5 --retry-all-errors "
+        "--connect-timeout 30 --max-time 900 "
+        "-o /root/.cache/torch/hub/checkpoints/pt_inception-2015-12-05-6726825d.pth "
+        "https://github.com/mseitzer/pytorch-fid/releases/download/fid_weights/pt_inception-2015-12-05-6726825d.pth && "
+        "test -s /root/.cache/torch/hub/checkpoints/pt_inception-2015-12-05-6726825d.pth"
     )
     .run_commands("git clone --depth 1 https://github.com/willisma/SiT.git /opt/SiT")
     .add_local_dir(

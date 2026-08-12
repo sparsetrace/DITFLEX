@@ -159,20 +159,31 @@ def _parse_repo_spec(spec: str):
     return repo_id, subfolder
 
 
+def _make_official_sit_backbone(device):
+    """Instantiate the exact official SiT-XL/2 ImageNet-256 backbone."""
+    import sys
+
+    if "/opt/SiT" not in sys.path:
+        sys.path.insert(0, "/opt/SiT")
+    from models import SiT_models
+
+    return SiT_models["SiT-XL/2"](
+        input_size=32,
+        num_classes=1000,
+        learn_sigma=True,
+    ).to(device)
+
+
 def _load_official_sit(device):
     """Load the official Xie et al. SiT-XL/2 ImageNet-256 checkpoint."""
     import sys
     from types import SimpleNamespace
 
-    sys.path.insert(0, "/opt/SiT")
+    if "/opt/SiT" not in sys.path:
+        sys.path.insert(0, "/opt/SiT")
     from download import find_model
-    from models import SiT_models
 
-    model = SiT_models["SiT-XL/2"](
-        input_size=32,
-        num_classes=1000,
-        learn_sigma=True,
-    ).to(device)
+    model = _make_official_sit_backbone(device)
     state = find_model("SiT-XL-2-256x256.pt")
     model.load_state_dict(state, strict=True)
     model.eval()
@@ -181,41 +192,54 @@ def _load_official_sit(device):
     return model, cfg, "official_sit"
 
 
+def _structured_cfg(raw_cfg: dict, cls):
+    """Build AMAPConfig/DMAPConfig from checkpoint metadata without guessing
+    the SiT backbone architecture. Only dataclass fields belonging to the
+    structured attention patch are consumed; everything else is metadata."""
+    import dataclasses
+
+    known = {f.name for f in dataclasses.fields(cls)}
+    found = {}
+    stack = [raw_cfg]
+    while stack:
+        obj = stack.pop()
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in known and not isinstance(v, (dict, list)):
+                    found[k] = v
+                elif isinstance(v, (dict, list)):
+                    stack.append(v)
+        elif isinstance(obj, list):
+            stack.extend(v for v in obj if isinstance(v, (dict, list)))
+    return cls(**found), found
+
+
 def load_checkpoint(repo: str, device):
     """Return (model, config-like object, backend) with evaluation weights loaded.
 
-    Specs:
-      * official-sit
-      * jcandane/AMAP@latest
-      * jcandane/DMAP@checkpoints/step_0080000
-      * any ordinary ditflex Hugging Face repo
+    AMAP and DMAP checkpoints are official SiT-XL/2 backbones with the exact
+    training-time attention surgery applied from /repo/AMAP and /repo/DMAP.
+    They are NOT reconstructed through ditflex.ModelConfig.
     """
     if repo.lower() in {"official-sit", "sit-official", "xie-sit", "sit-xl/2"}:
         return _load_official_sit(device)
 
-    import dataclasses
     import json
     import sys
+    from types import SimpleNamespace
 
     from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
 
-    sys.path.insert(0, "/repo/src")
-    from ditflex.config import ModelConfig
-    from ditflex.diffusion_model import build_dmap_model
-    from ditflex.model import build_model
-
     repo_id, subfolder = _parse_repo_spec(repo)
     CFG_NAMES = (
-        "state.json", "config.json", "model_config.json", "ditflex_config.json",
         "amap_config.json", "dmap_config.json",
+        "state.json", "config.json", "model_config.json", "ditflex_config.json",
     )
     EMA_NAMES = ("ema.safetensors", "ema_model.safetensors", "model_ema.safetensors")
     RAW_NAMES = ("model.safetensors", "diffusion_pytorch_model.safetensors", "pytorch_model.safetensors")
 
-    allow_patterns = None
-    if subfolder:
-        allow_patterns = [f"{subfolder}/*"]
+    allow_patterns = [f"{subfolder}/*"] if subfolder else None
     path = Path(snapshot_download(
         repo_id=repo_id,
         repo_type="model",
@@ -229,84 +253,15 @@ def load_checkpoint(repo: str, device):
 
     cfg_file = next((base / n for n in CFG_NAMES if (base / n).exists()), None)
     if cfg_file is None:
-        # Future DAC checkpoints may use another descriptive *_config.json name.
-        # Restrict the fallback to the selected checkpoint directory so an
-        # unrelated repository-level config cannot be loaded accidentally.
-        config_candidates = sorted(base.glob("*_config.json"))
-        if len(config_candidates) == 1:
-            cfg_file = config_candidates[0]
+        candidates = sorted(base.glob("*_config.json"))
+        if len(candidates) == 1:
+            cfg_file = candidates[0]
             print(f"[fid] config fallback: {cfg_file.name}")
-        elif len(config_candidates) > 1:
-            raise FileNotFoundError(
-                f"multiple *_config.json files in {base}; cannot choose safely: "
-                f"{[x.name for x in config_candidates]}"
-            )
         else:
             raise FileNotFoundError(
-                f"no config json among {CFG_NAMES} (or unique *_config.json) "
-                f"in selected checkpoint {base}; files={listing}"
+                f"no unique config json in selected checkpoint {base}; files={listing}"
             )
     raw_cfg = json.loads(cfg_file.read_text())
-    known = {f.name for f in dataclasses.fields(ModelConfig)}
-    model_cfg, score, where = _find_model_cfg(raw_cfg, known)
-
-    # `amap_config.json` / `dmap_config.json` are conversion metadata in the
-    # structured checkpoints, not necessarily a serialized ModelConfig.  The
-    # converted models retain the repository's canonical SiT backbone, so use
-    # the dataclass defaults as that backbone and overlay every compatible
-    # field supplied by the checkpoint metadata.  Generic configs with a real
-    # ModelConfig-like block still take the original path below.
-    structured_name = cfg_file.name.lower() in {"amap_config.json", "dmap_config.json"}
-    if score >= 3:
-        cfg_kwargs = {k: v for k, v in model_cfg.items() if k in known}
-        cfg = ModelConfig(**cfg_kwargs)
-        print(f"[fid] model config from {cfg_file.name}:{where} ({score}/{len(known)} fields)")
-    elif structured_name:
-        try:
-            default_cfg = ModelConfig()
-        except TypeError as exc:
-            raise KeyError(
-                f"{cfg_file.name} is structured conversion metadata ({score}/{len(known)} ModelConfig fields), "
-                "but ModelConfig() has no usable defaults for reconstructing the SiT backbone. "
-                f"Constructor error: {exc}"
-            ) from exc
-
-        cfg_kwargs = dataclasses.asdict(default_cfg)
-
-        # Collect compatible fields anywhere in the metadata.  This is more
-        # permissive than requiring a particular nesting convention, while the
-        # state-dict checks below guard against silently constructing the wrong
-        # architecture.
-        found = {}
-        stack = [raw_cfg]
-        while stack:
-            obj = stack.pop()
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if k in known and not isinstance(v, (dict, list)):
-                        found[k] = v
-                    elif isinstance(v, (dict, list)):
-                        stack.append(v)
-            elif isinstance(obj, list):
-                stack.extend(v for v in obj if isinstance(v, (dict, list)))
-        cfg_kwargs.update(found)
-
-        # The filename is authoritative for the structured attention family.
-        # AMAP uses the ordinary builder with qk_mode='amap'; DMAP uses its
-        # dedicated tied-Q/K builder.
-        if "qk_mode" in known:
-            cfg_kwargs["qk_mode"] = "amap" if cfg_file.name.lower().startswith("amap_") else "dmap"
-        cfg = ModelConfig(**{k: v for k, v in cfg_kwargs.items() if k in known})
-        print(
-            f"[fid] {cfg_file.name}: structured metadata ({score}/{len(known)} direct ModelConfig fields); "
-            f"using canonical ModelConfig defaults + {len(found)} compatible checkpoint override(s)"
-        )
-    else:
-        raise KeyError(
-            f"{cfg_file.name}: no ModelConfig-like block found (best match {score}/{len(known)})"
-        )
-
-    print(f"[fid] cfg: qk_mode={getattr(cfg, 'qk_mode', None)} num_classes={cfg.num_classes}")
 
     wfile = next((base / n for n in EMA_NAMES if (base / n).exists()), None)
     used_ema = wfile is not None
@@ -322,46 +277,66 @@ def load_checkpoint(repo: str, device):
     if not used_ema:
         print("[fid] WARNING: checkpoint does not look like EMA weights; verify before paper reporting")
 
-    qk_mode = str(getattr(cfg, "qk_mode", "regular")).lower()
-    if qk_mode == "dmap":
-        model = build_dmap_model(cfg)
-        builder = "build_dmap_model"
-    else:
-        model = build_model(cfg)
-        builder = "build_model"
-    print(f"[fid] architecture dispatch: qk_mode={qk_mode!r} -> {builder}")
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    name = cfg_file.name.lower()
+    if name == "amap_config.json" or repo_id.lower().endswith("/amap"):
+        if "/repo" not in sys.path:
+            sys.path.insert(0, "/repo")
+        from AMAP.amap_attention import AMAPConfig, apply_amap
 
-    tied_k = [k for k in missing if ".to_k." in k]
-    other_missing = [k for k in missing if ".to_k." not in k]
-    # Structured AMAP/DMAP checkpoints tie the key projection to the query
-    # projection and therefore intentionally omit standalone ``to_k`` weights.
-    # ``build_model`` may still instantiate dormant ``to_k`` modules for AMAP,
-    # so strict=False reports them as missing even though qk_mode='amap' does
-    # not use them in the structured attention forward pass.
-    tied_qk_modes = {"amap", "dmap"}
-    if tied_k and qk_mode not in tied_qk_modes:
-        raise RuntimeError(
-            f"{len(tied_k)} to_k tensors missing but qk_mode={qk_mode!r}; wrong checkpoint/config?"
-        )
-    if tied_k:
-        print(
-            f"[fid] {len(tied_k)} to_k tensors absent -- expected for "
-            f"structured qk_mode={qk_mode!r}"
-        )
-    if other_missing or unexpected:
-        print(f"[fid] load_state_dict: {len(other_missing)} other missing, {len(unexpected)} unexpected")
-        if other_missing:
-            print(f"[fid] missing[:8] = {other_missing[:8]}")
-        if unexpected:
-            print(f"[fid] unexpected[:8] = {unexpected[:8]}")
-        if len(other_missing) > 10 or len(unexpected) > 10:
+        amap_cfg, found = _structured_cfg(raw_cfg, AMAPConfig)
+        model = _make_official_sit_backbone(device)
+        n = apply_amap(model, amap_cfg)
+        print(f"[fid] AMAP: official SiT-XL/2 backbone + apply_amap; patched {n} attention modules")
+        print(f"[fid] AMAP config overrides: {found or '{}'}")
+        try:
+            model.load_state_dict(state, strict=True)
+        except RuntimeError as exc:
             raise RuntimeError(
-                "too many state-dict mismatches -- reconstructed backbone/config does not match checkpoint"
-            )
+                "AMAP checkpoint did not strictly match official SiT + apply_amap. "
+                "AMAP keeps the original fused qkv state-dict layout, so any mismatch "
+                "indicates a backbone/config mismatch."
+            ) from exc
+        cfg = SimpleNamespace(num_classes=1000, qk_mode="amap", backend="official_sit", amap=amap_cfg)
+        return model.to(device).eval(), cfg, "official_sit"
 
+    if name == "dmap_config.json" or repo_id.lower().endswith("/dmap"):
+        if "/repo" not in sys.path:
+            sys.path.insert(0, "/repo")
+        from DMAP.dmap_attention import DMAPConfig, install_folded_dmap
+
+        dmap_cfg, found = _structured_cfg(raw_cfg, DMAPConfig)
+        model = _make_official_sit_backbone(device)
+        n = install_folded_dmap(model, dmap_cfg, fold_weights=False)
+        print(f"[fid] DMAP: official SiT-XL/2 backbone + install_folded_dmap(fold_weights=False); folded {n} attention modules")
+        print(f"[fid] DMAP config overrides: {found or '{}'}")
+        try:
+            model.load_state_dict(state, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "DMAP checkpoint did not strictly match official SiT + folded wmv attention. "
+                "Expected checkpoint keys *.attn.wmv.{weight,bias} rather than *.attn.qkv.*."
+            ) from exc
+        cfg = SimpleNamespace(num_classes=1000, qk_mode="dmap", backend="official_sit", dmap=dmap_cfg)
+        return model.to(device).eval(), cfg, "official_sit"
+
+    # Generic ditflex checkpoint fallback, retained for non-AMAP/DMAP repos.
+    import dataclasses
+    sys.path.insert(0, "/repo/src")
+    from ditflex.config import ModelConfig
+    from ditflex.diffusion_model import build_dmap_model
+    from ditflex.model import build_model
+
+    known = {f.name for f in dataclasses.fields(ModelConfig)}
+    model_cfg, score, where = _find_model_cfg(raw_cfg, known)
+    if model_cfg is None or score < 3:
+        raise KeyError(f"{cfg_file.name}: no ModelConfig-like block found (best match {score}/{len(known)})")
+    cfg_kwargs = {k: v for k, v in model_cfg.items() if k in known}
+    cfg = ModelConfig(**cfg_kwargs)
+    qk_mode = str(getattr(cfg, "qk_mode", "regular")).lower()
+    model = build_dmap_model(cfg) if qk_mode == "dmap" else build_model(cfg)
+    model.load_state_dict(state, strict=True)
+    print(f"[fid] generic ditflex checkpoint loaded strictly with qk_mode={qk_mode!r}")
     return model.to(device).eval(), cfg, "ditflex"
-
 
 def sample_latents(model, labels, *, steps: int, cfg_scale: float, cfg,
                    device, objective: str, seed: int, backend: str):

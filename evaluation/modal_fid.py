@@ -5,7 +5,7 @@ Frechet distance against reference statistics. Images are never written to
 disk; only the 2048-d features are retained (50k x 2048 fp32 = 410 MB).
 
 RUN:
-    modal run evaluation/modal_fidXX.py \
+    modal run evaluation/modal_fid.py \
         --repos "org/sit-regular,org/sit-amap,org/sit-dmap" \
         --num-samples 50000 --bootstrap-reps 100 \
         --ref-stats-url <ADM-imagenet256-stats-url>
@@ -718,5 +718,5 @@ def main(
         bootstrap_reps=bootstrap_reps, inference_precision=inference_precision,
     )
     Path("evaluation").mkdir(exist_ok=True)
-    Path("evaluation/fidXX_results.json").write_text(payload)
-    print("[fid] wrote evaluation/fidXX_results.json")
+    Path("evaluation/fid_results.json").write_text(payload)
+    print("[fid] wrote evaluation/fid_results.json")

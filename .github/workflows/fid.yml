@@ -115,6 +115,15 @@ jobs:
             echo "::warning::bootstrap_reps < 20 is suitable only for pipeline testing, not paper uncertainty."
           fi
 
+      - name: Modal import preflight
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          MODAL_GPU: ${{ inputs.gpu }}
+          MODAL_FID_SECONDS: ${{ inputs.fid_seconds }}
+        run: |
+          python -m py_compile evaluation/modal_fidXX.py
+          modal run evaluation/modal_fidXX.py --help
+
       - name: Compute FID on Modal
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}

@@ -5,7 +5,7 @@ Frechet distance against reference statistics. Images are never written to
 disk; only the 2048-d features are retained (50k x 2048 fp32 = 410 MB).
 
 RUN:
-    modal run evaluation/modal_fid.py \
+    modal run evaluation/modal_fidXX.py \
         --repos "org/sit-regular,org/sit-amap,org/sit-dmap" \
         --num-samples 50000 --bootstrap-reps 100 \
         --ref-stats-url <ADM-imagenet256-stats-url>
@@ -195,7 +195,10 @@ def load_checkpoint(repo: str, device):
     from ditflex.model import build_model
 
     repo_id, subfolder = _parse_repo_spec(repo)
-    CFG_NAMES = ("state.json", "config.json", "model_config.json", "ditflex_config.json")
+    CFG_NAMES = (
+        "state.json", "config.json", "model_config.json", "ditflex_config.json",
+        "amap_config.json", "dmap_config.json",
+    )
     EMA_NAMES = ("ema.safetensors", "ema_model.safetensors", "model_ema.safetensors")
     RAW_NAMES = ("model.safetensors", "diffusion_pytorch_model.safetensors", "pytorch_model.safetensors")
 
@@ -215,9 +218,23 @@ def load_checkpoint(repo: str, device):
 
     cfg_file = next((base / n for n in CFG_NAMES if (base / n).exists()), None)
     if cfg_file is None:
-        raise FileNotFoundError(
-            f"no config json among {CFG_NAMES} in selected checkpoint {base}; files={listing}"
-        )
+        # Future DAC checkpoints may use another descriptive *_config.json name.
+        # Restrict the fallback to the selected checkpoint directory so an
+        # unrelated repository-level config cannot be loaded accidentally.
+        config_candidates = sorted(base.glob("*_config.json"))
+        if len(config_candidates) == 1:
+            cfg_file = config_candidates[0]
+            print(f"[fid] config fallback: {cfg_file.name}")
+        elif len(config_candidates) > 1:
+            raise FileNotFoundError(
+                f"multiple *_config.json files in {base}; cannot choose safely: "
+                f"{[x.name for x in config_candidates]}"
+            )
+        else:
+            raise FileNotFoundError(
+                f"no config json among {CFG_NAMES} (or unique *_config.json) "
+                f"in selected checkpoint {base}; files={listing}"
+            )
     raw_cfg = json.loads(cfg_file.read_text())
     known = {f.name for f in dataclasses.fields(ModelConfig)}
     model_cfg, score, where = _find_model_cfg(raw_cfg, known)
@@ -388,7 +405,7 @@ def frechet_distance(mu1, sigma1, mu2, sigma2, eps: float = 1e-6) -> float:
     from scipy import linalg
 
     diff = mu1 - mu2
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    covmean = linalg.sqrtm(sigma1.dot(sigma2))
     if not np.isfinite(covmean).all():
         # Numerically singular product; nudge both covariances.
         offset = np.eye(sigma1.shape[0]) * eps
@@ -406,7 +423,7 @@ def _stats(features):
     return mu, sigma
 
 
-def bootstrap_fid(features, mu_ref, sigma_ref, *, reps: int, seed: int,
+def bootstrap_fid(features, mu_ref, sigma_ref, *, observed_score: float, reps: int, seed: int,
                   ref_features=None, confidence: float = 0.95):
     """Bootstrap sampling uncertainty of an FID estimate.
 
@@ -416,9 +433,12 @@ def bootstrap_fid(features, mu_ref, sigma_ref, *, reps: int, seed: int,
     independently bootstrapped (the right choice for ref_mode='latents').
 
     Returns the bootstrap standard error, a symmetric normal-approximation
-    half-width (z * SE), and the percentile interval.  The matrix square root
-    makes this CPU-expensive: 100+ reps are preferable for paper numbers; use
-    10-20 only as a pipeline smoke test.
+    half-width (z * SE), and a RECENTERED percentile interval around the
+    observed FID. Raw percentile bootstrap FIDs are upward-shifted because FID
+    itself is a biased finite-sample plug-in estimator and bootstrap samples
+    contain duplicates. Their spread is useful for uncertainty; their raw
+    location is not a CI for the observed FID. The raw bootstrap mean/bias are
+    retained as diagnostics.
     """
     import numpy as np
 
@@ -445,10 +465,14 @@ def bootstrap_fid(features, mu_ref, sigma_ref, *, reps: int, seed: int,
             print(f"[fid] bootstrap {b + 1}/{reps}")
 
     alpha = 1.0 - confidence
-    lo, hi = np.quantile(values, [alpha / 2.0, 1.0 - alpha / 2.0])
+    boot_mean = float(values.mean())
+    boot_bias = boot_mean - float(observed_score)
+    centered = values - boot_mean
+    qlo, qhi = np.quantile(centered, [alpha / 2.0, 1.0 - alpha / 2.0])
+    lo = float(observed_score + qlo)
+    hi = float(observed_score + qhi)
     se = values.std(ddof=1) if reps > 1 else 0.0
-    # 1.95996 is the two-sided 95% standard-normal quantile.  Keep this
-    # definition explicit so `FID +/- x` has an unambiguous meaning.
+    # 1.95996 is the two-sided 95% standard-normal quantile.
     z = 1.959963984540054 if abs(confidence - 0.95) < 1e-12 else None
     if z is None:
         from scipy.stats import norm
@@ -458,8 +482,10 @@ def bootstrap_fid(features, mu_ref, sigma_ref, *, reps: int, seed: int,
         "confidence": float(confidence),
         "std_error": float(se),
         "normal_half_width": float(z * se),
-        "percentile_low": float(lo),
-        "percentile_high": float(hi),
+        "centered_percentile_low": lo,
+        "centered_percentile_high": hi,
+        "bootstrap_mean_raw": boot_mean,
+        "bootstrap_bias_raw": float(boot_bias),
     }
 
 
@@ -471,7 +497,7 @@ def bootstrap_fid(features, mu_ref, sigma_ref, *, reps: int, seed: int,
     secrets=[modal.Secret.from_dict({"HF_TOKEN": os.environ.get("HF_TOKEN", "")})],
 )
 def evaluate(
-    repos: str = "official-sit,jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000",
+    repos: str = "jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000",
     num_samples: int = 50_000,
     batch_size: int = 64,
     sample_steps: int = 50,
@@ -643,7 +669,7 @@ def evaluate(
         mu, sigma = _stats(feats)
         score = frechet_distance(mu, sigma, mu_ref, sigma_ref)
         boot = bootstrap_fid(
-            feats, mu_ref, sigma_ref, reps=bootstrap_reps,
+            feats, mu_ref, sigma_ref, observed_score=score, reps=bootstrap_reps,
             seed=seed + 17_171, ref_features=ref_features, confidence=0.95,
         )
         entry = {"score": round(score, 4), "num_samples": num_samples}
@@ -653,8 +679,10 @@ def evaluate(
             pm = boot["normal_half_width"]
             print(f"[fid] {repo}: FID = {score:.4f} +/- {pm:.4f} "
                   f"(95% bootstrap-normal CI)")
-            print(f"[fid] {repo}: percentile 95% bootstrap CI = "
-                  f"[{boot['percentile_low']:.4f}, {boot['percentile_high']:.4f}]")
+            print(f"[fid] {repo}: centered-percentile 95% bootstrap CI = "
+                  f"[{boot['centered_percentile_low']:.4f}, {boot['centered_percentile_high']:.4f}]")
+            print(f"[fid] {repo}: raw bootstrap mean = {boot['bootstrap_mean_raw']:.4f} "
+                  f"(plug-in bootstrap bias diagnostic = {boot['bootstrap_bias_raw']:+.4f})")
         else:
             print(f"[fid] {repo}: FID = {score:.4f} (bootstrap disabled)")
         results["fid"][repo] = entry
@@ -669,7 +697,7 @@ def evaluate(
 
 @app.local_entrypoint()
 def main(
-    repos: str = "official-sit,jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000",
+    repos: str = "jcandane/AMAP@latest,jcandane/DMAP@checkpoints/step_0080000",
     num_samples: int = 50_000,
     batch_size: int = 64,
     sample_steps: int = 50,
@@ -690,5 +718,5 @@ def main(
         bootstrap_reps=bootstrap_reps, inference_precision=inference_precision,
     )
     Path("evaluation").mkdir(exist_ok=True)
-    Path("evaluation/fid_results.json").write_text(payload)
-    print("[fid] wrote evaluation/fid_results.json")
+    Path("evaluation/fidXX_results.json").write_text(payload)
+    print("[fid] wrote evaluation/fidXX_results.json")
